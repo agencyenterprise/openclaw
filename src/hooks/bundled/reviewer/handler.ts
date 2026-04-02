@@ -19,6 +19,7 @@ import { createSubsystemLogger } from "../../../logging/subsystem.js";
 import { resolveHookConfig } from "../../config.js";
 import type { HookHandler } from "../../hooks.js";
 import type { InternalHookEvent, MessageSentHookContext } from "../../internal-hooks.js";
+import { addThread, removeThread, loadAndConsumeThreads } from "./active-threads.js";
 
 const log = createSubsystemLogger("hooks/reviewer");
 
@@ -43,6 +44,11 @@ interface ReviewResult {
 
 const iterationCounts = new Map<string, number>();
 const activeReviews = new Set<string>();
+const pendingReviews = new Map<
+  string,
+  { timer: ReturnType<typeof setTimeout>; event: InternalHookEvent }
+>();
+const REVIEW_DEBOUNCE_MS = 10_000; // Wait 10s after last message:sent before reviewing
 
 // ── Default system prompt ───────────────────────────────────────────
 
@@ -587,10 +593,79 @@ async function slackPost(
 // ── Handler ─────────────────────────────────────────────────────────
 
 const handler: HookHandler = async (event: InternalHookEvent) => {
+  // Handle gateway:startup — respawn active threads from before restart
+  if (event.type === "gateway" && event.action === "startup") {
+    const threads = loadAndConsumeThreads();
+    if (threads.length === 0) {
+      return;
+    }
+    log.info(`gateway startup: respawning ${threads.length} active threads`);
+    // Wait for Slack provider to fully initialize
+    await new Promise((r) => setTimeout(r, 2000));
+    const dispatchKey = Symbol.for("openclaw.reviewerDispatch");
+    const dispatchFn = (
+      globalThis as Record<
+        symbol,
+        ((p: { channelId: string; threadTs: string; text: string }) => Promise<boolean>) | undefined
+      >
+    )[dispatchKey];
+    if (!dispatchFn) {
+      log.warn("gateway startup: no reviewer dispatch function — cannot respawn threads");
+      return;
+    }
+    for (const { channelId, threadTs } of threads) {
+      try {
+        await dispatchFn({
+          channelId,
+          threadTs,
+          text: "Gateway restarted. Continue where you left off.",
+        });
+        log.info(`respawned thread ${channelId}:${threadTs}`);
+      } catch (err) {
+        log.warn(`failed to respawn ${channelId}:${threadTs}: ${String(err)}`);
+      }
+    }
+    return;
+  }
+
+  // Only process message:sent events
   if (event.type !== "message" || event.action !== "sent") {
     return;
   }
 
+  // Extract threadTs early for debounce key
+  const rawCtx = event.context as Partial<MessageSentHookContext> & Record<string, unknown>;
+  let debounceThreadTs = rawCtx.conversationId;
+  if (!debounceThreadTs) {
+    const sk = event.sessionKey ?? "";
+    const m = sk.match(/thread:(\d+\.\d+)/);
+    if (m) {
+      debounceThreadTs = m[1];
+    }
+  }
+
+  if (debounceThreadTs) {
+    // Cancel any pending review for this thread — a new message:sent arrived
+    const pending = pendingReviews.get(debounceThreadTs);
+    if (pending) {
+      clearTimeout(pending.timer);
+      log.info(`debounce reset for thread ${debounceThreadTs} — new message:sent arrived`);
+    }
+    // Schedule the review after debounce period
+    const timer = setTimeout(() => {
+      pendingReviews.delete(debounceThreadTs);
+      log.info(`debounce fired for thread ${debounceThreadTs} — starting review`);
+      executeReview(event).catch((err) => log.error(`deferred review failed: ${String(err)}`));
+    }, REVIEW_DEBOUNCE_MS);
+    pendingReviews.set(debounceThreadTs, { timer, event });
+    return;
+  }
+
+  // No threadTs — run immediately (shouldn't happen in practice)
+  await executeReview(event);
+};
+
+async function executeReview(event: InternalHookEvent): Promise<void> {
   const ctx = event.context as Partial<MessageSentHookContext> & Record<string, unknown>;
   log.info(
     `handler called: type=${event.type} action=${event.action} hasCfg=${!!ctx.cfg} channelId=${ctx.channelId ?? "-"} sessionKey=${event.sessionKey ?? "-"}`,
@@ -613,25 +688,34 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
     }
   }
 
-  // Extract channelId from context or parse from sessionKey
-  if (!ctx.channelId || ctx.channelId === "slack") {
-    // Parse channelId from sessionKey: "agent:main:slack:channel:c0ahskbndb6:thread:..."
-    const sk = event.sessionKey ?? "";
-    const channelMatch = sk.match(/channel:(c[a-z0-9]+)/i);
-    if (channelMatch) {
-      ctx.channelId = channelMatch[1].toUpperCase();
-      log.info(`resolved channelId from sessionKey: ${ctx.channelId}`);
+  // Always extract channelId and threadTs from sessionKey — ctx values are
+  // often wrong (channelId="slack", conversationId="channel"). The sessionKey
+  // is the authoritative source: "agent:main:slack:channel:<id>:thread:<ts>"
+  const sk = event.sessionKey ?? "";
+  const channelMatch = sk.match(/channel:(c[a-z0-9]+)/i);
+  if (channelMatch) {
+    const resolved = channelMatch[1].toUpperCase();
+    if (ctx.channelId !== resolved) {
+      log.info(`channelId override: ${ctx.channelId ?? "-"} -> ${resolved} (from sessionKey)`);
     }
+    ctx.channelId = resolved;
+  } else if (!ctx.channelId || ctx.channelId === "slack") {
+    log.warn(`cannot resolve channelId from sessionKey: ${sk}`);
   }
 
-  // Extract conversationId (threadTs) from sessionKey if missing
-  if (!ctx.conversationId) {
-    const sk = event.sessionKey ?? "";
-    const threadMatch = sk.match(/thread:(\d+\.\d+)/);
-    if (threadMatch) {
-      ctx.conversationId = threadMatch[1];
-      log.info(`resolved conversationId from sessionKey: ${ctx.conversationId}`);
+  const threadMatch = sk.match(/thread:(\d+\.\d+)/);
+  if (threadMatch) {
+    const resolved = threadMatch[1];
+    if (ctx.conversationId !== resolved) {
+      log.info(
+        `conversationId override: ${ctx.conversationId ?? "-"} -> ${resolved} (from sessionKey)`,
+      );
     }
+    ctx.conversationId = resolved;
+  } else if (!ctx.conversationId || !/^\d+\.\d+$/.test(ctx.conversationId)) {
+    log.warn(
+      `cannot resolve threadTs from sessionKey: ${sk} (conversationId=${ctx.conversationId ?? "-"})`,
+    );
   }
 
   const reviewerConfig = resolveReviewerConfig(cfg);
@@ -650,9 +734,14 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
   }
 
   const sessionKey = event.sessionKey;
-  if (activeReviews.has(sessionKey)) {
+
+  // Guard against concurrent reviews on the same thread (message:sent can fire multiple times)
+  const reviewKey = threadTs;
+  if (activeReviews.has(reviewKey)) {
+    log.info(`review already in progress for thread ${threadTs} — skipping`);
     return;
   }
+  activeReviews.add(reviewKey);
 
   // Check iteration limit
   const maxIterations = reviewerConfig.maxIterations ?? 3;
@@ -660,10 +749,29 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
   if (count >= maxIterations) {
     log.info(`max iterations (${maxIterations}) reached for thread ${threadTs} — auto-approving`);
     iterationCounts.delete(threadTs);
+    removeThread(channelId, threadTs);
+    // Add approve reaction even on auto-approve so there's visible signal
+    try {
+      const slackConfig = (cfg as Record<string, unknown>).channels as
+        | Record<string, unknown>
+        | undefined;
+      const slackCfg = slackConfig?.slack as Record<string, unknown> | undefined;
+      const botToken = slackCfg?.botToken as string | undefined;
+      if (botToken) {
+        const emoji = reviewerConfig.approveEmoji ?? "approved_by_fractal_reviewer";
+        const lastBotMsg = (await fetchSlackThread(botToken, channelId, threadTs))
+          .filter((m: { role: string }) => m.role === "Assistant")
+          .pop();
+        if (lastBotMsg?.ts) {
+          await slackReact(botToken, channelId, lastBotMsg.ts, emoji);
+        }
+      }
+    } catch (err) {
+      log.warn(`auto-approve reaction failed: ${String(err)}`);
+    }
     return;
   }
 
-  activeReviews.add(sessionKey);
   log.info(
     `starting review: session=${sessionKey} channel=${channelId} thread=${threadTs} iteration=${count + 1}/${maxIterations}`,
   );
@@ -681,6 +789,9 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
     }
     log.info(`bot token found, fetching thread...`);
 
+    // Track this thread as active (survives gateway restarts)
+    addThread(channelId, threadTs);
+
     // Resolve bot user ID for role assignment
     const botUserId = ctx.botUserId as string | undefined;
 
@@ -692,6 +803,9 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
 
     const systemPrompt = loadSystemPrompt(reviewerConfig, workspaceDir);
     const model = reviewerConfig.model ?? "gpt-5.4";
+
+    // Brief delay to ensure all messages from the dispatch are visible in Slack API
+    await new Promise((r) => setTimeout(r, 1000));
 
     // Fetch thread, extract tool calls, and query Hindsight in parallel
     const stateDir =
@@ -763,8 +877,9 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
         log.warn("no reviewer dispatch function registered — feedback posted to Slack only");
       }
     } else {
-      // Approved — react and clear iteration counter
+      // Approved — react, clear iteration counter, and untrack thread
       iterationCounts.delete(threadTs);
+      removeThread(channelId, threadTs);
       const emoji = reviewerConfig.approveEmoji ?? "approved_by_fractal_reviewer";
 
       // Prefer messageId from hook context; fall back to the last bot message ts
@@ -789,8 +904,8 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
   } catch (err) {
     log.error(`review failed: ${String(err)}`);
   } finally {
-    activeReviews.delete(sessionKey);
+    activeReviews.delete(reviewKey);
   }
-};
+}
 
 export default handler;
