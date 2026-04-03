@@ -289,15 +289,23 @@ function extractToolCallsFromSession(
               const args = block.arguments ?? {};
               let callStr = "";
               if (toolName === "exec") {
-                callStr = `[CALL exec]: ${(args.command ?? "").slice(0, 300)}`;
+                callStr = `[CALL exec]: ${(args.command ?? "").slice(0, 1000)}`;
               } else if (toolName === "memory_search") {
                 callStr = `[CALL memory_search]: query="${args.query ?? ""}"`;
               } else if (toolName === "read") {
                 callStr = `[CALL read]: ${args.path ?? args.file_path ?? ""}`;
               } else if (toolName === "write") {
-                callStr = `[CALL write]: ${args.path ?? ""} (${(args.content ?? "").length} chars)`;
+                const writeContent = (args.content ?? "").slice(0, 2000);
+                const writeLen = (args.content ?? "").length;
+                callStr = `[CALL write]: ${args.path ?? ""} (${writeLen} chars)\n${writeContent}${writeLen > 2000 ? "\n... (truncated)" : ""}`;
               } else if (toolName === "message") {
-                continue; // Skip — Slack messages are already in thread
+                // Only skip send — those are already visible in the thread.
+                // Keep delete/react/update since they're invisible to thread readers.
+                const action = args.action ?? "send";
+                if (action === "send") {
+                  continue;
+                }
+                callStr = `[CALL message ${action}]: ${JSON.stringify(args).slice(0, 500)}`;
               } else {
                 callStr = `[CALL ${toolName}]: ${JSON.stringify(args).slice(0, 200)}`;
               }
@@ -319,8 +327,8 @@ function extractToolCallsFromSession(
             }
             if (resultText) {
               const truncated =
-                resultText.length > 500
-                  ? resultText.slice(0, 500) + `... (${resultText.length} chars total)`
+                resultText.length > 2000
+                  ? resultText.slice(0, 2000) + `... (${resultText.length} chars total)`
                   : resultText;
               entries.push(`[RESULT]: ${truncated}`);
             }
@@ -437,12 +445,29 @@ async function callReviewer(params: {
     })
     .join("\n\n");
 
-  // Build tool activity section if available (calls + results paired)
+  // Build tool activity section if available — 100K token budget moving window.
+  // Newest entries are kept; oldest are dropped when budget is exceeded.
+  // ~4 chars per token, so 100K tokens ≈ 400K chars budget for tool activity.
   let toolSection = "";
   if (params.toolCalls && params.toolCalls.length > 0) {
-    // Keep last 80 entries (calls + results) to give reviewer full visibility
-    const recentTools = params.toolCalls.slice(-80);
-    toolSection = `\n\n--- AGENT TOOL ACTIVITY (behind-the-scenes commands and their results) ---\n${recentTools.join("\n")}\n--- END TOOL ACTIVITY ---`;
+    const TOKEN_BUDGET_CHARS = 400_000; // ~100K tokens
+    // Walk backwards (newest first), accumulate until budget is spent
+    const selected: string[] = [];
+    let charCount = 0;
+    for (let i = params.toolCalls.length - 1; i >= 0; i--) {
+      const entry = params.toolCalls[i];
+      if (charCount + entry.length > TOKEN_BUDGET_CHARS) {
+        break; // Budget exhausted — older entries are dropped
+      }
+      selected.unshift(entry); // Prepend to maintain chronological order
+      charCount += entry.length;
+    }
+    const dropped = params.toolCalls.length - selected.length;
+    const header =
+      dropped > 0
+        ? `(showing ${selected.length}/${params.toolCalls.length} tool calls — ${dropped} older calls trimmed to fit 100K token budget)`
+        : `(${selected.length} tool calls from current turn)`;
+    toolSection = `\n\n--- AGENT TOOL ACTIVITY ${header} ---\n${selected.join("\n")}\n--- END TOOL ACTIVITY ---`;
   }
 
   // Build memory section from Hindsight pre-fetch
