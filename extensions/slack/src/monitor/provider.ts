@@ -419,6 +419,33 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
       })
     : null;
 
+  // Register the reviewer dispatch function so the steerer hook can inject
+  // feedback directly into the message handler pipeline.
+  {
+    const { registerReviewerDispatch } = await import("./reviewer-dispatch.js");
+    registerReviewerDispatch(async (params) => {
+      try {
+        const syntheticMessage: import("../types.js").SlackMessageEvent = {
+          channel: params.channelId,
+          ts: `reviewer-${Date.now()}`,
+          thread_ts: params.threadTs,
+          user: ctx.botUserId ?? "REVIEWER",
+          text: params.text,
+          type: "message",
+          channel_type: "group",
+        };
+        await handleSlackMessage(syntheticMessage, {
+          source: "message",
+          wasMentioned: true,
+        });
+        return true;
+      } catch (err) {
+        console.error(`[reviewer-dispatch] failed: ${String(err)}`);
+        return false;
+      }
+    });
+  }
+
   registerSlackMonitorEvents({ ctx, account, handleSlackMessage, trackEvent });
   await registerSlackMonitorSlashCommands({ ctx, account });
   await execApprovalsHandler?.start();

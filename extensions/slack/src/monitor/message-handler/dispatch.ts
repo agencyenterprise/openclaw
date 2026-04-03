@@ -8,6 +8,7 @@ import {
   type StatusReactionAdapter,
 } from "openclaw/plugin-sdk/channel-feedback";
 import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pipeline";
+import { createInternalHookEvent, triggerInternalHook } from "openclaw/plugin-sdk/hook-runtime";
 import { resolveAgentOutboundIdentity } from "openclaw/plugin-sdk/outbound-runtime";
 import { clearHistoryEntriesIfEnabled } from "openclaw/plugin-sdk/reply-history";
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
@@ -667,6 +668,25 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
   const participationThreadTs = usedReplyThreadTs ?? statusThreadTs;
   if (anyReplyDelivered && participationThreadTs) {
     recordSlackThreadParticipation(account.accountId, message.channel, participationThreadTs);
+
+    // Fire internal message:sent hook so workspace hooks (e.g., reviewer)
+    // can react to completed deliveries.
+    console.error(
+      `[slack-trace] firing internal message:sent hook session=${prepared.ctxPayload.SessionKey ?? "-"} channel=${message.channel} thread=${participationThreadTs}`,
+    );
+    void triggerInternalHook(
+      createInternalHookEvent("message", "sent", prepared.ctxPayload.SessionKey ?? "", {
+        channelId: message.channel,
+        conversationId: participationThreadTs,
+        to: prepared.replyTarget,
+        success: true,
+        accountId: account.accountId,
+        botUserId: ctx.botUserId,
+        cfg,
+      }),
+    ).catch((err) => {
+      console.error(`[slack-trace] internal message:sent hook failed: ${String(err)}`);
+    });
   }
 
   if (!anyReplyDelivered) {
