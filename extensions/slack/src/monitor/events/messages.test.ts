@@ -31,6 +31,7 @@ vi.mock("openclaw/plugin-sdk/conversation-runtime", async () => {
 });
 
 let registerSlackMessageEvents: typeof import("./messages.js").registerSlackMessageEvents;
+let _resetDeletedMessageCacheForTest: typeof import("./messages.js")._resetDeletedMessageCacheForTest;
 
 type MessageHandler = (args: { event: Record<string, unknown>; body: unknown }) => Promise<void>;
 type RegisteredEventName = "message" | "app_mention";
@@ -59,8 +60,7 @@ function resetMessageMocks(): void {
   messageAllowMock.mockReset().mockResolvedValue([]);
 }
 
-beforeAll(async () => {
-  ({ registerSlackMessageEvents } = await import("./messages.js"));
+beforeEach(async () => {  vi.resetModules();  const mod = await import("./messages.js");  registerSlackMessageEvents = mod.registerSlackMessageEvents;  _resetDeletedMessageCacheForTest = mod._resetDeletedMessageCacheForTest;  _resetDeletedMessageCacheForTest();
 });
 
 beforeEach(() => {
@@ -79,14 +79,19 @@ function makeChangedEvent(overrides?: { channel?: string; user?: string }) {
   };
 }
 
-function makeDeletedEvent(overrides?: { channel?: string; user?: string }) {
+function makeDeletedEvent(overrides?: {
+  channel?: string;
+  user?: string;
+  deleted_ts?: string;
+  previous_ts?: string;
+}) {
   return {
     type: "message",
     subtype: "message_deleted",
     channel: overrides?.channel ?? "D1",
-    deleted_ts: "123.456",
+    deleted_ts: overrides?.deleted_ts ?? "123.456",
     previous_message: {
-      ts: "123.450",
+      ts: overrides?.previous_ts ?? "123.450",
       user: overrides?.user ?? "U1",
     },
     event_ts: "123.456",
@@ -280,5 +285,149 @@ describe("registerSlackMessageEvents", () => {
     });
 
     expect(handleSlackMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("deleted message cache", () => {
+  it("drops a regular message whose ts matches a recently deleted message (deleted_ts)", async () => {
+    resetMessageMocks();
+    const { handler, handleSlackMessage } = createHandlers("message", {
+      dmPolicy: "open",
+    });
+    expect(handler).toBeTruthy();
+
+    // Step 1: Deliver a message_deleted event
+    await handler!({
+      event: makeDeletedEvent({ channel: "C1", deleted_ts: "100.001", previous_ts: "100.000" }),
+      body: {},
+    });
+
+    // Step 2: Deliver a stale regular message with the same ts as deleted_ts
+    await handler!({
+      event: {
+        type: "message",
+        channel: "C1",
+        user: "U1",
+        text: "stale redelivery",
+        ts: "100.001",
+      },
+      body: {},
+    });
+
+    // The stale message should have been dropped
+    expect(handleSlackMessage).not.toHaveBeenCalled();
+  });
+
+  it("drops a regular message whose ts matches previous_message.ts of a deleted event", async () => {
+    resetMessageMocks();
+    const { handler, handleSlackMessage } = createHandlers("message", {
+      dmPolicy: "open",
+    });
+    expect(handler).toBeTruthy();
+
+    await handler!({
+      event: makeDeletedEvent({ channel: "C1", deleted_ts: "100.001", previous_ts: "100.000" }),
+      body: {},
+    });
+
+    // Stale event arrives with ts matching previous_message.ts
+    await handler!({
+      event: {
+        type: "message",
+        channel: "C1",
+        user: "U1",
+        text: "stale redelivery via previous_message.ts",
+        ts: "100.000",
+      },
+      body: {},
+    });
+
+    expect(handleSlackMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not drop messages with a ts that was never deleted", async () => {
+    resetMessageMocks();
+    const { handler, handleSlackMessage } = createHandlers("message", {
+      dmPolicy: "open",
+    });
+    expect(handler).toBeTruthy();
+
+    await handler!({
+      event: makeDeletedEvent({ channel: "C1", deleted_ts: "100.001", previous_ts: "100.000" }),
+      body: {},
+    });
+
+    // A completely different ts should pass through
+    await handler!({
+      event: {
+        type: "message",
+        channel: "C1",
+        user: "U1",
+        text: "fresh message",
+        ts: "200.000",
+      },
+      body: {},
+    });
+
+    expect(handleSlackMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not cross-contaminate channels — same ts on a different channel passes through", async () => {
+    resetMessageMocks();
+    const { handler, handleSlackMessage } = createHandlers("message", {
+      dmPolicy: "open",
+      channelType: "channel",
+    });
+    expect(handler).toBeTruthy();
+
+    await handler!({
+      event: makeDeletedEvent({ channel: "C1", deleted_ts: "100.001", previous_ts: "100.000" }),
+      body: {},
+    });
+
+    // Same ts but different channel — should NOT be dropped
+    await handler!({
+      event: {
+        type: "message",
+        channel: "C2",
+        channel_type: "channel",
+        user: "U1",
+        text: "different channel",
+        ts: "100.001",
+      },
+      body: {},
+    });
+
+    expect(handleSlackMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a stale app_mention whose ts matches a recently deleted message", async () => {
+    resetMessageMocks();
+    // First register with message handler to process the delete
+    const harness = createSlackSystemEventTestHarness({ dmPolicy: "open" });
+    const handleSlackMessage = vi.fn(async () => {});
+    registerSlackMessageEvents({
+      ctx: harness.ctx,
+      handleSlackMessage,
+    });
+
+    const messageHandler = harness.getHandler("message") as MessageHandler | null;
+    const mentionHandler = harness.getHandler("app_mention") as MessageHandler | null;
+    expect(messageHandler).toBeTruthy();
+    expect(mentionHandler).toBeTruthy();
+
+    // Deliver message_deleted via the message handler
+    await messageHandler!({
+      event: makeDeletedEvent({ channel: "C123", deleted_ts: "100.001", previous_ts: "100.000" }),
+      body: {},
+    });
+
+    // Now deliver a stale app_mention with the deleted ts
+    await mentionHandler!({
+      event: makeAppMentionEvent({ channel: "C123", ts: "100.001" }),
+      body: {},
+    });
+
+    expect(handleSlackMessage).not.toHaveBeenCalled();
   });
 });
