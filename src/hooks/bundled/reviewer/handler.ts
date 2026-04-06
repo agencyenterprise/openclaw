@@ -42,7 +42,7 @@ interface ReviewResult {
 
 // ── State ───────────────────────────────────────────────────────────
 
-const iterationCounts = new Map<string, number>();
+const iterationCounts = new Map<string, { count: number; triggerHumanTs: string }>();
 const activeReviews = new Set<string>();
 const pendingReviews = new Map<
   string,
@@ -768,9 +768,37 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
   }
   activeReviews.add(reviewKey);
 
-  // Check iteration limit
+  // Check iteration limit (reset if a new human message arrived)
   const maxIterations = reviewerConfig.maxIterations ?? 3;
-  const count = iterationCounts.get(threadTs) ?? 0;
+  let iterState = iterationCounts.get(threadTs);
+  let count = iterState?.count ?? 0;
+
+  // If max iterations reached, check whether a new human message warrants a fresh budget
+  if (iterState && count >= maxIterations) {
+    const peekToken = (
+      ((cfg as Record<string, unknown>).channels as Record<string, unknown> | undefined)?.slack as
+        | Record<string, unknown>
+        | undefined
+    )?.botToken as string | undefined;
+    if (peekToken) {
+      try {
+        const peekMessages = await fetchSlackThread(peekToken, channelId, threadTs);
+        const latestHumanTs = peekMessages
+          .filter((m: { role: string }) => m.role !== "Assistant")
+          .pop()?.ts;
+        if (latestHumanTs && latestHumanTs !== iterState.triggerHumanTs) {
+          log.info(
+            `new human message in thread ${threadTs} (human=${latestHumanTs} vs last=${iterState.triggerHumanTs}) — resetting iteration counter`,
+          );
+          count = 0;
+          iterState = undefined;
+        }
+      } catch (err) {
+        log.warn(`iteration reset peek failed: ${String(err)}`);
+      }
+    }
+  }
+
   if (count >= maxIterations) {
     log.info(`max iterations (${maxIterations}) reached for thread ${threadTs} — auto-approving`);
     iterationCounts.delete(threadTs);
@@ -875,7 +903,9 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
     );
 
     if (action === "continue" && result.message) {
-      iterationCounts.set(threadTs, count + 1);
+      const latestHumanMsgTs =
+        threadMessages.filter((m: { role: string }) => m.role !== "Assistant").pop()?.ts ?? "";
+      iterationCounts.set(threadTs, { count: count + 1, triggerHumanTs: latestHumanMsgTs });
 
       let feedbackText = `🔍 *Reviewer:* ${result.message}`;
       if (result.suggestions) {
