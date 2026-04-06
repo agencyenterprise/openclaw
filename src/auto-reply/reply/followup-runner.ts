@@ -13,6 +13,7 @@ import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
 import { logVerbose } from "../../globals.js";
+import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
 import { defaultRuntime } from "../../runtime.js";
 import { isInternalMessageChannel } from "../../utils/message-channel.js";
@@ -398,6 +399,30 @@ export function createFollowupRunner(params: {
       }
 
       await sendFollowupPayloads(finalPayloads, queued);
+
+      // Fire internal message:sent hook so workspace hooks (e.g., reviewer)
+      // can react to follow-up deliveries — mirrors the hook in dispatch.ts.
+      const hookSessionKey = queued.run.sessionKey ?? sessionKey ?? "";
+      const hookChannelId = queued.originatingTo;
+      const hookThreadTs =
+        queued.originatingThreadId != null ? String(queued.originatingThreadId) : undefined;
+      if (hookChannelId && hookThreadTs) {
+        logVerbose(
+          `followup: firing internal message:sent hook session=${hookSessionKey} channel=${hookChannelId} thread=${hookThreadTs}`,
+        );
+        void triggerInternalHook(
+          createInternalHookEvent("message", "sent", hookSessionKey, {
+            channelId: hookChannelId,
+            conversationId: hookThreadTs,
+            to: hookChannelId,
+            success: true,
+            accountId: queued.originatingAccountId,
+            cfg: queued.run.config,
+          }),
+        ).catch((err) => {
+          logVerbose(`followup: internal message:sent hook failed: ${String(err)}`);
+        });
+      }
     } finally {
       // Both signals are required for the typing controller to clean up.
       // The main inbound dispatch path calls markDispatchIdle() from the
