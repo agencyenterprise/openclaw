@@ -26,7 +26,7 @@ import { logVerbose, shouldLogVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { resolvePinnedMainDmOwnerFromAllowlist } from "openclaw/plugin-sdk/security-runtime";
 import { resolveSlackReplyToMode, type ResolvedSlackAccount } from "../../accounts.js";
 import { reactSlackMessage } from "../../actions.js";
-import { hasSlackThreadParticipation } from "../../sent-thread-cache.js";
+import { hasSlackThreadParticipation, checkAndRehydrateThreadParticipation } from "../../sent-thread-cache.js";
 import { resolveSlackThreadContext } from "../../threading.js";
 import type { SlackMessageEvent } from "../../types.js";
 import {
@@ -390,13 +390,26 @@ export async function prepareSlackMessage(params: {
           canResolveExplicit: Boolean(ctx.botUserId),
         },
       }));
-  const implicitMention = Boolean(
+  // Check thread participation: in-memory cache first, then Slack API fallback
+  // The API fallback rehydrates the cache after gateway restarts
+  let implicitMention = Boolean(
     !isDirectMessage &&
     ctx.botUserId &&
     message.thread_ts &&
     (message.parent_user_id === ctx.botUserId ||
       hasSlackThreadParticipation(account.accountId, message.channel, message.thread_ts)),
   );
+
+  // If not in cache and this is a thread reply, check Slack API for prior bot participation
+  if (!implicitMention && !isDirectMessage && ctx.botUserId && message.thread_ts) {
+    implicitMention = await checkAndRehydrateThreadParticipation({
+      accountId: account.accountId,
+      channelId: message.channel,
+      threadTs: message.thread_ts,
+      botUserId: ctx.botUserId,
+      client: ctx.app.client,
+    });
+  }
 
   let resolvedSenderName = message.username?.trim() || undefined;
   const resolveSenderName = async (): Promise<string> => {

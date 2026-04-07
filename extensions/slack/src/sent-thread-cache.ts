@@ -45,6 +45,52 @@ export function hasSlackThreadParticipation(
   return threadParticipation.peek(makeKey(accountId, channelId, threadTs));
 }
 
+
+/**
+ * Check Slack thread history to see if the bot previously participated.
+ * Used to rehydrate the in-memory cache after gateway restarts.
+ * Only calls the Slack API if the in-memory cache misses — then warms the cache
+ * so subsequent messages in the same thread don't re-query.
+ */
+export async function checkAndRehydrateThreadParticipation(params: {
+  accountId: string;
+  channelId: string;
+  threadTs: string;
+  botUserId: string;
+  client: { conversations: { replies: (opts: Record<string, unknown>) => Promise<Record<string, unknown>> } };
+}): Promise<boolean> {
+  const { accountId, channelId, threadTs, botUserId, client } = params;
+  if (!accountId || !channelId || !threadTs || !botUserId) {
+    return false;
+  }
+
+  // Already in cache — no API call needed
+  if (hasSlackThreadParticipation(accountId, channelId, threadTs)) {
+    return true;
+  }
+
+  try {
+    // Fetch first page of thread replies (limit 50 is enough to detect bot presence)
+    const response = await client.conversations.replies({
+      channel: channelId,
+      ts: threadTs,
+      limit: 50,
+    }) as { messages?: Array<{ user?: string }> };
+
+    const botParticipated = response.messages?.some((m) => m.user === botUserId) ?? false;
+
+    if (botParticipated) {
+      // Warm the cache so we don't re-query
+      recordSlackThreadParticipation(accountId, channelId, threadTs);
+    }
+
+    return botParticipated;
+  } catch {
+    // API failure — don't block message processing
+    return false;
+  }
+}
+
 export function clearSlackThreadParticipationCache(): void {
   threadParticipation.clear();
 }
