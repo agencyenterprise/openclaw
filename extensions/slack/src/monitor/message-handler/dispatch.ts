@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { resolveHumanDelayConfig } from "openclaw/plugin-sdk/agent-runtime";
 import {
   createStatusReactionController,
@@ -42,6 +45,58 @@ import type { PreparedSlackMessage } from "./types.js";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── Pending ack reaction tracking (crash recovery) ──────────────────
+// Records which messages have an active ack reaction so orphan reactions
+// can be cleaned up after a gateway crash. See pending-reactions.ts.
+
+function pendingReactionsPath(): string {
+  const stateDir = process.env.OPENCLAW_STATE_DIR ?? path.join(os.homedir(), ".openclaw");
+  return path.join(stateDir, "pending-reactions.json");
+}
+
+function trackPendingAckReaction(channel: string, messageTs: string, emoji: string): void {
+  try {
+    const filePath = pendingReactionsPath();
+    let data: Record<string, unknown> = {};
+    try {
+      data = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    } catch {}
+    data[`${channel}:${messageTs}`] = {
+      channel,
+      messageTs,
+      emoji,
+      addedAt: new Date().toISOString(),
+    };
+    const tmp = filePath + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, filePath);
+  } catch {
+    /* fire-and-forget — never block the dispatch pipeline */
+  }
+}
+
+function untrackPendingAckReaction(channel: string, messageTs: string | undefined): void {
+  if (!messageTs) return;
+  try {
+    const filePath = pendingReactionsPath();
+    let data: Record<string, unknown> = {};
+    try {
+      data = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    } catch {
+      return;
+    }
+    const key = `${channel}:${messageTs}`;
+    if (key in data) {
+      delete data[key];
+      const tmp = filePath + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+      fs.renameSync(tmp, filePath);
+    }
+  } catch {
+    /* fire-and-forget */
+  }
 }
 
 // Slack reactions.add/remove expect shortcode names, not raw unicode emoji.
@@ -227,6 +282,15 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
     ...DEFAULT_TIMING,
     ...cfg.messages?.statusReactions?.timing,
   };
+  // Track ack reaction for crash recovery (cleaned up on next startup if gateway crashes)
+  if (reactionMessageTs && prepared.ackReactionValue) {
+    trackPendingAckReaction(
+      message.channel,
+      reactionMessageTs,
+      toSlackEmojiName(prepared.ackReactionValue),
+    );
+  }
+
   const statusReactions = createStatusReactionController({
     enabled: statusReactionsEnabled,
     adapter: slackStatusAdapter,
@@ -698,6 +762,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
         limit: ctx.historyLimit,
       });
     }
+    untrackPendingAckReaction(message.channel, reactionMessageTs);
     return;
   }
 
@@ -741,4 +806,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
       limit: ctx.historyLimit,
     });
   }
+
+  // Dispatch complete — untrack ack reaction (cleanup handled by StatusReactionController)
+  untrackPendingAckReaction(message.channel, reactionMessageTs);
 }

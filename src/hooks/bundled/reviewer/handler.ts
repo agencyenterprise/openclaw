@@ -20,6 +20,7 @@ import { resolveHookConfig } from "../../config.js";
 import type { HookHandler } from "../../hooks.js";
 import type { InternalHookEvent, MessageSentHookContext } from "../../internal-hooks.js";
 import { addThread, removeThread, loadAndConsumeThreads } from "./active-threads.js";
+import { loadAndConsumePendingReactions } from "./pending-reactions.js";
 
 const log = createSubsystemLogger("hooks/reviewer");
 
@@ -618,24 +619,101 @@ async function slackPost(
 // ── Handler ─────────────────────────────────────────────────────────
 
 const handler: HookHandler = async (event: InternalHookEvent) => {
-  // Handle gateway:startup — respawn active threads from before restart
+  // Handle gateway:startup — clean orphan reactions + respawn active threads
   if (event.type === "gateway" && event.action === "startup") {
+    // --- Phase 1: Clean up orphan ack reactions from previous incarnation ---
+    const pendingReactions = loadAndConsumePendingReactions();
+    if (pendingReactions.length > 0) {
+      log.info(`gateway startup: cleaning ${pendingReactions.length} orphan ack reactions`);
+      const startupCtx = event.context;
+      const startupCfg = startupCtx.cfg as OpenClawConfig | undefined;
+      let reactionBotToken: string | undefined;
+      if (startupCfg) {
+        const chCfg = (startupCfg as Record<string, unknown>).channels as
+          | Record<string, unknown>
+          | undefined;
+        const slkCfg = chCfg?.slack as Record<string, unknown> | undefined;
+        reactionBotToken = slkCfg?.botToken as string | undefined;
+      }
+      if (reactionBotToken) {
+        // All known status reaction shortcodes that could be left on messages
+        const STATUS_EMOJIS = [
+          "eyes",
+          "thinking_face",
+          "fire",
+          "male-technologist",
+          "female-technologist",
+          "zap",
+          "globe_with_meridians",
+          "thumbsup",
+          "scream",
+          "yawning_face",
+          "fearful",
+          "hourglass_flowing_sand",
+          "warning",
+          "writing_hand",
+          "brain",
+          "hammer_and_wrench",
+          "computer",
+          "white_check_mark",
+          "x",
+        ];
+        for (const { channel, messageTs, emoji } of pendingReactions) {
+          const emojisToRemove = new Set([emoji, ...STATUS_EMOJIS]);
+          for (const emojiName of emojisToRemove) {
+            try {
+              const res = await fetch("https://slack.com/api/reactions.remove", {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${reactionBotToken}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ channel, timestamp: messageTs, name: emojiName }),
+              });
+              const rd = (await res.json()) as { ok?: boolean; error?: string };
+              if (rd.ok) {
+                log.info(`removed orphan :${emojiName}: from ${channel}:${messageTs}`);
+              }
+              // Silently ignore no_reaction / not_reactable errors
+            } catch (err) {
+              log.warn(`orphan reaction remove failed: ${String(err)}`);
+            }
+          }
+        }
+      } else {
+        log.warn("gateway startup: no Slack bot token — cannot clean orphan reactions");
+      }
+    }
+
+    // --- Phase 2: Respawn active threads from before restart ---
     const threads = loadAndConsumeThreads();
     if (threads.length === 0) {
       return;
     }
+
     log.info(`gateway startup: respawning ${threads.length} active threads`);
-    // Wait for Slack provider to fully initialize
-    await new Promise((r) => setTimeout(r, 2000));
+
+    // Poll for Slack provider dispatch function with 30s timeout
+    // (Slack Socket Mode takes ~12s to connect after startChannels)
     const dispatchKey = Symbol.for("openclaw.reviewerDispatch");
-    const dispatchFn = (
-      globalThis as Record<
-        symbol,
-        ((p: { channelId: string; threadTs: string; text: string }) => Promise<boolean>) | undefined
-      >
-    )[dispatchKey];
+    type DispatchFn = (p: {
+      channelId: string;
+      threadTs: string;
+      text: string;
+    }) => Promise<boolean>;
+    let dispatchFn: DispatchFn | undefined;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      dispatchFn = (globalThis as Record<symbol, DispatchFn | undefined>)[dispatchKey];
+      if (dispatchFn) {
+        log.info(`reviewer dispatch ready after ${attempt + 1}s`);
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
     if (!dispatchFn) {
-      log.warn("gateway startup: no reviewer dispatch function — cannot respawn threads");
+      log.warn(
+        "gateway startup: reviewer dispatch not available after 30s — cannot respawn threads",
+      );
       return;
     }
     for (const { channelId, threadTs } of threads) {
