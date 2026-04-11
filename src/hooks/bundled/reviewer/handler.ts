@@ -619,46 +619,56 @@ async function slackPost(
 // ── Handler ─────────────────────────────────────────────────────────
 
 const handler: HookHandler = async (event: InternalHookEvent) => {
-  // Handle gateway:startup — clean orphan reactions + respawn active threads
+  // Handle gateway:startup — clean orphan reactions + re-engage interrupted threads
   if (event.type === "gateway" && event.action === "startup") {
-    // --- Phase 1: Clean up orphan ack reactions from previous incarnation ---
+    // --- Resolve Slack bot token + bot user ID for all phases ---
+    const startupCtx = event.context as Record<string, unknown>;
+    const startupCfg = startupCtx.cfg as OpenClawConfig | undefined;
+    let reactionBotToken: string | undefined;
+    let botUserId: string | undefined;
+    if (startupCfg) {
+      const chCfg = (startupCfg as Record<string, unknown>).channels as
+        | Record<string, unknown>
+        | undefined;
+      const slkCfg = chCfg?.slack as Record<string, unknown> | undefined;
+      reactionBotToken = slkCfg?.botToken as string | undefined;
+    }
+
+    // --- Phase 1: Clean up orphan ack reactions + collect interrupted threads ---
     const pendingReactions = loadAndConsumePendingReactions();
+    const interruptedThreads: Array<{ channelId: string; threadTs: string }> = [];
+
     if (pendingReactions.length > 0) {
       log.info(`gateway startup: cleaning ${pendingReactions.length} orphan ack reactions`);
-      const startupCtx = event.context;
-      const startupCfg = startupCtx.cfg as OpenClawConfig | undefined;
-      let reactionBotToken: string | undefined;
-      if (startupCfg) {
-        const chCfg = (startupCfg as Record<string, unknown>).channels as
-          | Record<string, unknown>
-          | undefined;
-        const slkCfg = chCfg?.slack as Record<string, unknown> | undefined;
-        reactionBotToken = slkCfg?.botToken as string | undefined;
+
+      // Resolve bot user ID so we can check if bot already responded
+      if (reactionBotToken) {
+        try {
+          const authRes = await fetch("https://slack.com/api/auth.test", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${reactionBotToken}` },
+          });
+          const authData = (await authRes.json()) as { ok?: boolean; user_id?: string };
+          if (authData.ok && authData.user_id) {
+            botUserId = authData.user_id;
+          }
+        } catch {}
       }
+
       if (reactionBotToken) {
         // All known status reaction shortcodes that could be left on messages
         const STATUS_EMOJIS = [
-          "eyes",
-          "thinking_face",
-          "fire",
-          "male-technologist",
-          "female-technologist",
-          "zap",
-          "globe_with_meridians",
-          "thumbsup",
-          "scream",
-          "yawning_face",
-          "fearful",
-          "hourglass_flowing_sand",
-          "warning",
-          "writing_hand",
-          "brain",
-          "hammer_and_wrench",
-          "computer",
-          "white_check_mark",
-          "x",
+          "eyes", "thinking_face", "fire", "male-technologist",
+          "female-technologist", "zap", "globe_with_meridians",
+          "thumbsup", "scream", "yawning_face", "fearful",
+          "hourglass_flowing_sand", "warning", "writing_hand",
+          "brain", "hammer_and_wrench", "computer", "white_check_mark", "x",
         ];
-        for (const { channel, messageTs, emoji } of pendingReactions) {
+        for (const reaction of pendingReactions) {
+          const { channel, messageTs, emoji } = reaction;
+          const threadTs = (reaction as Record<string, string>).threadTs ?? messageTs;
+
+          // Clean up all possible status emojis from the message
           const emojisToRemove = new Set([emoji, ...STATUS_EMOJIS]);
           for (const emojiName of emojisToRemove) {
             try {
@@ -674,9 +684,53 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
               if (rd.ok) {
                 log.info(`removed orphan :${emojiName}: from ${channel}:${messageTs}`);
               }
-              // Silently ignore no_reaction / not_reactable errors
             } catch (err) {
               log.warn(`orphan reaction remove failed: ${String(err)}`);
+            }
+          }
+
+          // Check if bot already responded after the trigger message.
+          // If not, this thread needs re-engagement.
+          if (botUserId && threadTs) {
+            try {
+              const params = new URLSearchParams({
+                channel,
+                ts: threadTs,
+                oldest: messageTs,
+                limit: "10",
+              });
+              const res = await fetch(
+                `https://slack.com/api/conversations.replies?${params.toString()}`,
+                {
+                  method: "GET",
+                  headers: { Authorization: `Bearer ${reactionBotToken}` },
+                },
+              );
+              const data = (await res.json()) as {
+                ok?: boolean;
+                messages?: Array<{ user?: string; ts?: string }>;
+              };
+              const botReplied =
+                data.ok &&
+                data.messages?.some(
+                  (m) => m.user === botUserId && m.ts && m.ts > messageTs,
+                );
+              if (!botReplied) {
+                interruptedThreads.push({ channelId: channel, threadTs });
+                log.info(
+                  `thread ${channel}:${threadTs} needs re-engagement (bot did not respond)`,
+                );
+              } else {
+                log.info(
+                  `thread ${channel}:${threadTs} already has bot reply — skip re-engagement`,
+                );
+              }
+            } catch (err) {
+              // If we can't check, err on the side of re-engaging
+              interruptedThreads.push({ channelId: channel, threadTs });
+              log.warn(
+                `thread check failed for ${channel}:${threadTs}: ${String(err)} — will re-engage`,
+              );
             }
           }
         }
@@ -685,16 +739,36 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
       }
     }
 
-    // --- Phase 2: Respawn active threads from before restart ---
-    const threads = loadAndConsumeThreads();
-    if (threads.length === 0) {
+    // --- Phase 2: Merge interrupted threads with reviewer active threads ---
+    const reviewerThreads = loadAndConsumeThreads();
+    const seen = new Set<string>();
+    const allThreads: Array<{ channelId: string; threadTs: string }> = [];
+
+    for (const t of interruptedThreads) {
+      const key = `${t.channelId}:${t.threadTs}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        allThreads.push(t);
+      }
+    }
+    for (const t of reviewerThreads) {
+      const key = `${t.channelId}:${t.threadTs}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        allThreads.push(t);
+      }
+    }
+
+    if (allThreads.length === 0) {
       return;
     }
 
-    log.info(`gateway startup: respawning ${threads.length} active threads`);
+    log.info(
+      `gateway startup: respawning ${allThreads.length} threads ` +
+        `(${interruptedThreads.length} interrupted + ${reviewerThreads.length} reviewer)`,
+    );
 
-    // Poll for Slack provider dispatch function with 30s timeout
-    // (Slack Socket Mode takes ~12s to connect after startChannels)
+    // --- Phase 3: Poll for dispatch function + respawn threads ---
     const dispatchKey = Symbol.for("openclaw.reviewerDispatch");
     type DispatchFn = (p: {
       channelId: string;
@@ -716,7 +790,7 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
       );
       return;
     }
-    for (const { channelId, threadTs } of threads) {
+    for (const { channelId, threadTs } of allThreads) {
       try {
         await dispatchFn({
           channelId,

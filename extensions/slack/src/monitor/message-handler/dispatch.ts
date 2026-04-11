@@ -56,7 +56,7 @@ function pendingReactionsPath(): string {
   return path.join(stateDir, "pending-reactions.json");
 }
 
-function trackPendingAckReaction(channel: string, messageTs: string, emoji: string): void {
+function trackPendingAckReaction(channel: string, messageTs: string, emoji: string, threadTs?: string): void {
   try {
     const filePath = pendingReactionsPath();
     let data: Record<string, unknown> = {};
@@ -67,6 +67,7 @@ function trackPendingAckReaction(channel: string, messageTs: string, emoji: stri
       channel,
       messageTs,
       emoji,
+      threadTs: threadTs ?? messageTs,
       addedAt: new Date().toISOString(),
     };
     const tmp = filePath + ".tmp";
@@ -288,6 +289,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
       message.channel,
       reactionMessageTs,
       toSlackEmojiName(prepared.ackReactionValue),
+      incomingThreadTs ?? messageTs,
     );
   }
 
