@@ -3,8 +3,6 @@ import {
   adaptScopedAccountAccessor,
   createScopedChannelConfigAdapter,
 } from "openclaw/plugin-sdk/channel-config-helpers";
-import type { ChannelPlugin } from "../runtime-api.js";
-import { buildChannelConfigSchema, formatAllowFromLowercase } from "../runtime-api.js";
 import {
   listZalouserAccountIds,
   resolveDefaultZalouserAccountId,
@@ -12,10 +10,12 @@ import {
   checkZcaAuthenticated,
   type ResolvedZalouserAccount,
 } from "./accounts.js";
+import type { ChannelPlugin } from "./channel-api.js";
+import { buildChannelConfigSchema, formatAllowFromLowercase } from "./channel-api.js";
 import { ZalouserConfigSchema } from "./config-schema.js";
 import { zalouserDoctor } from "./doctor.js";
 
-export const zalouserMeta = {
+const zalouserMeta: ChannelPlugin<ResolvedZalouserAccount>["meta"] = {
   id: "zalouser",
   label: "Zalo Personal",
   selectionLabel: "Zalo (Personal Account)",
@@ -25,7 +25,7 @@ export const zalouserMeta = {
   aliases: ["zlu"],
   order: 85,
   quickstartAllowFrom: false,
-} satisfies ChannelPlugin<ResolvedZalouserAccount>["meta"];
+};
 
 const zalouserConfigAdapter = createScopedChannelConfigAdapter<ResolvedZalouserAccount>({
   sectionKey: "zalouser",

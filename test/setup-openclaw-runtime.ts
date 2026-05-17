@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll } from "vitest";
+import { afterAll, afterEach, beforeAll, vi } from "vitest";
 import type {
   ChannelId,
   ChannelOutboundAdapter,
@@ -7,25 +7,30 @@ import type {
 import type { OpenClawConfig } from "../src/config/config.js";
 import type { OutboundSendDeps } from "../src/infra/outbound/deliver.js";
 import type { PluginRegistry } from "../src/plugins/registry.js";
-import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../src/plugins/runtime.js";
 import { installSharedTestSetup } from "./setup.shared.js";
 
-const testEnv = installSharedTestSetup();
+installSharedTestSetup();
 
 const WORKER_RUNTIME_STATE = Symbol.for("openclaw.testSetupRuntimeState");
-const WORKER_CLEANUP_DEPS = Symbol.for("openclaw.testSetupCleanupDeps");
-
+const WORKER_PLUGIN_RUNTIME_HELPERS = Symbol.for("openclaw.testSetupPluginRuntimeHelpers");
+const WORKER_CLEANUP_HELPERS = Symbol.for("openclaw.testSetupCleanupHelpers");
 type WorkerRuntimeState = {
   defaultPluginRegistry: PluginRegistry | null;
   materializedDefaultPluginRegistry: PluginRegistry | null;
 };
-
-type WorkerCleanupDeps = {
-  resetContextWindowCacheForTest: typeof import("../src/agents/context.js").resetContextWindowCacheForTest;
-  resetModelsJsonReadyCacheForTest: typeof import("../src/agents/models-config.js").resetModelsJsonReadyCacheForTest;
+type WorkerPluginRuntimeHelpers = {
+  resetPluginRuntimeStateForTest: typeof import("../src/plugins/runtime.js").resetPluginRuntimeStateForTest;
+  setActivePluginRegistry: typeof import("../src/plugins/runtime.js").setActivePluginRegistry;
+};
+type WorkerCleanupHelpers = {
+  clearSessionStoreCaches: typeof import("../src/config/sessions/store-cache.js").clearSessionStoreCaches;
+  drainFileLockStateForTest: typeof import("../src/infra/file-lock.js").drainFileLockStateForTest;
+  drainSessionStoreWriterQueuesForTest: typeof import("../src/config/sessions/store-writer-state.js").drainSessionStoreWriterQueuesForTest;
   drainSessionWriteLockStateForTest: typeof import("../src/agents/session-write-lock.js").drainSessionWriteLockStateForTest;
+  resetContextWindowCacheForTest: typeof import("../src/agents/context-runtime-state.js").resetContextWindowCacheForTest;
+  resetFileLockStateForTest: typeof import("../src/infra/file-lock.js").resetFileLockStateForTest;
+  resetModelsJsonReadyCacheForTest: typeof import("../src/agents/models-config-state.js").resetModelsJsonReadyCacheForTest;
   resetSessionWriteLockStateForTest: typeof import("../src/agents/session-write-lock.js").resetSessionWriteLockStateForTest;
-  cleanupSessionStateForTest: typeof import("../src/test-utils/session-state-cleanup.js").cleanupSessionStateForTest;
 };
 
 type ReplyToModeResolver = NonNullable<
@@ -45,40 +50,62 @@ const workerRuntimeState = (() => {
   return globalState[WORKER_RUNTIME_STATE];
 })();
 
-async function loadWorkerCleanupDeps(): Promise<WorkerCleanupDeps> {
-  const [
-    { resetContextWindowCacheForTest },
-    { resetModelsJsonReadyCacheForTest },
-    { drainSessionWriteLockStateForTest, resetSessionWriteLockStateForTest },
-    { cleanupSessionStateForTest },
-  ] = await Promise.all([
-    import("../src/agents/context.js"),
-    import("../src/agents/models-config.js"),
-    import("../src/agents/session-write-lock.js"),
-    import("../src/test-utils/session-state-cleanup.js"),
-  ]);
-
-  return {
-    resetContextWindowCacheForTest,
-    resetModelsJsonReadyCacheForTest,
-    drainSessionWriteLockStateForTest,
-    resetSessionWriteLockStateForTest,
-    cleanupSessionStateForTest,
-  };
-}
-
-function getWorkerCleanupDeps(): Promise<WorkerCleanupDeps> {
+function loadWorkerPluginRuntimeHelpers(): Promise<WorkerPluginRuntimeHelpers> {
   const globalState = globalThis as typeof globalThis & {
-    [WORKER_CLEANUP_DEPS]?: Promise<WorkerCleanupDeps>;
+    [WORKER_PLUGIN_RUNTIME_HELPERS]?: Promise<WorkerPluginRuntimeHelpers>;
   };
-  globalState[WORKER_CLEANUP_DEPS] ??= loadWorkerCleanupDeps();
-  return globalState[WORKER_CLEANUP_DEPS];
+  globalState[WORKER_PLUGIN_RUNTIME_HELPERS] ??= import("../src/plugins/runtime.js").then(
+    (pluginRuntime) => ({
+      resetPluginRuntimeStateForTest: pluginRuntime.resetPluginRuntimeStateForTest,
+      setActivePluginRegistry: pluginRuntime.setActivePluginRegistry,
+    }),
+  );
+  return globalState[WORKER_PLUGIN_RUNTIME_HELPERS];
 }
 
-// Preload cleanup/runtime helpers before per-file vi.mock hoists run in
-// non-isolated workers, otherwise test-scoped module mocks can leak into the
-// shared cleanup dependency graph.
-void getWorkerCleanupDeps();
+function loadWorkerCleanupHelpers(): Promise<WorkerCleanupHelpers> {
+  const globalState = globalThis as typeof globalThis & {
+    [WORKER_CLEANUP_HELPERS]?: Promise<WorkerCleanupHelpers>;
+  };
+  globalState[WORKER_CLEANUP_HELPERS] ??= Promise.all([
+    vi.importActual<typeof import("../src/agents/context-runtime-state.js")>(
+      "../src/agents/context-runtime-state.js",
+    ),
+    vi.importActual<typeof import("../src/agents/models-config-state.js")>(
+      "../src/agents/models-config-state.js",
+    ),
+    vi.importActual<typeof import("../src/agents/session-write-lock.js")>(
+      "../src/agents/session-write-lock.js",
+    ),
+    vi.importActual<typeof import("../src/config/sessions/store-cache.js")>(
+      "../src/config/sessions/store-cache.js",
+    ),
+    vi.importActual<typeof import("../src/config/sessions/store-writer-state.js")>(
+      "../src/config/sessions/store-writer-state.js",
+    ),
+    vi.importActual<typeof import("../src/infra/file-lock.js")>("../src/infra/file-lock.js"),
+  ]).then(
+    ([
+      contextRuntimeState,
+      modelsConfigState,
+      sessionWriteLock,
+      sessionStoreCache,
+      sessionStoreWriterState,
+      fileLock,
+    ]) => ({
+      clearSessionStoreCaches: sessionStoreCache.clearSessionStoreCaches,
+      drainFileLockStateForTest: fileLock.drainFileLockStateForTest,
+      drainSessionStoreWriterQueuesForTest:
+        sessionStoreWriterState.drainSessionStoreWriterQueuesForTest,
+      drainSessionWriteLockStateForTest: sessionWriteLock.drainSessionWriteLockStateForTest,
+      resetContextWindowCacheForTest: contextRuntimeState.resetContextWindowCacheForTest,
+      resetFileLockStateForTest: fileLock.resetFileLockStateForTest,
+      resetModelsJsonReadyCacheForTest: modelsConfigState.resetModelsJsonReadyCacheForTest,
+      resetSessionWriteLockStateForTest: sessionWriteLock.resetSessionWriteLockStateForTest,
+    }),
+  );
+  return globalState[WORKER_CLEANUP_HELPERS];
+}
 
 const pickSendFn = (id: ChannelId, deps?: OutboundSendDeps) => {
   return deps?.[id] as ((...args: unknown[]) => Promise<unknown>) | undefined;
@@ -110,14 +137,23 @@ function createTestRegistryForSetup(
     })),
     providers: [],
     speechProviders: [],
+    realtimeTranscriptionProviders: [],
+    realtimeVoiceProviders: [],
     mediaUnderstandingProviders: [],
     imageGenerationProviders: [],
+    videoGenerationProviders: [],
     webFetchProviders: [],
     webSearchProviders: [],
+    migrationProviders: [],
+    memoryEmbeddingProviders: [],
     gatewayHandlers: {},
     httpRoutes: [],
     cliRegistrars: [],
+    reloads: [],
+    nodeHostCommands: [],
+    securityAuditCollectors: [],
     services: [],
+    gatewayDiscoveryServices: [],
     commands: [],
     conversationBindingResolvedHandlers: [],
     diagnostics: [],
@@ -336,7 +372,9 @@ function resolveDefaultPluginRegistryProxy(): PluginRegistry {
   return workerRuntimeState.defaultPluginRegistry;
 }
 
-function installDefaultPluginRegistry(): void {
+async function installDefaultPluginRegistry(): Promise<void> {
+  const { resetPluginRuntimeStateForTest, setActivePluginRegistry } =
+    await loadWorkerPluginRuntimeHelpers();
   workerRuntimeState.materializedDefaultPluginRegistry = null;
   resetPluginRuntimeStateForTest();
   setActivePluginRegistry(resolveDefaultPluginRegistryProxy());
@@ -345,30 +383,38 @@ function installDefaultPluginRegistry(): void {
 // Some suites import channel/plugin consumers at module top level, before
 // Vitest runs hooks. Seed the lazy registry during setup module evaluation so
 // import-time lookups still see the default test registry.
-installDefaultPluginRegistry();
+await installDefaultPluginRegistry();
 
-beforeAll(() => {
-  installDefaultPluginRegistry();
+beforeAll(async () => {
+  await installDefaultPluginRegistry();
 });
 
 afterEach(async () => {
   const {
-    cleanupSessionStateForTest,
+    clearSessionStoreCaches,
+    drainFileLockStateForTest,
+    drainSessionStoreWriterQueuesForTest,
+    drainSessionWriteLockStateForTest,
     resetContextWindowCacheForTest,
+    resetFileLockStateForTest,
     resetModelsJsonReadyCacheForTest,
     resetSessionWriteLockStateForTest,
-  } = await getWorkerCleanupDeps();
-  await cleanupSessionStateForTest();
+  } = await loadWorkerCleanupHelpers();
+  await drainSessionStoreWriterQueuesForTest();
+  clearSessionStoreCaches();
+  await drainFileLockStateForTest();
+  await drainSessionWriteLockStateForTest();
+  resetFileLockStateForTest();
   resetContextWindowCacheForTest();
   resetModelsJsonReadyCacheForTest();
   resetSessionWriteLockStateForTest();
-  installDefaultPluginRegistry();
+  await installDefaultPluginRegistry();
 });
 
 afterAll(async () => {
-  const { cleanupSessionStateForTest, drainSessionWriteLockStateForTest } =
-    await getWorkerCleanupDeps();
-  await cleanupSessionStateForTest();
+  const { clearSessionStoreCaches, drainFileLockStateForTest, drainSessionWriteLockStateForTest } =
+    await loadWorkerCleanupHelpers();
+  clearSessionStoreCaches();
+  await drainFileLockStateForTest();
   await drainSessionWriteLockStateForTest();
-  testEnv.cleanup();
 });

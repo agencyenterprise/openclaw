@@ -1,17 +1,11 @@
 import { sanitizeForPlainText } from "openclaw/plugin-sdk/outbound-runtime";
-import {
-  resolvePayloadMediaUrls,
-  sendPayloadMediaSequence,
-  sendPayloadMediaSequenceAndFinalize,
-  sendPayloadMediaSequenceOrFallback,
-  sendTextMediaPayload,
-} from "openclaw/plugin-sdk/reply-payload";
+import { sendTextMediaPayload } from "openclaw/plugin-sdk/reply-payload";
 import { chunkText } from "../../../auto-reply/chunk.js";
-import type { OpenClawConfig } from "../../../config/config.js";
+import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import type { OutboundSendDeps } from "../../../infra/outbound/deliver.js";
 import type { OutboundMediaAccess } from "../../../media/load-options.js";
 import { resolveChannelMediaMaxBytes } from "../media-limits.js";
-import type { ChannelOutboundAdapter } from "../types.js";
+import type { ChannelOutboundAdapter } from "../types.adapters.js";
 
 type DirectSendOptions = {
   cfg: OpenClawConfig;
@@ -51,14 +45,14 @@ export function resolveScopedChannelMediaMaxBytes(params: {
   });
 }
 
-export function createScopedChannelMediaMaxBytesResolver(channel: "imessage" | "signal") {
+export function createScopedChannelMediaMaxBytesResolver(channel: string) {
   return (params: { cfg: OpenClawConfig; accountId?: string | null }) =>
     resolveScopedChannelMediaMaxBytes({
       cfg: params.cfg,
       accountId: params.accountId,
       resolveChannelLimitMb: ({ cfg, accountId }) =>
-        cfg.channels?.[channel]?.accounts?.[accountId]?.mediaMaxMb ??
-        cfg.channels?.[channel]?.mediaMaxMb,
+        (cfg.channels?.[channel]?.accounts?.[accountId] as { mediaMaxMb?: number } | undefined)
+          ?.mediaMaxMb ?? cfg.channels?.[channel]?.mediaMaxMb,
     });
 }
 
@@ -66,7 +60,7 @@ export function createDirectTextMediaOutbound<
   TOpts extends Record<string, unknown>,
   TResult extends DirectSendResult,
 >(params: {
-  channel: "imessage" | "signal";
+  channel: string;
   resolveSender: (deps: OutboundSendDeps | undefined) => DirectSendFn<TOpts, TResult>;
   resolveMaxBytes: (params: {
     cfg: OpenClawConfig;

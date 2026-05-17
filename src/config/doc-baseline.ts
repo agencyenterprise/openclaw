@@ -1,9 +1,10 @@
+import { createHash } from "node:crypto";
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveOpenClawPackageRootSync } from "../infra/openclaw-root.js";
-import { FIELD_HELP } from "./schema.help.js";
+import { replaceFileAtomicSync } from "../infra/replace-file.js";
 import type { ConfigSchemaResponse } from "./schema.js";
 import { schemaHasChildren } from "./schema.shared.js";
 
@@ -25,7 +26,7 @@ type JsonSchemaObject = JsonSchemaNode & {
   oneOf?: JsonSchemaObject[];
 };
 
-export type ConfigDocBaselineKind = "core" | "channel" | "plugin";
+type ConfigDocBaselineKind = "core" | "channel" | "plugin";
 
 export type ConfigDocBaselineEntry = {
   path: string;
@@ -42,42 +43,43 @@ export type ConfigDocBaselineEntry = {
   hasChildren: boolean;
 };
 
-export type ConfigDocBaseline = {
+type ConfigDocBaseline = {
   generatedBy: "scripts/generate-config-doc-baseline.ts";
   coreEntries: ConfigDocBaselineEntry[];
   channelEntries: ConfigDocBaselineEntry[];
   pluginEntries: ConfigDocBaselineEntry[];
 };
 
-export type ConfigDocBaselineKindBaseline = {
+type ConfigDocBaselineKindBaseline = {
   generatedBy: "scripts/generate-config-doc-baseline.ts";
   kind: ConfigDocBaselineKind;
   entries: ConfigDocBaselineEntry[];
 };
 
-export type ConfigDocBaselineArtifacts = {
+type ConfigDocBaselineArtifacts = {
   combined: string;
   core: string;
   channel: string;
   plugin: string;
 };
 
-export type ConfigDocBaselineArtifactsRender = {
+type ConfigDocBaselineArtifactsRender = {
   baseline: ConfigDocBaseline;
   json: ConfigDocBaselineArtifacts;
 };
 
-export type ConfigDocBaselineArtifactPaths = {
+type ConfigDocBaselineArtifactPaths = {
   combined: string;
   core: string;
   channel: string;
   plugin: string;
 };
 
-export type ConfigDocBaselineArtifactsWriteResult = {
+type ConfigDocBaselineArtifactsWriteResult = {
   changed: boolean;
   wrote: boolean;
   jsonPaths: ConfigDocBaselineArtifactPaths;
+  hashPath: string;
 };
 
 const GENERATED_BY = "scripts/generate-config-doc-baseline.ts" as const;
@@ -85,6 +87,7 @@ const DEFAULT_COMBINED_OUTPUT = "docs/.generated/config-baseline.json";
 const DEFAULT_CORE_OUTPUT = "docs/.generated/config-baseline.core.json";
 const DEFAULT_CHANNEL_OUTPUT = "docs/.generated/config-baseline.channel.json";
 const DEFAULT_PLUGIN_OUTPUT = "docs/.generated/config-baseline.plugin.json";
+const DEFAULT_HASH_OUTPUT = "docs/.generated/config-baseline.sha256";
 let cachedConfigDocBaselinePromise: Promise<ConfigDocBaseline> | null = null;
 let cachedDocBaselineRuntimePromise: Promise<typeof import("./doc-baseline.runtime.js")> | null =
   null;
@@ -362,9 +365,9 @@ async function loadBundledConfigSchemaResponse(): Promise<ConfigSchemaResponse> 
   };
 
   const manifestRegistry = runtime.loadPluginManifestRegistry({
-    cache: false,
     env,
     config: {},
+    bundledChannelConfigCollector: runtime.collectBundledChannelConfigs,
   });
   logConfigDocBaselineDebug(`loaded ${manifestRegistry.plugins.length} bundled plugin manifests`);
   const bundledRegistry = {
@@ -377,7 +380,6 @@ async function loadBundledConfigSchemaResponse(): Promise<ConfigSchemaResponse> 
   );
 
   return runtime.buildConfigSchema({
-    cache: false,
     plugins: runtime.collectPluginSchemaMetadata(bundledRegistry),
     channels: channelPlugins,
   });
@@ -489,7 +491,7 @@ export function dedupeConfigDocBaselineEntries(
   return [...byPath.values()].toSorted((left, right) => left.path.localeCompare(right.path));
 }
 
-export function splitConfigDocBaselineEntries(entries: ConfigDocBaselineEntry[]): {
+function splitConfigDocBaselineEntries(entries: ConfigDocBaselineEntry[]): {
   coreEntries: ConfigDocBaselineEntry[];
   channelEntries: ConfigDocBaselineEntry[];
   pluginEntries: ConfigDocBaselineEntry[];
@@ -519,7 +521,7 @@ export function flattenConfigDocBaselineEntries(
   return [...baseline.coreEntries, ...baseline.channelEntries, ...baseline.pluginEntries];
 }
 
-export async function buildConfigDocBaseline(): Promise<ConfigDocBaseline> {
+async function buildConfigDocBaseline(): Promise<ConfigDocBaseline> {
   if (cachedConfigDocBaselinePromise) {
     return await cachedConfigDocBaselinePromise;
   }
@@ -587,7 +589,7 @@ export async function renderConfigDocBaselineArtifacts(
   };
 }
 
-async function readIfExists(filePath: string): Promise<string | null> {
+function readFileIfExists(filePath: string): string | null {
   try {
     return fsSync.readFileSync(filePath, "utf8");
   } catch {
@@ -595,14 +597,29 @@ async function readIfExists(filePath: string): Promise<string | null> {
   }
 }
 
-async function writeIfChanged(filePath: string, next: string): Promise<boolean> {
-  const current = await readIfExists(filePath);
-  if (current === next) {
-    return false;
-  }
-  fsSync.mkdirSync(path.dirname(filePath), { recursive: true });
-  fsSync.writeFileSync(filePath, next, "utf8");
-  return true;
+function writeFileAtomic(filePath: string, content: string): void {
+  replaceFileAtomicSync({
+    filePath,
+    content,
+    dirMode: 0o755,
+    mode: 0o644,
+    tempPrefix: path.basename(filePath),
+  });
+}
+
+function sha256(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+/** Build the sha256 hash file content for all config baseline artifacts. */
+function computeConfigBaselineHashFileContent(json: ConfigDocBaselineArtifacts): string {
+  const lines = [
+    `${sha256(json.combined)}  config-baseline.json`,
+    `${sha256(json.core)}  config-baseline.core.json`,
+    `${sha256(json.channel)}  config-baseline.channel.json`,
+    `${sha256(json.plugin)}  config-baseline.plugin.json`,
+  ];
+  return `${lines.join("\n")}\n`;
 }
 
 function resolveBaselineArtifactPaths(
@@ -629,29 +646,24 @@ export async function writeConfigDocBaselineArtifacts(params?: {
   corePath?: string;
   channelPath?: string;
   pluginPath?: string;
+  hashPath?: string;
   rendered?: ConfigDocBaselineArtifactsRender | Promise<ConfigDocBaselineArtifactsRender>;
 }): Promise<ConfigDocBaselineArtifactsWriteResult> {
   const start = Date.now();
   logConfigDocBaselineDebug("write artifacts start");
   const repoRoot = params?.repoRoot ?? resolveRepoRoot();
   const jsonPaths = resolveBaselineArtifactPaths(repoRoot, params);
+  const hashPath = path.resolve(repoRoot, params?.hashPath ?? DEFAULT_HASH_OUTPUT);
   const rendered = params?.rendered
     ? await params.rendered
     : await renderConfigDocBaselineArtifacts();
   logConfigDocBaselineDebug(`render artifacts done elapsedMs=${Date.now() - start}`);
 
-  const current = await Promise.all(
-    Object.entries(jsonPaths).map(async ([key, filePath]) => [key, await readIfExists(filePath)]),
-  );
-  const currentByKey = Object.fromEntries(current) as Record<
-    keyof ConfigDocBaselineArtifacts,
-    string | null
-  >;
-  const changed = (Object.keys(jsonPaths) as Array<keyof ConfigDocBaselineArtifacts>).some(
-    (key) => currentByKey[key] !== rendered.json[key],
-  );
+  const nextHashContent = computeConfigBaselineHashFileContent(rendered.json);
+  const currentHashContent = readFileIfExists(hashPath);
+  const changed = currentHashContent !== nextHashContent;
   logConfigDocBaselineDebug(
-    `compare artifacts done changed=${changed} elapsedMs=${Date.now() - start}`,
+    `compare hashes done changed=${changed} elapsedMs=${Date.now() - start}`,
   );
 
   if (params?.check) {
@@ -659,29 +671,26 @@ export async function writeConfigDocBaselineArtifacts(params?: {
       changed,
       wrote: false,
       jsonPaths,
+      hashPath,
     };
   }
 
-  const wroteResults = await Promise.all(
-    (Object.keys(jsonPaths) as Array<keyof ConfigDocBaselineArtifacts>).map((key) =>
-      writeIfChanged(jsonPaths[key], rendered.json[key]),
-    ),
-  );
+  // Write the hash file (tracked in git)
+  writeFileAtomic(hashPath, nextHashContent);
+
+  // Write full JSON artifacts locally (gitignored, useful for inspection)
+  for (const key of Object.keys(jsonPaths) as Array<keyof ConfigDocBaselineArtifacts>) {
+    writeFileAtomic(jsonPaths[key], rendered.json[key]);
+  }
+
   return {
     changed,
-    wrote: wroteResults.some(Boolean),
+    wrote: true,
     jsonPaths,
+    hashPath,
   };
 }
 
 export function normalizeConfigDocBaselineHelpPath(pathValue: string): string {
   return normalizeBaselinePath(pathValue);
-}
-
-export function getNormalizedFieldHelp(): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(FIELD_HELP)
-      .map(([configPath, help]) => [normalizeBaselinePath(configPath), help] as const)
-      .toSorted(([left], [right]) => left.localeCompare(right)),
-  );
 }

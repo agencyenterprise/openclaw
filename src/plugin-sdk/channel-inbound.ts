@@ -26,16 +26,51 @@ export {
   shouldDebounceTextInbound,
 } from "../channels/inbound-debounce-policy.js";
 export type {
+  InboundMentionFacts,
+  InboundMentionPolicy,
+  InboundImplicitMentionKind,
+  InboundMentionDecision,
   MentionGateParams,
   MentionGateResult,
   MentionGateWithBypassParams,
   MentionGateWithBypassResult,
+  ResolveInboundMentionDecisionFlatParams,
+  ResolveInboundMentionDecisionNestedParams,
+  ResolveInboundMentionDecisionParams,
 } from "../channels/mention-gating.js";
 export {
+  implicitMentionKindWhen,
+  resolveInboundMentionDecision,
+  // @deprecated Prefer `resolveInboundMentionDecision({ facts, policy })`.
   resolveMentionGating,
+  // @deprecated Prefer `resolveInboundMentionDecision({ facts, policy })`.
   resolveMentionGatingWithBypass,
 } from "../channels/mention-gating.js";
 export type { NormalizedLocation } from "../channels/location.js";
 export { formatLocationText, toLocationContext } from "../channels/location.js";
 export { logInboundDrop } from "../channels/logging.js";
 export { resolveInboundSessionEnvelopeContext } from "../channels/session-envelope.js";
+export {
+  buildChannelTurnContext,
+  filterChannelTurnSupplementalContext,
+} from "../channels/turn/context.js";
+export type {
+  BuildChannelTurnContextParams,
+  BuiltChannelTurnContext,
+} from "../channels/turn/context.js";
+export {
+  buildChannelTurnMediaPayload,
+  toHistoryMediaEntries,
+  toInboundMediaFacts,
+} from "../channels/turn/media.js";
+export type { ChannelTurnMediaInput, ChannelTurnMediaPayload } from "../channels/turn/media.js";
+export type { CommandFacts, InboundMediaFacts, InboundTurnKind } from "../channels/turn/types.js";
+export {
+  createCommandTurnContext,
+  isAuthorizedTextSlashCommandTurn,
+  isExplicitCommandTurn,
+  isNativeCommandTurn,
+  isTextSlashCommandTurn,
+} from "../auto-reply/command-turn-context.js";
+export type { CommandTurnContext } from "../auto-reply/command-turn-context.js";
+export { mergeInboundPathRoots } from "../media/inbound-path-policy.js";

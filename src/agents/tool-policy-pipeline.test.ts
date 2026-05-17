@@ -17,9 +17,7 @@ function runAllowlistWarningStep(params: {
   const warnings: string[] = [];
   const tools = [{ name: "exec" }] as unknown as DummyTool[];
   applyToolPolicyPipeline({
-    // oxlint-disable-next-line typescript/no-explicit-any
     tools: tools as any,
-    // oxlint-disable-next-line typescript/no-explicit-any
     toolMeta: () => undefined,
     warn: (msg) => warnings.push(msg),
     steps: [
@@ -44,9 +42,7 @@ describe("tool-policy-pipeline", () => {
   test("preserves plugin-only allowlists instead of silently stripping them", () => {
     const tools = [{ name: "exec" }, { name: "plugin_tool" }] as unknown as DummyTool[];
     const filtered = applyToolPolicyPipeline({
-      // oxlint-disable-next-line typescript/no-explicit-any
       tools: tools as any,
-      // oxlint-disable-next-line typescript/no-explicit-any
       toolMeta: (t: any) => (t.name === "plugin_tool" ? { pluginId: "foo" } : undefined),
       warn: () => {},
       steps: [
@@ -65,9 +61,7 @@ describe("tool-policy-pipeline", () => {
     const warnings: string[] = [];
     const tools = [{ name: "exec" }] as unknown as DummyTool[];
     applyToolPolicyPipeline({
-      // oxlint-disable-next-line typescript/no-explicit-any
       tools: tools as any,
-      // oxlint-disable-next-line typescript/no-explicit-any
       toolMeta: () => undefined,
       warn: (msg) => warnings.push(msg),
       steps: [
@@ -78,8 +72,9 @@ describe("tool-policy-pipeline", () => {
         },
       ],
     });
-    expect(warnings.length).toBe(1);
-    expect(warnings[0]).toContain("unknown entries (wat)");
+    expect(warnings).toEqual([
+      "tools: tools.allow allowlist contains unknown entries (wat). These entries won't match any tool unless the plugin is enabled.",
+    ]);
   });
 
   test("suppresses built-in profile warnings for unavailable gated core tools", () => {
@@ -88,7 +83,7 @@ describe("tool-policy-pipeline", () => {
       label: "tools.profile (coding)",
       suppressUnavailableCoreToolWarningAllowlist: ["apply_patch"],
     });
-    expect(warnings).toEqual([]);
+    expect(warnings).toStrictEqual([]);
   });
 
   test("still warns for profile steps when explicit alsoAllow entries are present", () => {
@@ -97,12 +92,9 @@ describe("tool-policy-pipeline", () => {
       label: "tools.profile (coding)",
       suppressUnavailableCoreToolWarningAllowlist: ["apply_patch"],
     });
-    expect(warnings.length).toBe(1);
-    expect(warnings[0]).toContain("unknown entries (browser)");
-    expect(warnings[0]).not.toContain("apply_patch");
-    expect(warnings[0]).toContain(
-      "shipped core tools but unavailable in the current runtime/provider/model/config",
-    );
+    expect(warnings).toEqual([
+      "tools: tools.profile (coding) allowlist contains unknown entries (browser). These entries are shipped core tools but unavailable in the current runtime/provider/model/config.",
+    ]);
   });
 
   test("still warns for explicit allowlists that mention unavailable gated core tools", () => {
@@ -110,22 +102,16 @@ describe("tool-policy-pipeline", () => {
       allow: ["apply_patch"],
       label: "tools.allow",
     });
-    expect(warnings.length).toBe(1);
-    expect(warnings[0]).toContain("unknown entries (apply_patch)");
-    expect(warnings[0]).toContain(
-      "shipped core tools but unavailable in the current runtime/provider/model/config",
-    );
-    expect(warnings[0]).not.toContain("Allowlist contains only plugin entries");
-    expect(warnings[0]).not.toContain("unless the plugin is enabled");
+    expect(warnings).toEqual([
+      "tools: tools.allow allowlist contains unknown entries (apply_patch). These entries are shipped core tools but unavailable in the current runtime/provider/model/config.",
+    ]);
   });
 
   test("default profile steps suppress unavailable baseline profile entries", () => {
     const warnings: string[] = [];
     const profilePolicy = resolveToolProfilePolicy("coding");
     applyToolPolicyPipeline({
-      // oxlint-disable-next-line typescript/no-explicit-any
       tools: [{ name: "exec" }] as any,
-      // oxlint-disable-next-line typescript/no-explicit-any
       toolMeta: () => undefined,
       warn: (msg) => warnings.push(msg),
       steps: buildDefaultToolPolicyPipelineSteps({
@@ -135,16 +121,14 @@ describe("tool-policy-pipeline", () => {
       }),
     });
 
-    expect(warnings).toEqual([]);
+    expect(warnings).toStrictEqual([]);
   });
 
   test("dedupes identical unknown-allowlist warnings across repeated runs", () => {
     const warnings: string[] = [];
     const tools = [{ name: "exec" }] as unknown as DummyTool[];
     const params = {
-      // oxlint-disable-next-line typescript/no-explicit-any
       tools: tools as any,
-      // oxlint-disable-next-line typescript/no-explicit-any
       toolMeta: () => undefined,
       warn: (msg: string) => warnings.push(msg),
       steps: [
@@ -168,9 +152,7 @@ describe("tool-policy-pipeline", () => {
 
     for (let i = 0; i < 257; i += 1) {
       applyToolPolicyPipeline({
-        // oxlint-disable-next-line typescript/no-explicit-any
         tools: tools as any,
-        // oxlint-disable-next-line typescript/no-explicit-any
         toolMeta: () => undefined,
         warn: (msg: string) => warnings.push(msg),
         steps: [
@@ -184,9 +166,7 @@ describe("tool-policy-pipeline", () => {
     }
 
     applyToolPolicyPipeline({
-      // oxlint-disable-next-line typescript/no-explicit-any
       tools: tools as any,
-      // oxlint-disable-next-line typescript/no-explicit-any
       toolMeta: () => undefined,
       warn: (msg: string) => warnings.push(msg),
       steps: [
@@ -207,9 +187,7 @@ describe("tool-policy-pipeline", () => {
 
     for (let i = 0; i < 256; i += 1) {
       applyToolPolicyPipeline({
-        // oxlint-disable-next-line typescript/no-explicit-any
         tools: tools as any,
-        // oxlint-disable-next-line typescript/no-explicit-any
         toolMeta: () => undefined,
         warn: (msg: string) => warnings.push(msg),
         steps: [
@@ -225,9 +203,7 @@ describe("tool-policy-pipeline", () => {
     warnings.length = 0;
 
     applyToolPolicyPipeline({
-      // oxlint-disable-next-line typescript/no-explicit-any
       tools: tools as any,
-      // oxlint-disable-next-line typescript/no-explicit-any
       toolMeta: () => undefined,
       warn: (msg: string) => warnings.push(msg),
       steps: [
@@ -239,9 +215,7 @@ describe("tool-policy-pipeline", () => {
       ],
     });
     applyToolPolicyPipeline({
-      // oxlint-disable-next-line typescript/no-explicit-any
       tools: tools as any,
-      // oxlint-disable-next-line typescript/no-explicit-any
       toolMeta: () => undefined,
       warn: (msg: string) => warnings.push(msg),
       steps: [
@@ -249,16 +223,16 @@ describe("tool-policy-pipeline", () => {
       ],
     });
 
-    expect(warnings).toHaveLength(2);
-    expect(warnings[1]).toContain("unknown_0");
+    expect(warnings).toEqual([
+      "tools: tools.allow allowlist contains unknown entries (unknown_256). These entries won't match any tool unless the plugin is enabled.",
+      "tools: tools.allow allowlist contains unknown entries (unknown_0). These entries won't match any tool unless the plugin is enabled.",
+    ]);
   });
 
   test("applies allowlist filtering when core tools are explicitly listed", () => {
     const tools = [{ name: "exec" }, { name: "process" }] as unknown as DummyTool[];
     const filtered = applyToolPolicyPipeline({
-      // oxlint-disable-next-line typescript/no-explicit-any
       tools: tools as any,
-      // oxlint-disable-next-line typescript/no-explicit-any
       toolMeta: () => undefined,
       warn: () => {},
       steps: [
@@ -275,9 +249,7 @@ describe("tool-policy-pipeline", () => {
   test("applies deny filtering after allow filtering", () => {
     const tools = [{ name: "exec" }, { name: "process" }] as unknown as DummyTool[];
     const filtered = applyToolPolicyPipeline({
-      // oxlint-disable-next-line typescript/no-explicit-any
       tools: tools as any,
-      // oxlint-disable-next-line typescript/no-explicit-any
       toolMeta: () => undefined,
       warn: () => {},
       steps: [

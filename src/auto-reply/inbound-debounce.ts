@@ -1,5 +1,5 @@
-import type { OpenClawConfig } from "../config/config.js";
 import type { InboundDebounceByProvider } from "../config/types.messages.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 
 const resolveMs = (value: unknown): number | undefined => {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -50,6 +50,7 @@ export type InboundDebounceCreateParams<T> = {
   buildKey: (item: T) => string | null | undefined;
   shouldDebounce?: (item: T) => boolean;
   resolveDebounceMs?: (item: T) => number | undefined;
+  serializeImmediate?: boolean;
   onFlush: (items: T[]) => Promise<void>;
   onError?: (err: unknown, items: T[]) => void;
 };
@@ -86,11 +87,35 @@ export function createInboundDebouncer<T>(params: InboundDebounceCreateParams<T>
     const next = previous.catch(() => undefined).then(task);
     const settled = next.catch(() => undefined);
     keyChains.set(key, settled);
-    void settled.finally(() => {
+    const cleanup = () => {
       if (keyChains.get(key) === settled) {
         keyChains.delete(key);
       }
+    };
+    settled.then(cleanup, cleanup);
+    return next;
+  };
+
+  const runKeyTaskNow = (key: string, task: () => Promise<void>) => {
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
     });
+    keyChains.set(key, settled);
+    const cleanup = () => {
+      resolveSettled();
+      if (keyChains.get(key) === settled) {
+        keyChains.delete(key);
+      }
+    };
+    let next: Promise<void>;
+    try {
+      next = task();
+    } catch (err) {
+      cleanup();
+      throw err;
+    }
+    next.then(cleanup, cleanup);
     return next;
   };
 
@@ -185,6 +210,12 @@ export function createInboundDebouncer<T>(params: InboundDebounceCreateParams<T>
         }
         if (keyChains.has(key)) {
           await enqueueKeyTask(key, async () => {
+            await runFlush([item]);
+          });
+          return;
+        }
+        if (params.serializeImmediate) {
+          await runKeyTaskNow(key, async () => {
             await runFlush([item]);
           });
           return;

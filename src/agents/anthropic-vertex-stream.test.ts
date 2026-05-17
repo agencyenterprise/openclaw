@@ -1,218 +1,121 @@
-import type { Model } from "@mariozechner/pi-ai";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
+import { resetFacadeRuntimeStateForTest } from "../plugin-sdk/facade-runtime.js";
+import { setBundledPluginsDirOverrideForTest } from "../plugins/bundled-dir.js";
+import { writePersistedInstalledPluginIndexInstallRecordsSync } from "../plugins/installed-plugin-index-records.js";
 
-const hoisted = vi.hoisted(() => {
-  const streamAnthropicMock = vi.fn<(model: unknown, context: unknown, options: unknown) => symbol>(
-    () => Symbol("anthropic-vertex-stream"),
-  );
-  const anthropicVertexCtorMock = vi.fn();
+const originalBundledPluginsDir = process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
+const originalDisableBundledPlugins = process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS;
+const originalStateDir = process.env.OPENCLAW_STATE_DIR;
+const tempDirs: string[] = [];
 
-  return {
-    streamAnthropicMock,
-    anthropicVertexCtorMock,
-  };
-});
+function makeTempDir(prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
 
-vi.mock("@mariozechner/pi-ai", async () => {
-  const original =
-    await vi.importActual<typeof import("@mariozechner/pi-ai")>("@mariozechner/pi-ai");
-  return {
-    ...original,
-    streamAnthropic: (model: unknown, context: unknown, options: unknown) =>
-      hoisted.streamAnthropicMock(model, context, options),
-  };
-});
-
-vi.mock("@anthropic-ai/vertex-sdk", () => ({
-  AnthropicVertex: vi.fn(function MockAnthropicVertex(options: unknown) {
-    hoisted.anthropicVertexCtorMock(options);
-    return { options };
-  }),
-}));
-
-let createAnthropicVertexStreamFn: typeof import("./anthropic-vertex-stream.js").createAnthropicVertexStreamFn;
-let createAnthropicVertexStreamFnForModel: typeof import("./anthropic-vertex-stream.js").createAnthropicVertexStreamFnForModel;
-
-async function loadFreshAnthropicVertexStreamModuleForTest() {
-  vi.resetModules();
-  vi.doMock("@mariozechner/pi-ai", async () => {
-    const original =
-      await vi.importActual<typeof import("@mariozechner/pi-ai")>("@mariozechner/pi-ai");
-    return {
-      ...original,
-      streamAnthropic: (model: unknown, context: unknown, options: unknown) =>
-        hoisted.streamAnthropicMock(model, context, options),
-    };
-  });
-  vi.doMock("@anthropic-ai/vertex-sdk", () => ({
-    AnthropicVertex: vi.fn(function MockAnthropicVertex(options: unknown) {
-      hoisted.anthropicVertexCtorMock(options);
-      return { options };
+function writeExternalAnthropicVertexPlugin(rootDir: string): void {
+  fs.mkdirSync(rootDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(rootDir, "package.json"),
+    JSON.stringify({
+      name: "@openclaw/anthropic-vertex-provider",
+      version: "0.0.0",
+      type: "module",
+      openclaw: {
+        extensions: ["./index.js", "./api.js"],
+      },
     }),
-  }));
-  return await import("./anthropic-vertex-stream.js");
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(rootDir, "openclaw.plugin.json"),
+    JSON.stringify({
+      id: "anthropic-vertex",
+      providers: ["anthropic-vertex"],
+      configSchema: { type: "object", additionalProperties: false, properties: {} },
+    }),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(rootDir, "api.js"),
+    [
+      "export function createAnthropicVertexStreamFnForModel(model, env) {",
+      "  return async () => ({ marker: 'external-vertex', baseUrl: model.baseUrl, envMarker: env.OPENCLAW_TEST_MARKER });",
+      "}",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(rootDir, "index.js"), "export default {};\n", "utf8");
 }
 
-function makeModel(params: { id: string; maxTokens?: number }): Model<"anthropic-messages"> {
-  return {
-    id: params.id,
-    api: "anthropic-messages",
-    provider: "anthropic-vertex",
-    ...(params.maxTokens !== undefined ? { maxTokens: params.maxTokens } : {}),
-  } as Model<"anthropic-messages">;
-}
-
-describe("createAnthropicVertexStreamFn", () => {
-  beforeEach(() => {
-    hoisted.streamAnthropicMock.mockClear();
-    hoisted.anthropicVertexCtorMock.mockClear();
-  });
-
-  beforeEach(async () => {
-    ({ createAnthropicVertexStreamFn, createAnthropicVertexStreamFnForModel } =
-      await loadFreshAnthropicVertexStreamModuleForTest());
-  });
-
-  it("omits projectId when ADC credentials are used without an explicit project", () => {
-    const streamFn = createAnthropicVertexStreamFn(undefined, "global");
-
-    void streamFn(makeModel({ id: "claude-sonnet-4-6", maxTokens: 128000 }), { messages: [] }, {});
-
-    expect(hoisted.anthropicVertexCtorMock).toHaveBeenCalledWith({
-      region: "global",
-    });
-  });
-
-  it("passes an explicit baseURL through to the Vertex client", () => {
-    const streamFn = createAnthropicVertexStreamFn(
-      "vertex-project",
-      "us-east5",
-      "https://proxy.example.test/vertex/v1",
-    );
-
-    void streamFn(makeModel({ id: "claude-sonnet-4-6", maxTokens: 128000 }), { messages: [] }, {});
-
-    expect(hoisted.anthropicVertexCtorMock).toHaveBeenCalledWith({
-      projectId: "vertex-project",
-      region: "us-east5",
-      baseURL: "https://proxy.example.test/vertex/v1",
-    });
-  });
-
-  it("defaults maxTokens to the model limit instead of the old 32000 cap", () => {
-    const streamFn = createAnthropicVertexStreamFn("vertex-project", "us-east5");
-    const model = makeModel({ id: "claude-opus-4-6", maxTokens: 128000 });
-
-    void streamFn(model, { messages: [] }, {});
-
-    expect(hoisted.streamAnthropicMock).toHaveBeenCalledWith(
-      model,
-      { messages: [] },
-      expect.objectContaining({
-        maxTokens: 128000,
-      }),
-    );
-  });
-
-  it("clamps explicit maxTokens to the selected model limit", () => {
-    const streamFn = createAnthropicVertexStreamFn("vertex-project", "us-east5");
-    const model = makeModel({ id: "claude-sonnet-4-6", maxTokens: 128000 });
-
-    void streamFn(model, { messages: [] }, { maxTokens: 999999 });
-
-    expect(hoisted.streamAnthropicMock).toHaveBeenCalledWith(
-      model,
-      { messages: [] },
-      expect.objectContaining({
-        maxTokens: 128000,
-      }),
-    );
-  });
-
-  it("maps xhigh reasoning to max effort for adaptive Opus models", () => {
-    const streamFn = createAnthropicVertexStreamFn("vertex-project", "us-east5");
-    const model = makeModel({ id: "claude-opus-4-6", maxTokens: 64000 });
-
-    void streamFn(model, { messages: [] }, { reasoning: "xhigh" });
-
-    expect(hoisted.streamAnthropicMock).toHaveBeenCalledWith(
-      model,
-      { messages: [] },
-      expect.objectContaining({
-        thinkingEnabled: true,
-        effort: "max",
-      }),
-    );
-  });
-
-  it("omits maxTokens when neither the model nor request provide a finite limit", () => {
-    const streamFn = createAnthropicVertexStreamFn("vertex-project", "us-east5");
-    const model = makeModel({ id: "claude-sonnet-4-6" });
-
-    void streamFn(model, { messages: [] }, { maxTokens: Number.NaN });
-
-    expect(hoisted.streamAnthropicMock).toHaveBeenCalledWith(
-      model,
-      { messages: [] },
-      expect.not.objectContaining({
-        maxTokens: expect.anything(),
-      }),
-    );
-  });
+afterEach(() => {
+  vi.resetModules();
+  clearRuntimeConfigSnapshot();
+  resetFacadeRuntimeStateForTest();
+  setBundledPluginsDirOverrideForTest(undefined);
+  if (originalBundledPluginsDir === undefined) {
+    delete process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
+  } else {
+    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = originalBundledPluginsDir;
+  }
+  if (originalDisableBundledPlugins === undefined) {
+    delete process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS;
+  } else {
+    process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS = originalDisableBundledPlugins;
+  }
+  if (originalStateDir === undefined) {
+    delete process.env.OPENCLAW_STATE_DIR;
+  } else {
+    process.env.OPENCLAW_STATE_DIR = originalStateDir;
+  }
+  for (const dir of tempDirs.splice(0)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-describe("createAnthropicVertexStreamFnForModel", () => {
-  beforeEach(() => {
-    hoisted.anthropicVertexCtorMock.mockClear();
-  });
+describe("anthropic-vertex stream facade", () => {
+  it("loads the stream facade from an installed external provider when bundled surfaces are absent", async () => {
+    const bundledDir = makeTempDir("openclaw-empty-bundled-vertex-");
+    const stateDir = makeTempDir("openclaw-state-vertex-");
+    const pluginRoot = makeTempDir("openclaw-external-vertex-");
+    writeExternalAnthropicVertexPlugin(pluginRoot);
+    writePersistedInstalledPluginIndexInstallRecordsSync(
+      {
+        "anthropic-vertex": {
+          source: "npm",
+          spec: "@openclaw/anthropic-vertex-provider",
+          installPath: pluginRoot,
+          resolvedName: "@openclaw/anthropic-vertex-provider",
+          resolvedVersion: "0.0.0",
+        },
+      },
+      { stateDir },
+    );
+    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = bundledDir;
+    process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS = "1";
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    setBundledPluginsDirOverrideForTest(bundledDir);
+    setRuntimeConfigSnapshot({});
 
-  beforeEach(async () => {
-    ({ createAnthropicVertexStreamFn, createAnthropicVertexStreamFnForModel } =
-      await loadFreshAnthropicVertexStreamModuleForTest());
-  });
-
-  it("derives project and region from the model and env", () => {
+    const { createAnthropicVertexStreamFnForModel } = await import("./anthropic-vertex-stream.js");
     const streamFn = createAnthropicVertexStreamFnForModel(
-      { baseUrl: "https://europe-west4-aiplatform.googleapis.com" },
-      { GOOGLE_CLOUD_PROJECT_ID: "vertex-project" } as NodeJS.ProcessEnv,
+      { baseUrl: "https://us-central1-aiplatform.googleapis.com" },
+      { OPENCLAW_TEST_MARKER: "registry" },
     );
 
-    void streamFn(makeModel({ id: "claude-sonnet-4-6", maxTokens: 64000 }), { messages: [] }, {});
-
-    expect(hoisted.anthropicVertexCtorMock).toHaveBeenCalledWith({
-      projectId: "vertex-project",
-      region: "europe-west4",
-      baseURL: "https://europe-west4-aiplatform.googleapis.com/v1",
-    });
-  });
-
-  it("preserves explicit custom provider base URLs", () => {
-    const streamFn = createAnthropicVertexStreamFnForModel(
-      { baseUrl: "https://proxy.example.test/custom-root/v1" },
-      { GOOGLE_CLOUD_PROJECT_ID: "vertex-project" } as NodeJS.ProcessEnv,
-    );
-
-    void streamFn(makeModel({ id: "claude-sonnet-4-6", maxTokens: 64000 }), { messages: [] }, {});
-
-    expect(hoisted.anthropicVertexCtorMock).toHaveBeenCalledWith({
-      projectId: "vertex-project",
-      region: "global",
-      baseURL: "https://proxy.example.test/custom-root/v1",
-    });
-  });
-
-  it("adds /v1 for path-prefixed custom provider base URLs", () => {
-    const streamFn = createAnthropicVertexStreamFnForModel(
-      { baseUrl: "https://proxy.example.test/custom-root" },
-      { GOOGLE_CLOUD_PROJECT_ID: "vertex-project" } as NodeJS.ProcessEnv,
-    );
-
-    void streamFn(makeModel({ id: "claude-sonnet-4-6", maxTokens: 64000 }), { messages: [] }, {});
-
-    expect(hoisted.anthropicVertexCtorMock).toHaveBeenCalledWith({
-      projectId: "vertex-project",
-      region: "global",
-      baseURL: "https://proxy.example.test/custom-root/v1",
+    await expect(streamFn({} as never, {} as never, {} as never)).resolves.toEqual({
+      marker: "external-vertex",
+      baseUrl: "https://us-central1-aiplatform.googleapis.com",
+      envMarker: "registry",
     });
   });
 });

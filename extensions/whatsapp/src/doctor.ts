@@ -2,9 +2,13 @@ import type {
   ChannelDoctorAdapter,
   ChannelDoctorConfigMutation,
 } from "openclaw/plugin-sdk/channel-contract";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 
-function normalizeWhatsAppAckReactionConfig(cfg: OpenClawConfig): ChannelDoctorConfigMutation {
+export function normalizeCompatibilityConfig({
+  cfg,
+}: {
+  cfg: OpenClawConfig;
+}): ChannelDoctorConfigMutation {
   const legacyAckReaction = cfg.messages?.ackReaction?.trim();
   if (!legacyAckReaction || cfg.channels?.whatsapp === undefined) {
     return { config: cfg, changes: [] };
@@ -48,5 +52,5 @@ function normalizeWhatsAppAckReactionConfig(cfg: OpenClawConfig): ChannelDoctorC
 }
 
 export const whatsappDoctor: ChannelDoctorAdapter = {
-  normalizeCompatibilityConfig: ({ cfg }) => normalizeWhatsAppAckReactionConfig(cfg),
+  normalizeCompatibilityConfig,
 };

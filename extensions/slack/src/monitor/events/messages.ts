@@ -1,75 +1,128 @@
 import type { SlackEventMiddlewareArgs } from "@slack/bolt";
-import { enqueueSystemEvent } from "openclaw/plugin-sdk/infra-runtime";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { danger } from "openclaw/plugin-sdk/runtime-env";
+import { enqueueSystemEvent } from "openclaw/plugin-sdk/system-event-runtime";
 import type { SlackAppMentionEvent, SlackMessageEvent } from "../../types.js";
 import { normalizeSlackChannelType } from "../channel-type.js";
 import type { SlackMonitorContext } from "../context.js";
 import type { SlackMessageHandler } from "../message-handler.js";
-import type { SlackMessageDeletedEvent } from "../types.js";
+import type { SlackMessageChangedEvent } from "../types.js";
 import { resolveSlackMessageSubtypeHandler } from "./message-subtype-handlers.js";
 import { authorizeAndResolveSlackSystemEventContext } from "./system-event-context.js";
 
-const DELETED_TS_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const DELETED_TS_PRUNE_INTERVAL = 60_000; // prune at most once per minute
+type SlackAssistantMessageRecord = {
+  bot_id?: unknown;
+  user?: unknown;
+  text?: unknown;
+  ts?: unknown;
+  thread_ts?: unknown;
+  files?: unknown;
+  attachments?: unknown;
+  metadata?: unknown;
+  blocks?: unknown;
+};
 
-/**
- * In-memory cache of deleted message timestamps.
- *
- * When a user deletes and reposts a Slack message, Slack may deliver a stale
- * event for the deleted message *after* the repost is already being processed.
- * Without this cache the gateway treats the stale event as new and replies in
- * the main channel instead of threading.  By recording deleted ts values here
- * we can silently drop any late-arriving event whose ts matches a recently
- * deleted message.
- */
-const deletedMessageCache = new Map<string, number>();
-let lastDeletedCachePrune = 0;
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
 
-function pruneDeletedMessageCache(now: number): void {
-  if (now - lastDeletedCachePrune < DELETED_TS_PRUNE_INTERVAL) {
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function isSlackUserId(value: string): boolean {
+  return /^[UW][A-Z0-9]+$/.test(value);
+}
+
+function addUserCandidate(candidates: Set<string>, value: unknown, botUserId: string): void {
+  const id = asString(value);
+  if (!id || id === botUserId || !isSlackUserId(id)) {
     return;
   }
-  lastDeletedCachePrune = now;
-  for (const [key, expiresAt] of deletedMessageCache) {
-    if (expiresAt <= now) {
-      deletedMessageCache.delete(key);
-    }
-  }
+  candidates.add(id);
 }
 
-function cacheDeletedTs(channelId: string | undefined, deletedTs: string | undefined): void {
-  if (!channelId || !deletedTs) {
+function collectMetadataUserCandidates(
+  candidates: Set<string>,
+  value: unknown,
+  botUserId: string,
+): void {
+  const metadata = asRecord(value);
+  const payload = asRecord(metadata?.event_payload);
+  if (!payload) {
     return;
   }
-  const now = Date.now();
-  pruneDeletedMessageCache(now);
-  const key = `${channelId}:${deletedTs}`;
-  deletedMessageCache.set(key, now + DELETED_TS_TTL_MS);
-  console.error(`[slack-trace] deleted-cache add key=${key} size=${deletedMessageCache.size}`);
+  for (const key of ["user", "user_id", "actor_user_id", "author_user_id", "slack_user_id"]) {
+    addUserCandidate(candidates, payload[key], botUserId);
+  }
 }
 
-function isDeletedTs(channelId: string | undefined, ts: string | undefined): boolean {
-  if (!channelId || !ts) {
-    return false;
-  }
-  const now = Date.now();
-  pruneDeletedMessageCache(now);
-  const key = `${channelId}:${ts}`;
-  const expiresAt = deletedMessageCache.get(key);
-  if (expiresAt === undefined) {
-    return false;
-  }
-  if (expiresAt <= now) {
-    deletedMessageCache.delete(key);
-    return false;
-  }
-  return true;
+function resolveAssistantMessageChangedSender(params: {
+  message?: SlackAssistantMessageRecord;
+  botUserId: string;
+}): string | undefined {
+  const candidates = new Set<string>();
+  collectMetadataUserCandidates(candidates, params.message?.metadata, params.botUserId);
+  return candidates.size === 1 ? [...candidates][0] : undefined;
 }
 
-/** Exposed for testing. */
-export function _resetDeletedMessageCacheForTest(): void {
-  deletedMessageCache.clear();
-  lastDeletedCachePrune = 0;
+function isSelfAttributedMessageChange(params: {
+  event: SlackMessageChangedEvent;
+  message?: SlackAssistantMessageRecord;
+  ctx: SlackMonitorContext;
+}): boolean {
+  const topUser = asString((params.event as SlackMessageChangedEvent & { user?: unknown }).user);
+  const messageUser = asString(params.message?.user);
+  const messageBotId = asString(params.message?.bot_id);
+  return (
+    (Boolean(params.ctx.botUserId) &&
+      (topUser === params.ctx.botUserId || messageUser === params.ctx.botUserId)) ||
+    (Boolean(params.ctx.botId) && messageBotId === params.ctx.botId)
+  );
+}
+
+function resolveAssistantMessageChangedInbound(params: {
+  event: SlackMessageEvent;
+  ctx: SlackMonitorContext;
+}): SlackMessageEvent | undefined {
+  if (params.event.subtype !== "message_changed") {
+    return undefined;
+  }
+  const changed = params.event as SlackMessageChangedEvent;
+  const message = asRecord(changed.message) as SlackAssistantMessageRecord | undefined;
+  if (!message || !isSelfAttributedMessageChange({ event: changed, message, ctx: params.ctx })) {
+    return undefined;
+  }
+  const channelType = normalizeSlackChannelType(
+    asString((changed as SlackMessageChangedEvent & { channel_type?: unknown }).channel_type),
+    changed.channel,
+  );
+  if (channelType !== "im") {
+    return undefined;
+  }
+  const senderId = resolveAssistantMessageChangedSender({
+    message,
+    botUserId: params.ctx.botUserId,
+  });
+  if (!senderId) {
+    return undefined;
+  }
+  return {
+    type: "message",
+    channel: changed.channel ?? params.event.channel,
+    channel_type: "im",
+    user: senderId,
+    text: asString(message.text),
+    ts: asString(message.ts) ?? asString(changed.event_ts),
+    thread_ts: asString(message.thread_ts),
+    event_ts: changed.event_ts,
+    files: Array.isArray(message.files) ? (message.files as SlackMessageEvent["files"]) : undefined,
+    attachments: Array.isArray(message.attachments)
+      ? (message.attachments as SlackMessageEvent["attachments"])
+      : undefined,
+  };
 }
 
 export function registerSlackMessageEvents(params: {
@@ -85,27 +138,30 @@ export function registerSlackMessageEvents(params: {
       }
 
       const message = event as SlackMessageEvent;
+      const assistantChangedInbound = resolveAssistantMessageChangedInbound({
+        event: message,
+        ctx,
+      });
+      if (assistantChangedInbound) {
+        await handleSlackMessage(assistantChangedInbound, { source: "message" });
+        return;
+      }
+
+      if (
+        message.subtype === "message_changed" &&
+        isSelfAttributedMessageChange({
+          event: message as SlackMessageChangedEvent,
+          message: asRecord((message as SlackMessageChangedEvent).message) as
+            | SlackAssistantMessageRecord
+            | undefined,
+          ctx,
+        })
+      ) {
+        return;
+      }
+
       const subtypeHandler = resolveSlackMessageSubtypeHandler(message);
       if (subtypeHandler) {
-        console.error(
-          `[slack-trace] ingress source=message subtype-handler eventKind=${subtypeHandler.eventKind} channel=${message.channel} ts=${message.ts ?? "-"}`,
-        );
-
-        // Cache deleted message ts so stale events arriving after a
-        // delete-and-repost are silently dropped.
-        if (subtypeHandler.eventKind === "message_deleted") {
-          const deleted = message as unknown as SlackMessageDeletedEvent;
-          const channelId = deleted.channel;
-          // Slack provides both deleted_ts and previous_message.ts — cache both
-          // to be safe since the stale re-delivery may carry either value.
-          const ts1 = deleted.deleted_ts;
-          const ts2 = deleted.previous_message?.ts;
-          cacheDeletedTs(channelId, ts1);
-          if (ts2 && ts2 !== ts1) {
-            cacheDeletedTs(channelId, ts2);
-          }
-        }
-
         const channelId = subtypeHandler.resolveChannelId(message);
         const ingressContext = await authorizeAndResolveSlackSystemEventContext({
           ctx,
@@ -124,17 +180,9 @@ export function registerSlackMessageEvents(params: {
         return;
       }
 
-      // Drop stale events for messages that were recently deleted.
-      if (isDeletedTs(message.channel, message.ts)) {
-        console.error(
-          `[slack-trace] handler drop-deleted-message ts=${message.ts ?? "-"} channel=${message.channel}`,
-        );
-        return;
-      }
-
       await handleSlackMessage(message, { source: "message" });
     } catch (err) {
-      ctx.runtime.error?.(danger(`slack handler failed: ${String(err)}`));
+      ctx.runtime.error?.(danger(`slack handler failed: ${formatErrorMessage(err)}`));
     }
   };
 
@@ -163,20 +211,12 @@ export function registerSlackMessageEvents(params: {
         return;
       }
 
-      // Drop stale app_mention events for messages that were recently deleted.
-      if (isDeletedTs(mention.channel, mention.ts)) {
-        console.error(
-          `[slack-trace] handler drop-deleted-message ts=${mention.ts ?? "-"} channel=${mention.channel} source=app_mention`,
-        );
-        return;
-      }
-
       await handleSlackMessage(mention as unknown as SlackMessageEvent, {
         source: "app_mention",
         wasMentioned: true,
       });
     } catch (err) {
-      ctx.runtime.error?.(danger(`slack mention handler failed: ${String(err)}`));
+      ctx.runtime.error?.(danger(`slack mention handler failed: ${formatErrorMessage(err)}`));
     }
   });
 }

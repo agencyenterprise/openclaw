@@ -62,30 +62,7 @@ describe("markdownToSlackMrkdwn", () => {
     );
   });
 
-  it("repairs common italic label markup before Slack rendering", () => {
-    const res = markdownToSlackMrkdwn(
-      [
-        "_FCT-183 — Title line_",
-        "",
-        "_The point:_ body",
-        "• _Success:_ pass",
-        "• *Verdict:* ok",
-        "inline _and_ stays italic",
-      ].join("\n"),
-    );
-
-    expect(res).toBe(
-      "*FCT-183 — Title line*\n\n*The point:* body\n• *Success:* pass\n• *Verdict:* ok\ninline _and_ stays italic",
-    );
-  });
-
-  it("does not repair emphasized labels inside fenced code blocks", () => {
-    expect(markdownToSlackMrkdwn("```\n_Success:_ literal\n```")).toBe(
-      "```\n_Success:_ literal\n```",
-    );
-  });
-
-  it("does not throw when input is undefined at runtime", () => {
+  it("returns empty text when input is undefined at runtime", () => {
     expect(markdownToSlackMrkdwn(undefined as unknown as string)).toBe("");
   });
 
@@ -93,7 +70,11 @@ describe("markdownToSlackMrkdwn", () => {
     const chunks = markdownToSlackMrkdwnChunks("alpha <<", 8);
 
     expect(chunks).toEqual(["alpha ", "&lt;&lt;"]);
-    expect(chunks.every((chunk) => chunk.length <= 8)).toBe(true);
+    expect(
+      chunks
+        .map((chunk, index) => ({ index, length: chunk.length }))
+        .filter((chunk) => chunk.length > 8),
+    ).toStrictEqual([]);
   });
 });
 

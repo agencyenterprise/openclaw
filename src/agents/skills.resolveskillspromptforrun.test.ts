@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { resolveSkillsPromptForRun } from "./skills.js";
 import { createCanonicalFixtureSkill } from "./skills.test-helpers.js";
 import type { SkillEntry } from "./skills/types.js";
+import { resolveSkillsPromptForRun } from "./skills/workspace.js";
 
 describe("resolveSkillsPromptForRun", () => {
   it("prefers snapshot prompt when available", () => {
@@ -28,6 +28,27 @@ describe("resolveSkillsPromptForRun", () => {
     });
     expect(prompt).toContain("<available_skills>");
     expect(prompt).toContain("/app/skills/demo-skill/SKILL.md");
+  });
+
+  it("keeps legacy entries with disableModelInvocation hidden when exposure metadata is absent", () => {
+    const hidden: SkillEntry = {
+      skill: createFixtureSkill({
+        name: "hidden-skill",
+        description: "Hidden",
+        filePath: "/app/skills/hidden-skill/SKILL.md",
+        baseDir: "/app/skills/hidden-skill",
+        source: "openclaw-workspace",
+        disableModelInvocation: true,
+      }),
+      frontmatter: {},
+    };
+
+    const prompt = resolveSkillsPromptForRun({
+      entries: [hidden],
+      workspaceDir: "/tmp/openclaw",
+    });
+
+    expect(prompt).not.toContain("/app/skills/hidden-skill/SKILL.md");
   });
 
   it("inherits agents.defaults.skills when rebuilding prompt for an agent", () => {
@@ -117,6 +138,7 @@ function createFixtureSkill(params: {
   filePath: string;
   baseDir: string;
   source: string;
+  disableModelInvocation?: boolean;
 }): SkillEntry["skill"] {
   return createCanonicalFixtureSkill(params);
 }

@@ -1,22 +1,11 @@
-import { Type } from "@sinclair/typebox";
-import type {
-  ProviderReplayPolicy,
-  ProviderReplayPolicyContext,
-} from "openclaw/plugin-sdk/plugin-entry";
-import {
-  coerceSecretRef,
-  resolveNonEnvSecretRefApiKeyMarker,
-} from "openclaw/plugin-sdk/provider-auth";
 import { defineSingleProviderPluginEntry } from "openclaw/plugin-sdk/provider-entry";
-import { createToolStreamWrapper } from "openclaw/plugin-sdk/provider-stream";
+import { OPENAI_COMPATIBLE_REPLAY_HOOKS } from "openclaw/plugin-sdk/provider-model-shared";
+import { defaultToolStreamExtraParams } from "openclaw/plugin-sdk/provider-stream-shared";
+import { jsonResult } from "openclaw/plugin-sdk/provider-web-search";
+import { Type } from "typebox";
 import {
-  jsonResult,
-  readProviderEnvValue,
-  resolveProviderWebSearchPluginConfig,
-} from "openclaw/plugin-sdk/provider-web-search";
-import { normalizeSecretInputString } from "openclaw/plugin-sdk/secret-input";
-import {
-  applyXaiModelCompat,
+  applyXaiRuntimeModelCompat,
+  buildXaiImageGenerationProvider,
   normalizeXaiModelId,
   resolveXaiTransport,
   resolveXaiModelCompatPatch,
@@ -25,103 +14,48 @@ import {
 import { applyXaiConfig, XAI_DEFAULT_MODEL_REF } from "./onboard.js";
 import { buildXaiProvider } from "./provider-catalog.js";
 import { isModernXaiModel, resolveXaiForwardCompatModel } from "./provider-models.js";
-import { resolveEffectiveXSearchConfig } from "./src/x-search-config.js";
+import { resolveThinkingProfile } from "./provider-policy-api.js";
+import { buildXaiRealtimeTranscriptionProvider } from "./realtime-transcription-provider.js";
+import { buildXaiSpeechProvider } from "./speech-provider.js";
 import {
-  createXaiFastModeWrapper,
-  createXaiToolCallArgumentDecodingWrapper,
-  createXaiToolPayloadCompatibilityWrapper,
-} from "./stream.js";
+  isXaiToolEnabled,
+  resolveFallbackXaiAuth,
+  type XaiToolAuthContext,
+} from "./src/tool-auth-shared.js";
+import { resolveEffectiveXSearchConfig } from "./src/x-search-config.js";
+import { wrapXaiProviderStream } from "./stream.js";
+import { buildXaiMediaUnderstandingProvider } from "./stt.js";
+import { buildXaiVideoGenerationProvider } from "./video-generation-provider.js";
 import { createXaiWebSearchProvider } from "./web-search.js";
+import {
+  buildMissingXSearchApiKeyPayload,
+  createXSearchToolDefinition,
+} from "./x-search-tool-shared.js";
 
 const PROVIDER_ID = "xai";
+type CodeExecutionModule = typeof import("./code-execution.js");
+type XSearchModule = typeof import("./x-search.js");
 
-function buildXaiReplayPolicy(ctx: ProviderReplayPolicyContext): ProviderReplayPolicy | undefined {
-  if (
-    ctx.modelApi !== "openai-completions" &&
-    ctx.modelApi !== "openai-responses" &&
-    ctx.modelApi !== "openai-codex-responses" &&
-    ctx.modelApi !== "azure-openai-responses"
-  ) {
-    return undefined;
-  }
+let codeExecutionModulePromise: Promise<CodeExecutionModule> | undefined;
+let xSearchModulePromise: Promise<XSearchModule> | undefined;
 
-  return {
-    sanitizeToolCallIds: true,
-    toolCallIdMode: "strict",
-    ...(ctx.modelApi === "openai-completions"
-      ? {
-          applyAssistantFirstOrderingFix: true,
-          validateGeminiTurns: true,
-          validateAnthropicTurns: true,
-        }
-      : {
-          applyAssistantFirstOrderingFix: false,
-          validateGeminiTurns: false,
-          validateAnthropicTurns: false,
-        }),
-  };
+function loadCodeExecutionModule(): Promise<CodeExecutionModule> {
+  codeExecutionModulePromise ??= import("./code-execution.js");
+  return codeExecutionModulePromise;
 }
 
-function readConfiguredOrManagedApiKey(value: unknown): string | undefined {
-  const literal = normalizeSecretInputString(value);
-  if (literal) {
-    return literal;
-  }
-  const ref = coerceSecretRef(value);
-  return ref ? resolveNonEnvSecretRefApiKeyMarker(ref.source) : undefined;
+function loadXSearchModule(): Promise<XSearchModule> {
+  xSearchModulePromise ??= import("./x-search.js");
+  return xSearchModulePromise;
 }
 
-function readLegacyGrokFallback(
-  config: Record<string, unknown>,
-): { apiKey: string; source: string } | undefined {
-  const tools = config.tools;
-  if (!tools || typeof tools !== "object") {
-    return undefined;
-  }
-  const web = (tools as Record<string, unknown>).web;
-  if (!web || typeof web !== "object") {
-    return undefined;
-  }
-  const search = (web as Record<string, unknown>).search;
-  if (!search || typeof search !== "object") {
-    return undefined;
-  }
-  const grok = (search as Record<string, unknown>).grok;
-  if (!grok || typeof grok !== "object") {
-    return undefined;
-  }
-  const apiKey = readConfiguredOrManagedApiKey((grok as Record<string, unknown>).apiKey);
-  return apiKey ? { apiKey, source: "tools.web.search.grok.apiKey" } : undefined;
+function hasResolvableXaiApiKey(config: unknown, auth?: XaiToolAuthContext): boolean {
+  return isXaiToolEnabled({ sourceConfig: config as never, auth });
 }
 
-function resolveXaiProviderFallbackAuth(
-  config: unknown,
-): { apiKey: string; source: string } | undefined {
+function isCodeExecutionEnabled(config: unknown, auth?: XaiToolAuthContext): boolean {
   if (!config || typeof config !== "object") {
-    return undefined;
-  }
-  const record = config as Record<string, unknown>;
-  const pluginApiKey = readConfiguredOrManagedApiKey(
-    resolveProviderWebSearchPluginConfig(record, PROVIDER_ID)?.apiKey,
-  );
-  if (pluginApiKey) {
-    return {
-      apiKey: pluginApiKey,
-      source: "plugins.entries.xai.config.webSearch.apiKey",
-    };
-  }
-  return readLegacyGrokFallback(record);
-}
-
-function hasResolvableXaiApiKey(config: unknown): boolean {
-  return Boolean(
-    resolveXaiProviderFallbackAuth(config)?.apiKey || readProviderEnvValue(["XAI_API_KEY"]),
-  );
-}
-
-function isCodeExecutionEnabled(config: unknown): boolean {
-  if (!config || typeof config !== "object") {
-    return hasResolvableXaiApiKey(config);
+    return hasResolvableXaiApiKey(config, auth);
   }
   const entries = (config as Record<string, unknown>).plugins;
   const pluginEntries =
@@ -143,10 +77,10 @@ function isCodeExecutionEnabled(config: unknown): boolean {
   if (codeExecution?.enabled === false) {
     return false;
   }
-  return hasResolvableXaiApiKey(config);
+  return hasResolvableXaiApiKey(config, auth);
 }
 
-function isXSearchEnabled(config: unknown): boolean {
+function isXSearchEnabled(config: unknown, auth?: XaiToolAuthContext): boolean {
   const resolved =
     config && typeof config === "object"
       ? resolveEffectiveXSearchConfig(config as never)
@@ -154,15 +88,17 @@ function isXSearchEnabled(config: unknown): boolean {
   if (resolved?.enabled === false) {
     return false;
   }
-  return hasResolvableXaiApiKey(config);
+  return hasResolvableXaiApiKey(config, auth);
 }
 
 function createLazyCodeExecutionTool(ctx: {
   config?: Record<string, unknown>;
   runtimeConfig?: Record<string, unknown>;
+  hasAuthForProvider?: XaiToolAuthContext["hasAuthForProvider"];
+  resolveApiKeyForProvider?: XaiToolAuthContext["resolveApiKeyForProvider"];
 }) {
   const effectiveConfig = ctx.runtimeConfig ?? ctx.config;
-  if (!isCodeExecutionEnabled(effectiveConfig)) {
+  if (!isCodeExecutionEnabled(effectiveConfig, ctx)) {
     return null;
   }
 
@@ -178,16 +114,17 @@ function createLazyCodeExecutionTool(ctx: {
       }),
     }),
     execute: async (toolCallId: string, args: Record<string, unknown>) => {
-      const { createCodeExecutionTool } = await import("./code-execution.js");
+      const { createCodeExecutionTool } = await loadCodeExecutionModule();
       const tool = createCodeExecutionTool({
         config: ctx.config as never,
         runtimeConfig: (ctx.runtimeConfig as never) ?? null,
+        auth: ctx,
       });
       if (!tool) {
         return jsonResult({
           error: "missing_xai_api_key",
           message:
-            "code_execution needs an xAI API key. Set XAI_API_KEY in the Gateway environment, or configure plugins.entries.xai.config.webSearch.apiKey.",
+            "code_execution needs an xAI API key. Run openclaw onboard --auth-choice xai-api-key, set XAI_API_KEY in the Gateway environment, or configure plugins.entries.xai.config.webSearch.apiKey.",
           docs: "https://docs.openclaw.ai/tools/code-execution",
         });
       }
@@ -199,59 +136,26 @@ function createLazyCodeExecutionTool(ctx: {
 function createLazyXSearchTool(ctx: {
   config?: Record<string, unknown>;
   runtimeConfig?: Record<string, unknown>;
+  hasAuthForProvider?: XaiToolAuthContext["hasAuthForProvider"];
+  resolveApiKeyForProvider?: XaiToolAuthContext["resolveApiKeyForProvider"];
 }) {
   const effectiveConfig = ctx.runtimeConfig ?? ctx.config;
-  if (!isXSearchEnabled(effectiveConfig)) {
+  if (!isXSearchEnabled(effectiveConfig, ctx)) {
     return null;
   }
 
-  return {
-    label: "X Search",
-    name: "x_search",
-    description:
-      "Search X (formerly Twitter) using xAI, including targeted post or thread lookups. For per-post stats like reposts, replies, bookmarks, or views, prefer the exact post URL or status ID.",
-    parameters: Type.Object({
-      query: Type.String({ description: "X search query string." }),
-      allowed_x_handles: Type.Optional(
-        Type.Array(Type.String({ minLength: 1 }), {
-          description: "Only include posts from these X handles.",
-        }),
-      ),
-      excluded_x_handles: Type.Optional(
-        Type.Array(Type.String({ minLength: 1 }), {
-          description: "Exclude posts from these X handles.",
-        }),
-      ),
-      from_date: Type.Optional(
-        Type.String({ description: "Only include posts on or after this date (YYYY-MM-DD)." }),
-      ),
-      to_date: Type.Optional(
-        Type.String({ description: "Only include posts on or before this date (YYYY-MM-DD)." }),
-      ),
-      enable_image_understanding: Type.Optional(
-        Type.Boolean({ description: "Allow xAI to inspect images attached to matching posts." }),
-      ),
-      enable_video_understanding: Type.Optional(
-        Type.Boolean({ description: "Allow xAI to inspect videos attached to matching posts." }),
-      ),
-    }),
-    execute: async (toolCallId: string, args: Record<string, unknown>) => {
-      const { createXSearchTool } = await import("./x-search.js");
-      const tool = createXSearchTool({
-        config: ctx.config as never,
-        runtimeConfig: (ctx.runtimeConfig as never) ?? null,
-      });
-      if (!tool) {
-        return jsonResult({
-          error: "missing_xai_api_key",
-          message:
-            "x_search needs an xAI API key. Set XAI_API_KEY in the Gateway environment, or configure plugins.entries.xai.config.webSearch.apiKey.",
-          docs: "https://docs.openclaw.ai/tools/web",
-        });
-      }
-      return await tool.execute(toolCallId, args);
-    },
-  };
+  return createXSearchToolDefinition(async (toolCallId: string, args: Record<string, unknown>) => {
+    const { createXSearchTool } = await loadXSearchModule();
+    const tool = createXSearchTool({
+      config: ctx.config as never,
+      runtimeConfig: (ctx.runtimeConfig as never) ?? null,
+      auth: ctx,
+    });
+    if (!tool) {
+      return jsonResult(buildMissingXSearchApiKeyPayload());
+    }
+    return await tool.execute(toolCallId, args);
+  });
 }
 
 export default defineSingleProviderPluginEntry({
@@ -281,30 +185,15 @@ export default defineSingleProviderPluginEntry({
     catalog: {
       buildProvider: buildXaiProvider,
     },
-    buildReplayPolicy: (ctx) => buildXaiReplayPolicy(ctx),
-    prepareExtraParams: (ctx) => {
-      if (ctx.extraParams?.tool_stream !== undefined) {
-        return ctx.extraParams;
-      }
-      return {
-        ...ctx.extraParams,
-        tool_stream: true,
-      };
-    },
-    wrapStreamFn: (ctx) => {
-      let streamFn = createXaiToolPayloadCompatibilityWrapper(ctx.streamFn);
-      if (typeof ctx.extraParams?.fastMode === "boolean") {
-        streamFn = createXaiFastModeWrapper(streamFn, ctx.extraParams.fastMode);
-      }
-      streamFn = createXaiToolCallArgumentDecodingWrapper(streamFn);
-      return createToolStreamWrapper(streamFn, ctx.extraParams?.tool_stream !== false);
-    },
+    ...OPENAI_COMPATIBLE_REPLAY_HOOKS,
+    prepareExtraParams: (ctx) => defaultToolStreamExtraParams(ctx.extraParams),
+    wrapStreamFn: wrapXaiProviderStream,
     // Provider-specific fallback auth stays owned by the xAI plugin so core
     // auth/discovery code can consume it generically without parsing xAI's
     // private config layout. Callers may receive a real key from the active
     // runtime snapshot or a non-secret SecretRef marker from source config.
     resolveSyntheticAuth: ({ config }) => {
-      const fallbackAuth = resolveXaiProviderFallbackAuth(config);
+      const fallbackAuth = resolveFallbackXaiAuth(config);
       if (!fallbackAuth) {
         return undefined;
       }
@@ -314,17 +203,23 @@ export default defineSingleProviderPluginEntry({
         mode: "api-key" as const,
       };
     },
-    normalizeResolvedModel: ({ model }) => applyXaiModelCompat(model),
+    normalizeResolvedModel: ({ model }) => applyXaiRuntimeModelCompat(model),
     normalizeTransport: ({ provider, api, baseUrl }) =>
       resolveXaiTransport({ provider, api, baseUrl }),
     contributeResolvedModelCompat: ({ modelId, model }) =>
       shouldContributeXaiCompat({ modelId, model }) ? resolveXaiModelCompatPatch() : undefined,
     normalizeModelId: ({ modelId }) => normalizeXaiModelId(modelId),
     resolveDynamicModel: (ctx) => resolveXaiForwardCompatModel({ providerId: PROVIDER_ID, ctx }),
+    resolveThinkingProfile,
     isModernModelRef: ({ modelId }) => isModernXaiModel(modelId),
   },
   register(api) {
     api.registerWebSearchProvider(createXaiWebSearchProvider());
+    api.registerMediaUnderstandingProvider(buildXaiMediaUnderstandingProvider());
+    api.registerVideoGenerationProvider(buildXaiVideoGenerationProvider());
+    api.registerImageGenerationProvider(buildXaiImageGenerationProvider());
+    api.registerSpeechProvider(buildXaiSpeechProvider());
+    api.registerRealtimeTranscriptionProvider(buildXaiRealtimeTranscriptionProvider());
     api.registerTool((ctx) => createLazyCodeExecutionTool(ctx), { name: "code_execution" });
     api.registerTool((ctx) => createLazyXSearchTool(ctx), { name: "x_search" });
   },

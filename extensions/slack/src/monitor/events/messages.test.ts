@@ -4,34 +4,22 @@ import {
   type SlackSystemEventTestOverrides,
 } from "./system-event-test-harness.js";
 
-const messageQueueMock = vi.fn();
-const messageAllowMock = vi.fn();
+const { messageQueueMock, messageAllowMock } = vi.hoisted(() => ({
+  messageQueueMock: vi.fn(),
+  messageAllowMock: vi.fn(),
+}));
 
-async function createChannelRuntimeMock() {
-  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/infra-runtime")>(
-    "openclaw/plugin-sdk/infra-runtime",
-  );
-  return {
-    ...actual,
-    enqueueSystemEvent: (...args: unknown[]) => messageQueueMock(...args),
-  };
-}
-
-vi.mock("openclaw/plugin-sdk/infra-runtime", createChannelRuntimeMock);
-vi.mock("openclaw/plugin-sdk/infra-runtime.js", createChannelRuntimeMock);
-
-vi.mock("openclaw/plugin-sdk/conversation-runtime", async () => {
-  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/conversation-runtime")>(
-    "openclaw/plugin-sdk/conversation-runtime",
-  );
-  return {
-    ...actual,
-    readChannelAllowFromStore: (...args: unknown[]) => messageAllowMock(...args),
-  };
-});
+vi.mock("openclaw/plugin-sdk/system-event-runtime", () => ({
+  enqueueSystemEvent: (...args: unknown[]) => messageQueueMock(...args),
+}));
+vi.mock("openclaw/plugin-sdk/system-event-runtime.js", () => ({
+  enqueueSystemEvent: (...args: unknown[]) => messageQueueMock(...args),
+}));
+vi.mock("openclaw/plugin-sdk/conversation-runtime", () => ({
+  readChannelAllowFromStore: (...args: unknown[]) => messageAllowMock(...args),
+}));
 
 let registerSlackMessageEvents: typeof import("./messages.js").registerSlackMessageEvents;
-let _resetDeletedMessageCacheForTest: typeof import("./messages.js")._resetDeletedMessageCacheForTest;
 
 type MessageHandler = (args: { event: Record<string, unknown>; body: unknown }) => Promise<void>;
 type RegisteredEventName = "message" | "app_mention";
@@ -55,12 +43,20 @@ function createHandlers(eventName: RegisteredEventName, overrides?: SlackSystemE
   };
 }
 
+function requireMessageHandler(handler: MessageHandler | null): MessageHandler {
+  if (!handler) {
+    throw new Error("expected Slack message event handler");
+  }
+  return handler;
+}
+
 function resetMessageMocks(): void {
   messageQueueMock.mockClear();
   messageAllowMock.mockReset().mockResolvedValue([]);
 }
 
-beforeEach(async () => {  vi.resetModules();  const mod = await import("./messages.js");  registerSlackMessageEvents = mod.registerSlackMessageEvents;  _resetDeletedMessageCacheForTest = mod._resetDeletedMessageCacheForTest;  _resetDeletedMessageCacheForTest();
+beforeAll(async () => {
+  ({ registerSlackMessageEvents } = await import("./messages.js"));
 });
 
 beforeEach(() => {
@@ -79,19 +75,34 @@ function makeChangedEvent(overrides?: { channel?: string; user?: string }) {
   };
 }
 
-function makeDeletedEvent(overrides?: {
-  channel?: string;
-  user?: string;
-  deleted_ts?: string;
-  previous_ts?: string;
-}) {
+function makeAssistantChangedEvent(overrides?: { user?: string }) {
+  const user = overrides?.user ?? "UREAL123";
+  return {
+    type: "message",
+    subtype: "message_changed",
+    channel: "D1",
+    channel_type: "im",
+    user: "U_BOT",
+    message: {
+      ts: "123.456",
+      thread_ts: "123.000",
+      user: "U_BOT",
+      text: "assistant wrapped user text",
+      metadata: { event_payload: { user } },
+    },
+    previous_message: { ts: "123.456", user: "U_BOT" },
+    event_ts: "123.789",
+  };
+}
+
+function makeDeletedEvent(overrides?: { channel?: string; user?: string }) {
   return {
     type: "message",
     subtype: "message_deleted",
     channel: overrides?.channel ?? "D1",
-    deleted_ts: overrides?.deleted_ts ?? "123.456",
+    deleted_ts: "123.456",
     previous_message: {
-      ts: overrides?.previous_ts ?? "123.450",
+      ts: "123.450",
       user: overrides?.user ?? "U1",
     },
     event_ts: "123.456",
@@ -132,8 +143,7 @@ async function invokeRegisteredHandler(input: {
   body?: unknown;
 }) {
   const { handler, handleSlackMessage } = createHandlers(input.eventName, input.overrides);
-  expect(handler).toBeTruthy();
-  await handler!({
+  await requireMessageHandler(handler)({
     event: input.event,
     body: input.body ?? {},
   });
@@ -142,8 +152,7 @@ async function invokeRegisteredHandler(input: {
 
 async function runMessageCase(input: MessageCase = {}): Promise<void> {
   const { handler } = createHandlers("message", input.overrides);
-  expect(handler).toBeTruthy();
-  await handler!({
+  await requireMessageHandler(handler)({
     event: (input.event ?? makeChangedEvent()) as Record<string, unknown>,
     body: input.body ?? {},
   });
@@ -181,18 +190,6 @@ describe("registerSlackMessageEvents", () => {
       },
       calls: 0,
     },
-    {
-      name: "blocks thread_broadcast system events without an authenticated sender",
-      input: {
-        overrides: { dmPolicy: "open" },
-        event: {
-          ...makeThreadBroadcastEvent(),
-          user: undefined,
-          message: { ts: "123.456" },
-        },
-      },
-      calls: 0,
-    },
   ];
   it.each(cases)("$name", async ({ input, calls }) => {
     await runMessageCase(input);
@@ -216,13 +213,110 @@ describe("registerSlackMessageEvents", () => {
     expect(messageQueueMock).not.toHaveBeenCalled();
   });
 
+  it("passes thread_broadcast events to the message handler", async () => {
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: makeThreadBroadcastEvent({ channel: "C1", user: "U1" }),
+    });
+
+    expect(handleSlackMessage).toHaveBeenCalledTimes(1);
+    const call = handleSlackMessage.mock.calls.at(0) as unknown as
+      | [{ subtype?: string; channel?: string; user?: string }, { source?: string }]
+      | undefined;
+    expect(call?.[0]?.subtype).toBe("thread_broadcast");
+    expect(call?.[0]?.channel).toBe("C1");
+    expect(call?.[0]?.user).toBe("U1");
+    expect(call?.[1]).toEqual({ source: "message" });
+    expect(messageQueueMock).not.toHaveBeenCalled();
+  });
+
+  it("rehydrates assistant DM message_changed events with a metadata user as inbound messages", async () => {
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: makeAssistantChangedEvent(),
+    });
+
+    expect(handleSlackMessage).toHaveBeenCalledTimes(1);
+    const call = handleSlackMessage.mock.calls.at(0) as unknown as
+      | [
+          {
+            channel?: string;
+            channel_type?: string;
+            user?: string;
+            text?: string;
+            ts?: string;
+            thread_ts?: string;
+          },
+          { source?: string },
+        ]
+      | undefined;
+    const message = call?.[0];
+    expect(message?.channel).toBe("D1");
+    expect(message?.channel_type).toBe("im");
+    expect(message?.user).toBe("UREAL123");
+    expect(message?.text).toBe("assistant wrapped user text");
+    expect(message?.ts).toBe("123.456");
+    expect(message?.thread_ts).toBe("123.000");
+    expect(call?.[1]).toEqual({ source: "message" });
+    expect(messageQueueMock).not.toHaveBeenCalled();
+  });
+
+  it("drops self-authored message_changed events without assistant sender metadata", async () => {
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: {
+        ...makeAssistantChangedEvent(),
+        message: {
+          ts: "123.456",
+          user: "U_BOT",
+          text: "preview edit",
+        },
+      },
+    });
+
+    expect(handleSlackMessage).not.toHaveBeenCalled();
+    expect(messageQueueMock).not.toHaveBeenCalled();
+  });
+
+  it("drops self-authored message_changed events that only include block user IDs", async () => {
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: {
+        ...makeAssistantChangedEvent(),
+        message: {
+          ts: "123.456",
+          user: "U_BOT",
+          text: "preview edit with mention",
+          blocks: [
+            {
+              type: "rich_text",
+              elements: [
+                {
+                  type: "rich_text_section",
+                  elements: [{ type: "user", user_id: "UREAL123" }],
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    expect(handleSlackMessage).not.toHaveBeenCalled();
+    expect(messageQueueMock).not.toHaveBeenCalled();
+  });
+
   it("handles channel and group messages via the unified message handler", async () => {
     const { handler, handleSlackMessage } = createHandlers("message", {
       dmPolicy: "open",
       channelType: "channel",
     });
 
-    expect(handler).toBeTruthy();
+    const messageHandler = requireMessageHandler(handler);
 
     // channel_type distinguishes the source; all arrive as event type "message"
     const channelMessage = {
@@ -233,8 +327,8 @@ describe("registerSlackMessageEvents", () => {
       text: "hello channel",
       ts: "123.100",
     };
-    await handler!({ event: channelMessage, body: {} });
-    await handler!({
+    await messageHandler({ event: channelMessage, body: {} });
+    await messageHandler({
       event: {
         ...channelMessage,
         channel_type: "group",
@@ -285,149 +379,5 @@ describe("registerSlackMessageEvents", () => {
     });
 
     expect(handleSlackMessage).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("deleted message cache", () => {
-  it("drops a regular message whose ts matches a recently deleted message (deleted_ts)", async () => {
-    resetMessageMocks();
-    const { handler, handleSlackMessage } = createHandlers("message", {
-      dmPolicy: "open",
-    });
-    expect(handler).toBeTruthy();
-
-    // Step 1: Deliver a message_deleted event
-    await handler!({
-      event: makeDeletedEvent({ channel: "C1", deleted_ts: "100.001", previous_ts: "100.000" }),
-      body: {},
-    });
-
-    // Step 2: Deliver a stale regular message with the same ts as deleted_ts
-    await handler!({
-      event: {
-        type: "message",
-        channel: "C1",
-        user: "U1",
-        text: "stale redelivery",
-        ts: "100.001",
-      },
-      body: {},
-    });
-
-    // The stale message should have been dropped
-    expect(handleSlackMessage).not.toHaveBeenCalled();
-  });
-
-  it("drops a regular message whose ts matches previous_message.ts of a deleted event", async () => {
-    resetMessageMocks();
-    const { handler, handleSlackMessage } = createHandlers("message", {
-      dmPolicy: "open",
-    });
-    expect(handler).toBeTruthy();
-
-    await handler!({
-      event: makeDeletedEvent({ channel: "C1", deleted_ts: "100.001", previous_ts: "100.000" }),
-      body: {},
-    });
-
-    // Stale event arrives with ts matching previous_message.ts
-    await handler!({
-      event: {
-        type: "message",
-        channel: "C1",
-        user: "U1",
-        text: "stale redelivery via previous_message.ts",
-        ts: "100.000",
-      },
-      body: {},
-    });
-
-    expect(handleSlackMessage).not.toHaveBeenCalled();
-  });
-
-  it("does not drop messages with a ts that was never deleted", async () => {
-    resetMessageMocks();
-    const { handler, handleSlackMessage } = createHandlers("message", {
-      dmPolicy: "open",
-    });
-    expect(handler).toBeTruthy();
-
-    await handler!({
-      event: makeDeletedEvent({ channel: "C1", deleted_ts: "100.001", previous_ts: "100.000" }),
-      body: {},
-    });
-
-    // A completely different ts should pass through
-    await handler!({
-      event: {
-        type: "message",
-        channel: "C1",
-        user: "U1",
-        text: "fresh message",
-        ts: "200.000",
-      },
-      body: {},
-    });
-
-    expect(handleSlackMessage).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not cross-contaminate channels — same ts on a different channel passes through", async () => {
-    resetMessageMocks();
-    const { handler, handleSlackMessage } = createHandlers("message", {
-      dmPolicy: "open",
-      channelType: "channel",
-    });
-    expect(handler).toBeTruthy();
-
-    await handler!({
-      event: makeDeletedEvent({ channel: "C1", deleted_ts: "100.001", previous_ts: "100.000" }),
-      body: {},
-    });
-
-    // Same ts but different channel — should NOT be dropped
-    await handler!({
-      event: {
-        type: "message",
-        channel: "C2",
-        channel_type: "channel",
-        user: "U1",
-        text: "different channel",
-        ts: "100.001",
-      },
-      body: {},
-    });
-
-    expect(handleSlackMessage).toHaveBeenCalledTimes(1);
-  });
-
-  it("drops a stale app_mention whose ts matches a recently deleted message", async () => {
-    resetMessageMocks();
-    // First register with message handler to process the delete
-    const harness = createSlackSystemEventTestHarness({ dmPolicy: "open" });
-    const handleSlackMessage = vi.fn(async () => {});
-    registerSlackMessageEvents({
-      ctx: harness.ctx,
-      handleSlackMessage,
-    });
-
-    const messageHandler = harness.getHandler("message") as MessageHandler | null;
-    const mentionHandler = harness.getHandler("app_mention") as MessageHandler | null;
-    expect(messageHandler).toBeTruthy();
-    expect(mentionHandler).toBeTruthy();
-
-    // Deliver message_deleted via the message handler
-    await messageHandler!({
-      event: makeDeletedEvent({ channel: "C123", deleted_ts: "100.001", previous_ts: "100.000" }),
-      body: {},
-    });
-
-    // Now deliver a stale app_mention with the deleted ts
-    await mentionHandler!({
-      event: makeAppMentionEvent({ channel: "C123", ts: "100.001" }),
-      body: {},
-    });
-
-    expect(handleSlackMessage).not.toHaveBeenCalled();
   });
 });

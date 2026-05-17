@@ -1,9 +1,8 @@
-import type { Api, Model } from "@mariozechner/pi-ai";
-import { resolveOpenAICompletionsCompatDefaultsFromCapabilities } from "../agents/openai-completions-compat.js";
-import { resolveProviderRequestCapabilities } from "../agents/provider-attribution.js";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { detectOpenAICompletionsCompat } from "../agents/openai-completions-compat.js";
 import type { ModelCompatConfig } from "../config/types.models.js";
 
-function extractModelCompat(
+export function extractModelCompat(
   modelOrCompat: { compat?: unknown } | ModelCompatConfig | undefined,
 ): ModelCompatConfig | undefined {
   if (!modelOrCompat || typeof modelOrCompat !== "object") {
@@ -16,6 +15,7 @@ function extractModelCompat(
   return modelOrCompat as ModelCompatConfig;
 }
 
+/** @deprecated Provider-owned model compat helper; do not use from third-party plugins. */
 export function applyModelCompatPatch<T extends { compat?: ModelCompatConfig }>(
   model: T,
   patch: ModelCompatConfig,
@@ -94,16 +94,7 @@ export function normalizeModelCompat(model: Model<Api>): Model<Api> {
 
   const compat = model.compat ?? undefined;
   const detectedCompatDefaults = baseUrl
-    ? resolveOpenAICompletionsCompatDefaultsFromCapabilities({
-        provider: typeof model.provider === "string" ? model.provider : undefined,
-        ...resolveProviderRequestCapabilities({
-          provider: typeof model.provider === "string" ? model.provider : undefined,
-          api: model.api,
-          baseUrl,
-          capability: "llm",
-          transport: "stream",
-        }),
-      })
+    ? detectOpenAICompletionsCompat(model).defaults
     : undefined;
   const needsForce = Boolean(
     detectedCompatDefaults &&

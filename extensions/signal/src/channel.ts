@@ -1,21 +1,17 @@
 import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
 import { buildDmGroupAccountAllowlistAdapter } from "openclaw/plugin-sdk/allowlist-config-edit";
+import { createChatChannelPlugin, type ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
+import { defineChannelMessageAdapter } from "openclaw/plugin-sdk/channel-message";
 import { createPairingPrefixStripper } from "openclaw/plugin-sdk/channel-pairing";
 import {
   attachChannelToResult,
   attachChannelToResults,
 } from "openclaw/plugin-sdk/channel-send-result";
 import { PAIRING_APPROVED_MESSAGE } from "openclaw/plugin-sdk/channel-status";
-import {
-  looksLikeSignalTargetId,
-  normalizeSignalMessagingTarget,
-} from "openclaw/plugin-sdk/channel-targets";
-import { resolveMarkdownTableMode } from "openclaw/plugin-sdk/config-runtime";
-import { createChatChannelPlugin, type ChannelPlugin } from "openclaw/plugin-sdk/core";
+import { resolveMarkdownTableMode } from "openclaw/plugin-sdk/markdown-table-runtime";
 import { resolveChannelMediaMaxBytes } from "openclaw/plugin-sdk/media-runtime";
-import { resolveOutboundSendDep } from "openclaw/plugin-sdk/outbound-runtime";
-import { resolveTextChunkLimit } from "openclaw/plugin-sdk/reply-runtime";
-import { chunkText } from "openclaw/plugin-sdk/reply-runtime";
+import { resolveOutboundSendDep } from "openclaw/plugin-sdk/outbound-send-deps";
+import { chunkText, resolveTextChunkLimit } from "openclaw/plugin-sdk/reply-chunking";
 import { buildOutboundBaseSessionKey, type RoutePeer } from "openclaw/plugin-sdk/routing";
 import {
   buildBaseChannelStatusSummary,
@@ -23,17 +19,18 @@ import {
   createComputedAccountStatusAdapter,
   createDefaultChannelRuntimeState,
 } from "openclaw/plugin-sdk/status-helpers";
-import { normalizeE164 } from "openclaw/plugin-sdk/text-runtime";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveSignalAccount, type ResolvedSignalAccount } from "./accounts.js";
 import { signalApprovalAuth } from "./approval-auth.js";
 import { markdownToSignalTextChunks } from "./format.js";
 import { signalMessageActions } from "./message-actions.js";
+import { looksLikeSignalTargetId, normalizeSignalMessagingTarget } from "./normalize.js";
 import { resolveSignalOutboundTarget } from "./outbound-session.js";
 import { resolveSignalReactionLevel } from "./reaction-level.js";
 import { signalSetupAdapter } from "./setup-core.js";
 import {
-  signalConfigAdapter,
   createSignalPluginBase,
+  signalConfigAdapter,
   signalSecurityAdapter,
   signalSetupWizard,
 } from "./shared.js";
@@ -97,6 +94,41 @@ async function sendSignalOutbound(params: {
   });
 }
 
+type SignalMessageContextExtras = {
+  deps?: { [channelId: string]: unknown };
+};
+
+const signalMessageAdapter = defineChannelMessageAdapter({
+  id: "signal",
+  durableFinal: {
+    capabilities: {
+      text: true,
+      media: true,
+    },
+  },
+  send: {
+    text: async (ctx) =>
+      await sendSignalOutbound({
+        cfg: ctx.cfg,
+        to: ctx.to,
+        text: ctx.text,
+        accountId: ctx.accountId ?? undefined,
+        deps: (ctx as typeof ctx & SignalMessageContextExtras).deps,
+      }),
+    media: async (ctx) =>
+      await sendSignalOutbound({
+        cfg: ctx.cfg,
+        to: ctx.to,
+        text: ctx.text,
+        mediaUrl: ctx.mediaUrl,
+        mediaLocalRoots: ctx.mediaLocalRoots,
+        mediaReadFile: ctx.mediaReadFile,
+        accountId: ctx.accountId ?? undefined,
+        deps: (ctx as typeof ctx & SignalMessageContextExtras).deps,
+      }),
+  },
+});
+
 function inferSignalTargetChatType(rawTo: string) {
   let to = rawTo.trim();
   if (!to) {
@@ -108,7 +140,7 @@ function inferSignalTargetChatType(rawTo: string) {
   if (!to) {
     return undefined;
   }
-  const lower = to.toLowerCase();
+  const lower = normalizeLowercaseStringOrEmpty(to);
   if (lower.startsWith("group:")) {
     return "group" as const;
   }
@@ -253,7 +285,7 @@ export const signalPlugin: ChannelPlugin<ResolvedSignalAccount, SignalProbe> =
         setup: signalSetupAdapter,
       }),
       actions: signalMessageActions,
-      auth: signalApprovalAuth,
+      approvalCapability: signalApprovalAuth,
       allowlist: buildDmGroupAccountAllowlistAdapter({
         channelId: "signal",
         resolveAccount: resolveSignalAccount,
@@ -274,6 +306,7 @@ export const signalPlugin: ChannelPlugin<ResolvedSignalAccount, SignalProbe> =
         },
       },
       messaging: {
+        targetPrefixes: ["signal"],
         normalizeTarget: normalizeSignalMessagingTarget,
         parseExplicitTarget: ({ raw }) => parseSignalExplicitTarget(raw),
         inferTargetChatType: ({ to }) => inferSignalTargetChatType(to),
@@ -281,6 +314,25 @@ export const signalPlugin: ChannelPlugin<ResolvedSignalAccount, SignalProbe> =
         targetResolver: {
           looksLikeId: looksLikeSignalTargetId,
           hint: "<E.164|uuid:ID|group:ID|signal:group:ID|signal:+E.164>",
+        },
+      },
+      heartbeat: {
+        sendTyping: async ({ cfg, to, accountId }) => {
+          await (
+            await loadSignalSendRuntime()
+          ).sendTypingSignal(to, {
+            cfg,
+            ...(accountId ? { accountId } : {}),
+          });
+        },
+        clearTyping: async ({ cfg, to, accountId }) => {
+          await (
+            await loadSignalSendRuntime()
+          ).sendTypingSignal(to, {
+            cfg,
+            ...(accountId ? { accountId } : {}),
+            stop: true,
+          });
         },
       },
       status: createComputedAccountStatusAdapter<ResolvedSignalAccount, SignalProbe>({
@@ -295,12 +347,12 @@ export const signalPlugin: ChannelPlugin<ResolvedSignalAccount, SignalProbe> =
         probeAccount: async ({ account, timeoutMs }) => {
           const baseUrl = account.baseUrl;
           const { probeSignal } = await loadSignalProbeModule();
-          return await probeSignal(baseUrl, timeoutMs);
+          return await probeSignal(baseUrl, timeoutMs, {
+            apiMode: account.config?.apiMode ?? "auto",
+          });
         },
         formatCapabilitiesProbe: ({ probe }) =>
-          (probe as SignalProbe | undefined)?.version
-            ? [{ text: `Signal daemon: ${(probe as SignalProbe).version}` }]
-            : [],
+          probe?.version ? [{ text: `Signal daemon: ${probe.version}` }] : [],
         resolveAccountSnapshot: ({ account }) => ({
           accountId: account.accountId,
           name: account.name,
@@ -329,14 +381,19 @@ export const signalPlugin: ChannelPlugin<ResolvedSignalAccount, SignalProbe> =
           });
         },
       },
+      message: signalMessageAdapter,
     },
     pairing: {
       text: {
         idLabel: "signalNumber",
         message: PAIRING_APPROVED_MESSAGE,
         normalizeAllowEntry: createPairingPrefixStripper(/^signal:/i),
-        notify: async ({ id, message }) => {
-          await (await loadSignalSendRuntime()).sendMessageSignal(id, message);
+        notify: async ({ cfg, id, message }) => {
+          await (
+            await loadSignalSendRuntime()
+          ).sendMessageSignal(id, message, {
+            cfg,
+          });
         },
       },
     },
