@@ -15,6 +15,7 @@ import {
   resolveCommandTurnTargetSessionKey,
 } from "./command-turn-context.js";
 import { withReplyDispatcher } from "./dispatch-dispatcher.js";
+import { createInternalHookEvent, triggerInternalHook } from "../hooks/internal-hooks.js";
 import { dispatchReplyFromConfig } from "./reply/dispatch-from-config.js";
 import type { DispatchFromConfigResult } from "./reply/dispatch-from-config.types.js";
 import type { GetReplyFromConfig } from "./reply/get-reply.types.js";
@@ -277,6 +278,13 @@ export async function dispatchInboundMessage(params: {
         },
       ),
   });
+  // Emit agent:turn-complete hook so the bundled reviewer + recovery hooks can react.
+  // Fork addition (originally in fractal/branch-cleanup-2026-05-15); ported into upstream-merged structure.
+  void triggerInternalHook(
+    createInternalHookEvent("agent", "turn-complete", finalized.SessionKey ?? "", {
+      cfg: params.cfg,
+    }),
+  );
   return finalizeDispatchResult(result, params.dispatcher);
 }
 
