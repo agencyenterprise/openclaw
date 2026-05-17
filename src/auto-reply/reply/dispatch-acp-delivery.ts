@@ -224,6 +224,18 @@ export function createAcpDispatchDeliveryCoordinator(params: {
         kind,
         text: ttsPayload.text,
       });
+      if (params.ctx.MessageThreadId == null) {
+        console.error(
+          "[THREAD-LEAK] dispatch-acp MessageThreadId=NULL channel=" +
+            params.originatingChannel +
+            " to=" +
+            params.originatingTo +
+            " sessionKey=" +
+            (params.ctx.SessionKey || "?") +
+            " stack=" +
+            new Error("ACP_NO_THREAD").stack,
+        );
+      }
       const result = await routeReply({
         payload: ttsPayload,
         channel: params.originatingChannel,

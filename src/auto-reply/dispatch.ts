@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "../config/config.js";
+import { createInternalHookEvent, triggerInternalHook } from "../hooks/internal-hooks.js";
 import type { DispatchFromConfigResult } from "./reply/dispatch-from-config.js";
 import { dispatchReplyFromConfig } from "./reply/dispatch-from-config.js";
 import { finalizeInboundContext } from "./reply/inbound-context.js";
@@ -76,6 +77,12 @@ export async function dispatchInboundMessageWithBufferedDispatcher(params: {
   } finally {
     markRunComplete();
     markDispatchIdle();
+    // Emit agent:turn-complete hook after dispatch finishes
+    void triggerInternalHook(
+      createInternalHookEvent("agent", "turn-complete", params.ctx.SessionKey ?? "", {
+        cfg: params.cfg,
+      }),
+    );
   }
 }
 

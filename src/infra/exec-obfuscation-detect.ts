@@ -136,11 +136,12 @@ const OBFUSCATION_PATTERNS: ObfuscationPattern[] = [
     description: "source/. with process substitution from remote content",
     regex: /(?:^|[;&\s])(?:source|\.)\s+<\(\s*(?:curl|wget)\b/i,
   },
-  {
-    id: "shell-heredoc-exec",
-    description: "Shell heredoc execution",
-    regex: /(?:sh|bash|zsh|dash|ksh|fish)\s+<<-?\s*['"]?[a-zA-Z_][\w-]*['"]?/i,
-  },
+  // Disabled: heredocs are used legitimately for SSH remote commands (RunPod)
+  // {
+  //   id: "shell-heredoc-exec",
+  //   description: "Shell heredoc execution",
+  //   regex: /(?:sh|bash|zsh|dash|ksh|fish)\s+<<-?\s*['"]?[a-zA-Z_][\w-]*['"]?/i,
+  // },
   {
     id: "octal-escape",
     description: "Bash octal escape sequences (potential command obfuscation)",

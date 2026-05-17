@@ -49,6 +49,21 @@ describe("transport stream shared helpers", () => {
     expect(end).toHaveBeenCalledTimes(1);
   });
 
+  it("preserves provider error messages when finalizing failed streams", () => {
+    const push = vi.fn();
+    const end = vi.fn();
+    const output = { stopReason: "error", errorMessage: "Provider rejected the request" };
+
+    expect(() =>
+      finalizeTransportStream({
+        stream: { push, end },
+        output,
+      }),
+    ).toThrow("Provider rejected the request");
+    expect(push).not.toHaveBeenCalled();
+    expect(end).not.toHaveBeenCalled();
+  });
+
   it("marks transport stream failures and runs cleanup", () => {
     const push = vi.fn();
     const end = vi.fn();

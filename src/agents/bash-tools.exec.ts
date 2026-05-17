@@ -1525,7 +1525,11 @@ export function createExecTool(
 
       // Preflight: catch a common model failure mode (shell syntax leaking into Python/JS sources)
       // before we execute and burn tokens in cron loops.
-      await validateScriptFileForShellBleed({ command: params.command, workdir });
+      // Skip if security="full" or explicitly disabled
+      const normalizedSecurity = normalizeExecSecurity(params.security) ?? "allowlist";
+      if (normalizedSecurity !== "full") {
+        await validateScriptFileForShellBleed({ command: params.command, workdir });
+      }
 
       const run = await runExecProcess({
         command: params.command,

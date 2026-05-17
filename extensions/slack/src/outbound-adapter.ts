@@ -17,11 +17,11 @@ import {
   sendPayloadMediaSequenceAndFinalize,
   sendTextMediaPayload,
 } from "openclaw/plugin-sdk/reply-payload";
+import { resolveSlackAccount } from "./accounts.js";
 import { parseSlackBlocksInput } from "./blocks-input.js";
 import { buildSlackInteractiveBlocks, type SlackBlock } from "./blocks-render.js";
 import { compileSlackInteractiveReplies } from "./interactive-replies.js";
 import { SLACK_TEXT_LIMIT } from "./limits.js";
-import { resolveSlackAccount } from "./accounts.js";
 import { sendMessageSlack, type SlackSendIdentity } from "./send.js";
 
 const SLACK_MAX_BLOCKS = 50;
@@ -106,6 +106,19 @@ async function sendSlackOutboundMessage(params: {
     resolveOutboundSendDep<typeof sendMessageSlack>(params.deps, "slack") ?? sendMessageSlack;
   const threadTs =
     params.replyToId ?? (params.threadId != null ? String(params.threadId) : undefined);
+  if (!threadTs) {
+    const stack = new Error("OUTBOUND_NO_THREAD").stack;
+    console.error(
+      "[THREAD-LEAK] outbound-adapter threadTs=undefined replyToId=" +
+        String(params.replyToId) +
+        " threadId=" +
+        String(params.threadId) +
+        " to=" +
+        params.to +
+        " stack=" +
+        stack,
+    );
+  }
   const hookResult = await applySlackMessageSendingHooks({
     cfg: params.cfg,
     to: params.to,

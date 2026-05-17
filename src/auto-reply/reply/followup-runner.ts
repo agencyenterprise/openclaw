@@ -101,6 +101,25 @@ export function createFollowupRunner(params: {
 
       // Route to originating channel if set, otherwise fall back to dispatcher.
       if (shouldRouteToOriginating) {
+        if (queued.originatingThreadId == null) {
+          console.error(
+            "[THREAD-LEAK] followup-runner originatingThreadId=NULL channel=" +
+              originatingChannel +
+              " to=" +
+              originatingTo +
+              " sessionKey=" +
+              (queued.run.sessionKey || "?") +
+              " stack=" +
+              new Error("FOLLOWUP_NO_THREAD").stack,
+          );
+        } else {
+          console.error(
+            "[thread-ok] followup-runner originatingThreadId=" +
+              String(queued.originatingThreadId) +
+              " sessionKey=" +
+              (queued.run.sessionKey || "?"),
+          );
+        }
         const result = await routeReply({
           payload,
           channel: originatingChannel,

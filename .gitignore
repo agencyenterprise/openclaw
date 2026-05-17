@@ -143,3 +143,6 @@ changelog/fragments/
 .tmp/
 test/fixtures/openclaw-vitest-unit-report.json
 analysis/
+
+# Local snapshot dumps (handler/dispatch/soul backups from manual hotpatch cycles)
+backups/

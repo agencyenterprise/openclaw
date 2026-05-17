@@ -30,6 +30,17 @@ export type AgentBootstrapHookEvent = InternalHookEvent & {
   context: AgentBootstrapHookContext;
 };
 
+export type AgentTurnCompleteHookContext = {
+  cfg?: OpenClawConfig;
+  stopReason?: "stop" | "toolUse" | "aborted";
+};
+
+export type AgentTurnCompleteHookEvent = InternalHookEvent & {
+  type: "agent";
+  action: "turn-complete";
+  context: AgentTurnCompleteHookContext;
+};
+
 export type GatewayStartupHookContext = {
   cfg?: OpenClawConfig;
   deps?: CliDeps;
@@ -373,6 +384,15 @@ export function isAgentBootstrapEvent(event: InternalHookEvent): event is AgentB
     return false;
   }
   return Array.isArray(context.bootstrapFiles);
+}
+
+export function isAgentTurnCompleteEvent(
+  event: InternalHookEvent,
+): event is AgentTurnCompleteHookEvent {
+  if (!isHookEventTypeAndAction(event, "agent", "turn-complete")) {
+    return false;
+  }
+  return Boolean(getHookContext<AgentTurnCompleteHookContext>(event));
 }
 
 export function isGatewayStartupEvent(event: InternalHookEvent): event is GatewayStartupHookEvent {

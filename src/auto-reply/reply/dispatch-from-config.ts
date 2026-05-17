@@ -232,7 +232,9 @@ export async function dispatchReplyFromConfig(params: {
   // folded back into lastThreadId/deliveryContext during store normalisation and resurrect a
   // stale route after thread delivery was intentionally cleared.
   const routeThreadId =
-    ctx.MessageThreadId ?? parseSessionThreadInfo(acpDispatchSessionKey).threadId;
+    ctx.MessageThreadId ??
+    parseSessionThreadInfo(acpDispatchSessionKey).threadId ??
+    sessionStoreEntry.entry?.lastThreadId;
   const inboundAudio = isInboundAudioContext(ctx);
   const sessionTtsAuto = normalizeTtsAutoMode(sessionStoreEntry.entry?.ttsAuto);
   const hookRunner = getGlobalHookRunner();

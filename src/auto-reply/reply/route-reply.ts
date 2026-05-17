@@ -164,6 +164,23 @@ export async function routeReply(params: RouteReplyParams): Promise<RouteReplyRe
       ? (replyTransport.threadId ?? null)
       : (threadId ?? null);
 
+  if (resolvedReplyToId == null && resolvedThreadId == null) {
+    console.error(
+      "[THREAD-LEAK] route-reply NO thread/replyToId channel=" +
+        String(channelId) +
+        " to=" +
+        to +
+        " inputThreadId=" +
+        String(threadId) +
+        " inputReplyToId=" +
+        String(replyToId) +
+        " sessionKey=" +
+        (params.sessionKey || "?") +
+        " stack=" +
+        new Error("ROUTE_NO_THREAD").stack,
+    );
+  }
+
   try {
     // Provider docking: this is an execution boundary (we're about to send).
     // Keep the module cheap to import by loading outbound plumbing lazily.

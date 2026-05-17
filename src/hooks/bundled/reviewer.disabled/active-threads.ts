@@ -2,7 +2,7 @@
  * Active threads persistence — survives gateway restarts.
  *
  * Tracks which Slack threads have an active agent turn in progress.
- * On gateway restart, threads < 1 hour old are respawned.
+ * On gateway restart, threads < 24 hours old are respawned.
  *
  * Thread-safety: Node.js is single-threaded for JS, but async interleaving
  * can cause read-modify-write races on the file. We use an in-memory Map
@@ -15,7 +15,7 @@ import { createSubsystemLogger } from "../../../logging/subsystem.js";
 
 const log = createSubsystemLogger("hooks/active-threads");
 
-const STALE_THRESHOLD_MS = 60 * 60 * 1000; // 1 hour
+const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // In-memory source of truth: "channelId:threadTs" → ISO timestamp
 const threads = new Map<string, string>();
@@ -72,8 +72,8 @@ export function removeThread(channelId: string, threadTs: string): void {
 }
 
 /**
- * Load active threads from disk (called on startup).
- * Returns entries < 1 hour old, then clears the file.
+ * Load active threads from disk (called on startup). Returns entries less than
+ * 24 hours old, then clears the file.
  */
 export function loadAndConsumeThreads(): Array<{ channelId: string; threadTs: string }> {
   const filePath = getFilePath();

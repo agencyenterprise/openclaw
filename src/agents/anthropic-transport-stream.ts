@@ -94,6 +94,8 @@ type MutableAssistantOutput = {
 
 function supportsAdaptiveThinking(modelId: string): boolean {
   return (
+    modelId.includes("opus-4-7") ||
+    modelId.includes("opus-4.7") ||
     modelId.includes("opus-4-6") ||
     modelId.includes("opus-4.6") ||
     modelId.includes("sonnet-4-6") ||
@@ -112,7 +114,12 @@ function mapThinkingLevelToEffort(
     case "medium":
       return "medium";
     case "xhigh":
-      return modelId.includes("opus-4-6") || modelId.includes("opus-4.6") ? "max" : "high";
+      return modelId.includes("opus-4-7") ||
+        modelId.includes("opus-4.7") ||
+        modelId.includes("opus-4-6") ||
+        modelId.includes("opus-4.6")
+        ? "max"
+        : "high";
     default:
       return "high";
   }

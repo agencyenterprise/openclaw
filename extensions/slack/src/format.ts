@@ -104,6 +104,52 @@ type SlackMarkdownOptions = {
   tableMode?: MarkdownTableMode;
 };
 
+const FENCE_RE = /^\s*```/;
+const STANDALONE_EMPHASIZED_LINE_RE = /^(\s*)([_*])([^_*`\n]{1,140})\2(\s*)$/;
+const TASK_TITLE_RE = /\b[A-Z][A-Z0-9]+-\d+\b/;
+const LABEL_EMPHASIS_RE = /^(\s*(?:(?:[-+*]|•)|\d+[.)])?\s*)([_*])([^_*`\n]{1,140}[:?])\2(?=\s|$)/;
+
+function shouldRepairStandaloneEmphasis(label: string): boolean {
+  const trimmed = label.trim();
+  return /[:?]$/.test(trimmed) || TASK_TITLE_RE.test(trimmed) || /\s[–—]\s/.test(trimmed);
+}
+
+function repairSlackReadableLabels(markdown: string): string {
+  if (!markdown || (!markdown.includes("_") && !markdown.includes("*"))) {
+    return markdown;
+  }
+
+  let inFence = false;
+  return markdown
+    .split("\n")
+    .map((line) => {
+      if (FENCE_RE.test(line)) {
+        inFence = !inFence;
+        return line;
+      }
+      if (inFence) {
+        return line;
+      }
+
+      const standalone = line.match(STANDALONE_EMPHASIZED_LINE_RE);
+      if (standalone) {
+        const [, prefix, , label, suffix] = standalone;
+        const trimmed = label.trim();
+        if (trimmed && shouldRepairStandaloneEmphasis(trimmed)) {
+          return `${prefix}**${trimmed}**${suffix}`;
+        }
+      }
+
+      return line.replace(
+        LABEL_EMPHASIS_RE,
+        (_match, prefix: string, _marker: string, label: string) => {
+          return `${prefix}**${label}**`;
+        },
+      );
+    })
+    .join("\n");
+}
+
 function buildSlackRenderOptions() {
   return {
     styleMarkers: {
@@ -122,7 +168,7 @@ export function markdownToSlackMrkdwn(
   markdown: string,
   options: SlackMarkdownOptions = {},
 ): string {
-  const ir = markdownToIR(markdown ?? "", {
+  const ir = markdownToIR(repairSlackReadableLabels(markdown ?? ""), {
     linkify: false,
     autolink: false,
     headingStyle: "bold",
@@ -141,7 +187,7 @@ export function markdownToSlackMrkdwnChunks(
   limit: number,
   options: SlackMarkdownOptions = {},
 ): string[] {
-  const ir = markdownToIR(markdown ?? "", {
+  const ir = markdownToIR(repairSlackReadableLabels(markdown ?? ""), {
     linkify: false,
     autolink: false,
     headingStyle: "bold",

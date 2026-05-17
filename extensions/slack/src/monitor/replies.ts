@@ -37,6 +37,20 @@ export async function deliverReplies(params: {
     // must not force threading.
     const inlineReplyToId = params.replyToMode === "off" ? undefined : payload.replyToId;
     const threadTs = inlineReplyToId ?? params.replyThreadTs;
+    if (!threadTs) {
+      console.error(
+        "[THREAD-LEAK] deliverReplies threadTs=undefined target=" +
+          params.target +
+          " replyToMode=" +
+          params.replyToMode +
+          " replyThreadTs=" +
+          String(params.replyThreadTs) +
+          " inlineReplyToId=" +
+          String(inlineReplyToId) +
+          " stack=" +
+          new Error("DELIVER_NO_THREAD").stack,
+      );
+    }
     const reply = resolveSendableOutboundReplyParts(payload);
     const slackBlocks = readSlackReplyBlocks(payload);
     if (!reply.hasContent && !slackBlocks?.length) {

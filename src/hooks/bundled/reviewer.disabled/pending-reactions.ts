@@ -24,6 +24,7 @@ interface PendingReaction {
   messageTs: string;
   emoji: string;
   addedAt: string;
+  threadTs?: string;
 }
 
 function getFilePath(): string {

@@ -467,6 +467,16 @@ export async function dispatchCronDelivery(
           }
         : undefined;
 
+      if (delivery.threadId == null) {
+        console.error(
+          "[THREAD-LEAK] cron-delivery threadId=NULL channel=" +
+            delivery.channel +
+            " to=" +
+            delivery.to +
+            " jobId=" +
+            params.job.id,
+        );
+      }
       const runDelivery = async () =>
         await deliverOutboundPayloads({
           cfg: params.cfgWithAgentDefaults,

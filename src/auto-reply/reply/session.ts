@@ -5,6 +5,7 @@ import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { clearBootstrapSnapshotOnSessionRollover } from "../../agents/bootstrap-cache.js";
 import { disposeSessionMcpRuntime } from "../../agents/pi-bundle-mcp-tools.js";
 import { normalizeChatType } from "../../channels/chat-type.js";
+import { resolveSessionThreadInfo } from "../../channels/plugins/session-conversation.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { resolveGroupSessionKey } from "../../config/sessions/group.js";
 import { canonicalizeMainSessionAlias } from "../../config/sessions/main-session.js";
@@ -508,10 +509,14 @@ export async function initSessionState(params: {
     sessionKey,
   });
   const lastAccountIdRaw = ctx.AccountId || baseEntry?.lastAccountId;
-  // Only fall back to persisted threadId for thread sessions.  Non-thread
-  // sessions (e.g. DM without topics) must not inherit a stale threadId from a
-  // previous interaction that happened inside a topic/thread.
-  const lastThreadIdRaw = ctx.MessageThreadId || (isThread ? baseEntry?.lastThreadId : undefined);
+  // Fall back to persisted threadId for all sessions. For non-thread channel
+  // sessions, lastThreadId prevents followup turns and system events from
+  // posting to channel root when MessageThreadId is absent.
+  const lastThreadIdRaw =
+    ctx.MessageThreadId ||
+    (isThread ? baseEntry?.lastThreadId : undefined) ||
+    resolveSessionThreadInfo(sessionKey).threadId ||
+    baseEntry?.lastThreadId;
   const deliveryFields = normalizeSessionDeliveryFields({
     deliveryContext: {
       channel: lastChannelRaw,

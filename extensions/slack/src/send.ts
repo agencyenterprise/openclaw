@@ -107,6 +107,21 @@ async function postSlackMessageBestEffort(params: {
     thread_ts: params.threadTs,
     ...(params.blocks?.length ? { blocks: params.blocks } : {}),
   };
+  if (!params.threadTs) {
+    const stack = new Error("THREAD_LEAK_TRACE").stack;
+    console.error(
+      "[THREAD-LEAK] postMessage WITHOUT thread_ts channel=" +
+        params.channelId +
+        " textLen=" +
+        (params.text || "").length +
+        " stack=" +
+        stack,
+    );
+  } else {
+    console.error(
+      "[thread-ok] postMessage channel=" + params.channelId + " thread_ts=" + params.threadTs,
+    );
+  }
   try {
     // Slack Web API types model icon_url and icon_emoji as mutually exclusive.
     // Build payloads in explicit branches so TS and runtime stay aligned.

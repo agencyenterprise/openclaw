@@ -225,7 +225,191 @@ function sendLangfuseTrace(params: {
   }).catch((err) => log.warn(`langfuse trace failed: ${String(err)}`));
 }
 
-// ── Tool call extraction from session JSONL ──────────────────────────
+// ── Tool call and subagent extraction from local OpenClaw state ───────
+
+function compactForReviewer(value: unknown, maxChars: number): string {
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxChars) {
+    return compact;
+  }
+  return `${compact.slice(0, maxChars)}... (${compact.length} chars total)`;
+}
+
+function formatToolCallForReviewer(toolName: string, args: Record<string, unknown>): string {
+  if (toolName === "exec") {
+    return `[CALL exec]: ${String(args.command ?? "").slice(0, 1000)}`;
+  }
+  if (toolName === "memory_search") {
+    return `[CALL memory_search]: query="${args.query ?? ""}"`;
+  }
+  if (toolName === "read") {
+    return `[CALL read]: ${args.path ?? args.file_path ?? ""}`;
+  }
+  if (toolName === "write") {
+    const content = String(args.content ?? "");
+    const writeContent = content.slice(0, 2000);
+    return `[CALL write]: ${args.path ?? ""} (${content.length} chars)\n${writeContent}${content.length > 2000 ? "\n... (truncated)" : ""}`;
+  }
+  if (toolName === "message") {
+    const action = args.action ?? "send";
+    if (action === "send") {
+      return "";
+    }
+    return `[CALL message ${action}]: ${compactForReviewer(args, 500)}`;
+  }
+
+  const lowerName = toolName.toLowerCase();
+  if (
+    lowerName.includes("spawn") ||
+    lowerName.includes("subagent") ||
+    lowerName.includes("codex")
+  ) {
+    const label = args.label ?? args.name ?? args.agentName ?? "";
+    const model = args.model ?? args.modelName ?? "";
+    const task =
+      args.task ?? args.message ?? args.prompt ?? args.input ?? args.instructions ?? args;
+    return `[CALL ${toolName}]: label="${label}" model="${model}" task="${compactForReviewer(task, 2000)}"`;
+  }
+
+  return `[CALL ${toolName}]: ${compactForReviewer(args, 1000)}`;
+}
+
+function extractSubagentRunsForThread(
+  stateDir: string,
+  threadTs: string,
+  sessionKey?: string,
+): string[] {
+  try {
+    const registryPath = path.join(stateDir, "subagents", "runs.json");
+    if (!fs.existsSync(registryPath)) {
+      return [];
+    }
+
+    const registry = JSON.parse(fs.readFileSync(registryPath, "utf-8"));
+    const rawRuns = Object.values(registry.runs ?? registry);
+    const threadSessionFragment = `:thread:${threadTs}`;
+
+    const matchedRuns = rawRuns
+      .filter((run: any) => {
+        const requester = String(run?.requesterSessionKey ?? "");
+        const controller = String(run?.controllerSessionKey ?? "");
+        const child = String(run?.childSessionKey ?? "");
+        const originThread = String(run?.requesterOrigin?.threadId ?? "");
+        if (originThread === threadTs) {
+          return true;
+        }
+        if (
+          requester.includes(threadSessionFragment) ||
+          controller.includes(threadSessionFragment) ||
+          child.includes(threadSessionFragment)
+        ) {
+          return true;
+        }
+        return Boolean(
+          sessionKey &&
+          (requester === sessionKey || controller === sessionKey || child === sessionKey),
+        );
+      })
+      .toSorted((a: any, b: any) => Number(a?.createdAt ?? 0) - Number(b?.createdAt ?? 0))
+      .slice(-25);
+
+    const entries: string[] = [];
+    for (const run of matchedRuns as any[]) {
+      const label = run.label ?? "";
+      const model = run.model ?? "";
+      const status = run.outcome?.status ?? run.endedReason ?? (run.endedAt ? "ended" : "active");
+      const created = run.createdAt ? new Date(Number(run.createdAt)).toISOString() : "";
+      const ended = run.endedAt ? new Date(Number(run.endedAt)).toISOString() : "active";
+      const child = run.childSessionKey ?? "";
+      const task = compactForReviewer(run.task ?? "", 1500);
+      entries.push(
+        `[SUBAGENT run]: label="${label}" runId="${run.runId ?? ""}" model="${model}" status="${status}" created="${created}" ended="${ended}" childSession="${child}" task="${task}"`,
+      );
+
+      if (run.frozenResultText) {
+        entries.push(
+          `[SUBAGENT result]: label="${label}" runId="${run.runId ?? ""}" ${compactForReviewer(run.frozenResultText, 2000)}`,
+        );
+      }
+    }
+    return entries;
+  } catch (err) {
+    log.warn(`extractSubagentRuns failed: ${String(err)}`);
+    return [];
+  }
+}
+
+function resolveReviewerArtifactPath(rawPath: string, workspaceDir: string): string | undefined {
+  const cleaned = rawPath
+    .replace(/^[`'"(<]+/, "")
+    .replace(/[>`'"),.;:]+$/, "")
+    .replace(/\{md,json\}$/, "md")
+    .replace(/\{json,md\}$/, "md");
+  if (!/\.(md|markdown|txt|json)$/i.test(cleaned)) {
+    return undefined;
+  }
+
+  const resolved = path.resolve(
+    cleaned.startsWith("/") ? cleaned : path.join(workspaceDir, cleaned),
+  );
+  const workspaceRoot = path.resolve(workspaceDir);
+  const tmpRoot = path.resolve("/tmp");
+  if (
+    resolved !== workspaceRoot &&
+    !resolved.startsWith(`${workspaceRoot}${path.sep}`) &&
+    !resolved.startsWith(`${tmpRoot}${path.sep}`)
+  ) {
+    return undefined;
+  }
+  return resolved;
+}
+
+function extractReferencedArtifactsForReviewer(
+  workspaceDir: string | undefined,
+  stateDir: string,
+  threadMessages: Array<{ text: string }>,
+  toolEntries: string[],
+): string[] {
+  try {
+    const resolvedWorkspace = workspaceDir ?? path.join(stateDir, "workspace");
+    const textSources = [...threadMessages.map((m) => m.text ?? ""), ...toolEntries].join("\n");
+    const artifactPattern =
+      /(?:\/home\/ubuntu\/\.openclaw\/workspace\/|\/tmp\/|(?:papers|reports|memory|outputs|repos|scripts)\/)[^\s`'"<>)]*\.(?:md|markdown|txt|json|\{md,json\}|\{json,md\})/g;
+    const matches = textSources.match(artifactPattern) ?? [];
+    const seen = new Set<string>();
+    const entries: string[] = [];
+
+    for (const raw of matches) {
+      const resolved = resolveReviewerArtifactPath(raw, resolvedWorkspace);
+      if (!resolved || seen.has(resolved) || !fs.existsSync(resolved)) {
+        continue;
+      }
+      const stat = fs.statSync(resolved);
+      if (!stat.isFile() || stat.size > 2_000_000) {
+        continue;
+      }
+      seen.add(resolved);
+      const content = fs.readFileSync(resolved, "utf-8");
+      const maxChars = 50_000;
+      const body =
+        content.length > maxChars
+          ? `${content.slice(0, maxChars)}\n... (${content.length} chars total)`
+          : content;
+      const display = resolved.startsWith(`${resolvedWorkspace}${path.sep}`)
+        ? path.relative(resolvedWorkspace, resolved)
+        : resolved;
+      entries.push(`[ARTIFACT ${display} (${content.length} chars)]\n${body}`);
+      if (entries.length >= 5) {
+        break;
+      }
+    }
+    return entries;
+  } catch (err) {
+    log.warn(`extractReferencedArtifacts failed: ${String(err)}`);
+    return [];
+  }
+}
 
 function extractToolCallsFromSession(
   stateDir: string,
@@ -286,31 +470,11 @@ function extractToolCallsFromSession(
                 continue;
               }
               const toolName = block.name ?? "";
-              const _toolId = block.id ?? "";
               const args = block.arguments ?? {};
-              let callStr = "";
-              if (toolName === "exec") {
-                callStr = `[CALL exec]: ${(args.command ?? "").slice(0, 1000)}`;
-              } else if (toolName === "memory_search") {
-                callStr = `[CALL memory_search]: query="${args.query ?? ""}"`;
-              } else if (toolName === "read") {
-                callStr = `[CALL read]: ${args.path ?? args.file_path ?? ""}`;
-              } else if (toolName === "write") {
-                const writeContent = (args.content ?? "").slice(0, 2000);
-                const writeLen = (args.content ?? "").length;
-                callStr = `[CALL write]: ${args.path ?? ""} (${writeLen} chars)\n${writeContent}${writeLen > 2000 ? "\n... (truncated)" : ""}`;
-              } else if (toolName === "message") {
-                // Only skip send — those are already visible in the thread.
-                // Keep delete/react/update since they're invisible to thread readers.
-                const action = args.action ?? "send";
-                if (action === "send") {
-                  continue;
-                }
-                callStr = `[CALL message ${action}]: ${JSON.stringify(args).slice(0, 500)}`;
-              } else {
-                callStr = `[CALL ${toolName}]: ${JSON.stringify(args).slice(0, 200)}`;
+              const callStr = formatToolCallForReviewer(toolName, args);
+              if (callStr) {
+                entries.push(callStr);
               }
-              entries.push(callStr);
             }
           }
 
@@ -572,6 +736,11 @@ async function fetchSlackThread(
   }));
 }
 
+function isReviewerFeedbackText(text: string | undefined): boolean {
+  const normalized = (text ?? "").trim();
+  return normalized.startsWith("🔍 *Reviewer:*") || normalized.startsWith(":mag: *Reviewer:*");
+}
+
 async function slackReact(
   token: string,
   channelId: string,
@@ -622,7 +791,7 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
   // Handle gateway:startup — clean orphan reactions + re-engage interrupted threads
   if (event.type === "gateway" && event.action === "startup") {
     // --- Resolve Slack bot token + bot user ID for all phases ---
-    const startupCtx = event.context as Record<string, unknown>;
+    const startupCtx = event.context;
     const startupCfg = startupCtx.cfg as OpenClawConfig | undefined;
     let reactionBotToken: string | undefined;
     let botUserId: string | undefined;
@@ -658,11 +827,25 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
       if (reactionBotToken) {
         // All known status reaction shortcodes that could be left on messages
         const STATUS_EMOJIS = [
-          "eyes", "thinking_face", "fire", "male-technologist",
-          "female-technologist", "zap", "globe_with_meridians",
-          "thumbsup", "scream", "yawning_face", "fearful",
-          "hourglass_flowing_sand", "warning", "writing_hand",
-          "brain", "hammer_and_wrench", "computer", "white_check_mark", "x",
+          "eyes",
+          "thinking_face",
+          "fire",
+          "male-technologist",
+          "female-technologist",
+          "zap",
+          "globe_with_meridians",
+          "thumbsup",
+          "scream",
+          "yawning_face",
+          "fearful",
+          "hourglass_flowing_sand",
+          "warning",
+          "writing_hand",
+          "brain",
+          "hammer_and_wrench",
+          "computer",
+          "white_check_mark",
+          "x",
         ];
         for (const reaction of pendingReactions) {
           const { channel, messageTs, emoji } = reaction;
@@ -689,49 +872,15 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
             }
           }
 
-          // Check if bot already responded after the trigger message.
-          // If not, this thread needs re-engagement.
-          if (botUserId && threadTs) {
-            try {
-              const params = new URLSearchParams({
-                channel,
-                ts: threadTs,
-                oldest: messageTs,
-                limit: "10",
-              });
-              const res = await fetch(
-                `https://slack.com/api/conversations.replies?${params.toString()}`,
-                {
-                  method: "GET",
-                  headers: { Authorization: `Bearer ${reactionBotToken}` },
-                },
-              );
-              const data = (await res.json()) as {
-                ok?: boolean;
-                messages?: Array<{ user?: string; ts?: string }>;
-              };
-              const botReplied =
-                data.ok &&
-                data.messages?.some(
-                  (m) => m.user === botUserId && m.ts && m.ts > messageTs,
-                );
-              if (!botReplied) {
-                interruptedThreads.push({ channelId: channel, threadTs });
-                log.info(
-                  `thread ${channel}:${threadTs} needs re-engagement (bot did not respond)`,
-                );
-              } else {
-                log.info(
-                  `thread ${channel}:${threadTs} already has bot reply — skip re-engagement`,
-                );
-              }
-            } catch (err) {
-              // If we can't check, err on the side of re-engaging
-              interruptedThreads.push({ channelId: channel, threadTs });
-              log.warn(
-                `thread check failed for ${channel}:${threadTs}: ${String(err)} — will re-engage`,
-              );
-            }
+          // A surviving pending ack means the previous gateway did not finish
+          // the dispatch lifecycle. Do not treat bot progress/block messages as
+          // completion; that was the old false-positive that abandoned threads
+          // after restart.
+          if (threadTs) {
+            interruptedThreads.push({ channelId: channel, threadTs });
+            log.info(
+              `thread ${channel}:${threadTs} needs re-engagement (pending ack survived restart)`,
+            );
           }
         }
       } else {
@@ -788,17 +937,26 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
       log.warn(
         "gateway startup: reviewer dispatch not available after 30s — cannot respawn threads",
       );
+      for (const { channelId, threadTs } of allThreads) {
+        addThread(channelId, threadTs);
+      }
       return;
     }
     for (const { channelId, threadTs } of allThreads) {
       try {
-        await dispatchFn({
+        const dispatched = await dispatchFn({
           channelId,
           threadTs,
           text: "Gateway restarted. Continue where you left off.",
         });
-        log.info(`respawned thread ${channelId}:${threadTs}`);
+        if (dispatched) {
+          log.info(`respawned thread ${channelId}:${threadTs}`);
+        } else {
+          addThread(channelId, threadTs);
+          log.warn(`failed to respawn ${channelId}:${threadTs}: dispatch returned false`);
+        }
       } catch (err) {
+        addThread(channelId, threadTs);
         log.warn(`failed to respawn ${channelId}:${threadTs}: ${String(err)}`);
       }
     }
@@ -911,6 +1069,7 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
   }
 
   const sessionKey = event.sessionKey;
+  const botUserId = ctx.botUserId as string | undefined;
 
   // Guard against concurrent reviews on the same thread (message:sent can fire multiple times)
   const reviewKey = threadTs;
@@ -934,9 +1093,12 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
     )?.botToken as string | undefined;
     if (peekToken) {
       try {
-        const peekMessages = await fetchSlackThread(peekToken, channelId, threadTs);
+        const peekMessages = await fetchSlackThread(peekToken, channelId, threadTs, botUserId);
         const latestHumanTs = peekMessages
-          .filter((m: { role: string }) => m.role !== "Assistant")
+          .filter(
+            (m: { role: string; text?: string }) =>
+              m.role !== "Assistant" && !isReviewerFeedbackText(m.text),
+          )
           .pop()?.ts;
         if (latestHumanTs && latestHumanTs !== iterState.triggerHumanTs) {
           log.info(
@@ -964,8 +1126,11 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
       const botToken = slackCfg?.botToken as string | undefined;
       if (botToken) {
         const emoji = reviewerConfig.approveEmoji ?? "approved_by_fractal_reviewer";
-        const lastBotMsg = (await fetchSlackThread(botToken, channelId, threadTs))
-          .filter((m: { role: string }) => m.role === "Assistant")
+        const lastBotMsg = (await fetchSlackThread(botToken, channelId, threadTs, botUserId))
+          .filter(
+            (m: { role: string; text?: string }) =>
+              m.role === "Assistant" && !isReviewerFeedbackText(m.text),
+          )
           .pop();
         if (lastBotMsg?.ts) {
           await slackReact(botToken, channelId, lastBotMsg.ts, emoji);
@@ -974,6 +1139,7 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
     } catch (err) {
       log.warn(`auto-approve reaction failed: ${String(err)}`);
     }
+    activeReviews.delete(reviewKey);
     return;
   }
 
@@ -997,9 +1163,6 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
     // Track this thread as active (survives gateway restarts)
     addThread(channelId, threadTs);
 
-    // Resolve bot user ID for role assignment
-    const botUserId = ctx.botUserId as string | undefined;
-
     // Get workspace dir for system prompt loading
     const agentDefaults = (
       (cfg as Record<string, unknown>).agents as Record<string, unknown> | undefined
@@ -1012,15 +1175,23 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
     // Brief delay to ensure all messages from the dispatch are visible in Slack API
     await new Promise((r) => setTimeout(r, 1000));
 
-    // Fetch thread, extract tool calls, and query Hindsight in parallel
+    // Fetch thread plus local action traces in parallel.
     const stateDir =
       process.env.OPENCLAW_STATE_DIR ?? path.join(require("node:os").homedir(), ".openclaw");
-    const [threadMessages, toolCalls] = await Promise.all([
+    const [threadMessages, sessionToolCalls, subagentRuns] = await Promise.all([
       fetchSlackThread(botToken, channelId, threadTs, botUserId),
       Promise.resolve(extractToolCallsFromSession(stateDir, threadTs, sessionKey)),
+      Promise.resolve(extractSubagentRunsForThread(stateDir, threadTs, sessionKey)),
     ]);
+    const artifactEntries = extractReferencedArtifactsForReviewer(
+      workspaceDir,
+      stateDir,
+      threadMessages,
+      [...sessionToolCalls, ...subagentRuns],
+    );
+    const toolCalls = [...sessionToolCalls, ...subagentRuns, ...artifactEntries];
     log.info(
-      `thread fetched: ${threadMessages.length} messages, ${toolCalls.length} tool calls, calling ${model}...`,
+      `thread fetched: ${threadMessages.length} messages, ${sessionToolCalls.length} session tool calls, ${subagentRuns.length} subagent records, ${artifactEntries.length} artifacts, calling ${model}...`,
     );
     if (threadMessages.length === 0) {
       return;
@@ -1056,7 +1227,12 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
 
     if (action === "continue" && result.message) {
       const latestHumanMsgTs =
-        threadMessages.filter((m: { role: string }) => m.role !== "Assistant").pop()?.ts ?? "";
+        threadMessages
+          .filter(
+            (m: { role: string; text?: string }) =>
+              m.role !== "Assistant" && !isReviewerFeedbackText(m.text),
+          )
+          .pop()?.ts ?? "";
       iterationCounts.set(threadTs, { count: count + 1, triggerHumanTs: latestHumanMsgTs });
 
       let feedbackText = `🔍 *Reviewer:* ${result.message}`;
@@ -1090,7 +1266,9 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
       const emoji = reviewerConfig.approveEmoji ?? "approved_by_fractal_reviewer";
 
       // Prefer messageId from hook context; fall back to the last bot message ts
-      const lastBotMsg = threadMessages.filter((m) => m.role === "Assistant").pop();
+      const lastBotMsg = threadMessages
+        .filter((m) => m.role === "Assistant" && !isReviewerFeedbackText(m.text))
+        .pop();
       const reactTs = ctx.messageId ?? lastBotMsg?.ts;
       if (reactTs) {
         await slackReact(botToken, channelId, reactTs, emoji);
@@ -1098,15 +1276,8 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
         log.warn("no message ts available for approval reaction — skipping react");
       }
 
-      // Post suggestions even on approve (non-blocking improvement feedback)
-      if (result.suggestions) {
-        await slackPost(
-          botToken,
-          channelId,
-          threadTs,
-          `💡 _Suggestions from reviewer: ${result.suggestions}_`,
-        );
-      }
+      // Approve is intentionally silent apart from the reaction. If feedback is
+      // important enough to post publicly, the reviewer must choose continue.
     }
   } catch (err) {
     log.error(`review failed: ${String(err)}`);

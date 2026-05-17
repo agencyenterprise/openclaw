@@ -6,7 +6,7 @@ metadata:
     "openclaw":
       {
         "emoji": "🔍",
-        "events": ["message:sent"],
+        "events": ["message:sent", "gateway:startup"],
         "requires": {},
         "install": [{ "id": "bundled", "kind": "bundled", "label": "Bundled with OpenClaw" }],
       },

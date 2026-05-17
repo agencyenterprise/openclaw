@@ -9,6 +9,8 @@
  * up as a normal inbound message.
  */
 
+import type { SlackMessageEvent } from "../types.js";
+
 export type ReviewerDispatchFn = (params: {
   channelId: string;
   threadTs: string;
@@ -16,6 +18,40 @@ export type ReviewerDispatchFn = (params: {
 }) => Promise<boolean>;
 
 const REVIEWER_DISPATCH_KEY = Symbol.for("openclaw.reviewerDispatch");
+
+/**
+ * Build the synthetic Slack message used for reviewer/startup continuations.
+ *
+ * The synthetic event must use the real Slack thread timestamp as its message
+ * timestamp. Earlier code used a non-Slack id (`reviewer-${Date.now()}`); if
+ * the dispatch path later fell back to the event ts as the reply thread, Slack
+ * rejected the bot response with `invalid_thread_ts` and the continuation died.
+ *
+ * Keep `parent_user_id` populated too. The Slack router intentionally treats
+ * `thread_ts === ts` without `parent_user_id` as a top-level message, which
+ * would put reviewer continuations into the channel-level session and let them
+ * inherit unrelated thread state.
+ */
+export function buildReviewerSyntheticMessage(
+  params: {
+    channelId: string;
+    threadTs: string;
+    text: string;
+  },
+  botUserId?: string,
+): SlackMessageEvent {
+  return {
+    channel: params.channelId,
+    ts: params.threadTs,
+    event_ts: params.threadTs,
+    thread_ts: params.threadTs,
+    parent_user_id: botUserId ?? "REVIEWER",
+    user: botUserId ?? "REVIEWER",
+    text: params.text,
+    type: "message",
+    channel_type: "group",
+  };
+}
 
 /**
  * Call from the steerer hook handler to inject reviewer feedback into the

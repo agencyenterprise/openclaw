@@ -5,6 +5,21 @@ import type { EnvelopeFormatOptions } from "../envelope.js";
 import { formatEnvelopeTimestamp } from "../envelope.js";
 import type { TemplateContext } from "../templating.js";
 
+const SLACK_RESPONSE_FORMAT_HINTS = {
+  text_markup: "standard_markdown_converted_to_slack_mrkdwn",
+  rules: [
+    "Write standard Markdown; OpenClaw converts it to Slack mrkdwn before delivery.",
+    "Bold uses **double asterisks**. Do not use raw Slack *single asterisks* for bold.",
+    "Use _underscores_ only for intentional italics, never for labels or section headers.",
+    "Links use standard Markdown [label](url) or bare URLs.",
+    "Code blocks use triple backticks; language identifiers are stripped for Slack.",
+    "Prefer short **bold labels** over markdown headings or pipe tables.",
+  ],
+} satisfies {
+  text_markup: string;
+  rules: string[];
+};
+
 function safeTrim(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
@@ -45,9 +60,13 @@ function resolveInboundFormattingHints(ctx: TemplateContext):
     return undefined;
   }
   const normalizedChannel = normalizeChannelId(channelValue) ?? channelValue;
-  return getChannelPlugin(normalizedChannel)?.agentPrompt?.inboundFormattingHints?.({
+  const pluginHints = getChannelPlugin(normalizedChannel)?.agentPrompt?.inboundFormattingHints?.({
     accountId: safeTrim(ctx.AccountId) ?? undefined,
   });
+  if (pluginHints) {
+    return pluginHints;
+  }
+  return normalizedChannel === "slack" ? SLACK_RESPONSE_FORMAT_HINTS : undefined;
 }
 
 export function buildInboundMetaSystemPrompt(ctx: TemplateContext): string {

@@ -575,6 +575,25 @@ export const slackPlugin: ChannelPlugin<ResolvedSlackAccount, SlackProbe> = crea
           replyToId,
           threadId,
         });
+        // Guard: block unthreaded posts to channels from outbound delivery paths.
+        // This only affects deliverOutboundPayloads callers (followup, cron, subagent).
+        // The normal Slack dispatch path uses deliverReplies/sendMessageSlack directly.
+        const isChannelTarget =
+          typeof to === "string" &&
+          (to.startsWith("channel:") || (to.startsWith("C") && !to.includes(":")));
+        if (isChannelTarget && threadTsValue == null) {
+          console.error(
+            "[THREAD-GUARD] BLOCKED unthreaded channel post to=" +
+              to +
+              " textLen=" +
+              (text || "").length +
+              " text=" +
+              (text || "").slice(0, 80).replace(/\n/g, " ") +
+              " stack=" +
+              new Error("BLOCKED_CHANNEL_ROOT_POST").stack,
+          );
+          return { messageId: "blocked-no-thread", channelId: to };
+        }
         return await send(to, text, {
           cfg,
           threadTs: threadTsValue != null ? String(threadTsValue) : undefined,
@@ -600,6 +619,14 @@ export const slackPlugin: ChannelPlugin<ResolvedSlackAccount, SlackProbe> = crea
           replyToId,
           threadId,
         });
+        // Guard: block unthreaded media posts to channels
+        const isChannelTarget =
+          typeof to === "string" &&
+          (to.startsWith("channel:") || (to.startsWith("C") && !to.includes(":")));
+        if (isChannelTarget && threadTsValue == null) {
+          console.error("[THREAD-GUARD] BLOCKED unthreaded channel media post to=" + to);
+          return { messageId: "blocked-no-thread", channelId: to };
+        }
         return await send(to, text, {
           cfg,
           mediaUrl,

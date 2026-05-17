@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { resolveSessionAuthProfileOverride } from "../../agents/auth-profiles/session-override.js";
 import type { ExecToolDefaults } from "../../agents/bash-tools.js";
 import { resolveFastModeState } from "../../agents/fast-mode.js";
+import { resolveSessionThreadInfo } from "../../channels/plugins/session-conversation.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { resolveGroupSessionKey } from "../../config/sessions/group.js";
 import {
@@ -527,7 +528,32 @@ export async function runPreparedReply(
     originatingChannel: ctx.OriginatingChannel,
     originatingTo: ctx.OriginatingTo,
     originatingAccountId: ctx.AccountId,
-    originatingThreadId: ctx.MessageThreadId,
+    originatingThreadId: (() => {
+      const tid =
+        ctx.MessageThreadId ??
+        resolveSessionThreadInfo(sessionKey).threadId ??
+        sessionEntry?.lastThreadId;
+      if (tid == null) {
+        console.error(
+          "[THREAD-LEAK] get-reply-run originatingThreadId=NULL MessageThreadId=" +
+            String(ctx.MessageThreadId) +
+            " sessionKey=" +
+            (sessionKey || "?") +
+            " resolvedFromKey=" +
+            String(resolveSessionThreadInfo(sessionKey).threadId) +
+            " lastThreadId=" +
+            String(sessionEntry?.lastThreadId),
+        );
+      } else if (!ctx.MessageThreadId && !resolveSessionThreadInfo(sessionKey).threadId) {
+        console.error(
+          "[thread-fallback] get-reply-run using lastThreadId=" +
+            String(tid) +
+            " sessionKey=" +
+            (sessionKey || "?"),
+        );
+      }
+      return tid;
+    })(),
     originatingChatType: ctx.ChatType,
     run: {
       agentId,

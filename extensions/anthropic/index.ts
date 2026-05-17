@@ -42,6 +42,9 @@ import {
 
 const PROVIDER_ID = "anthropic";
 const DEFAULT_ANTHROPIC_MODEL = "anthropic/claude-sonnet-4-6";
+const ANTHROPIC_OPUS_47_MODEL_ID = "claude-opus-4-7";
+const ANTHROPIC_OPUS_47_DOT_MODEL_ID = "claude-opus-4.7";
+const ANTHROPIC_OPUS_47_TEMPLATE_MODEL_IDS = ["claude-opus-4-6", "claude-opus-4.6"] as const;
 const ANTHROPIC_OPUS_46_MODEL_ID = "claude-opus-4-6";
 const ANTHROPIC_OPUS_46_DOT_MODEL_ID = "claude-opus-4.6";
 const ANTHROPIC_OPUS_TEMPLATE_MODEL_IDS = ["claude-opus-4-5", "claude-opus-4.5"] as const;
@@ -49,6 +52,7 @@ const ANTHROPIC_SONNET_46_MODEL_ID = "claude-sonnet-4-6";
 const ANTHROPIC_SONNET_46_DOT_MODEL_ID = "claude-sonnet-4.6";
 const ANTHROPIC_SONNET_TEMPLATE_MODEL_IDS = ["claude-sonnet-4-5", "claude-sonnet-4.5"] as const;
 const ANTHROPIC_MODERN_MODEL_PREFIXES = [
+  "claude-opus-4-7",
   "claude-opus-4-6",
   "claude-sonnet-4-6",
   "claude-opus-4-5",
@@ -56,6 +60,7 @@ const ANTHROPIC_MODERN_MODEL_PREFIXES = [
   "claude-haiku-4-5",
 ] as const;
 const ANTHROPIC_OAUTH_ALLOWLIST = [
+  "anthropic/claude-opus-4-7",
   "anthropic/claude-sonnet-4-6",
   "anthropic/claude-opus-4-6",
   "anthropic/claude-opus-4-5",
@@ -103,6 +108,14 @@ function resolveAnthropicForwardCompatModel(
   ctx: ProviderResolveDynamicModelContext,
 ): ProviderRuntimeModel | undefined {
   return (
+    resolveAnthropic46ForwardCompatModel({
+      ctx,
+      dashModelId: ANTHROPIC_OPUS_47_MODEL_ID,
+      dotModelId: ANTHROPIC_OPUS_47_DOT_MODEL_ID,
+      dashTemplateId: ANTHROPIC_OPUS_46_MODEL_ID,
+      dotTemplateId: ANTHROPIC_OPUS_46_DOT_MODEL_ID,
+      fallbackTemplateIds: ANTHROPIC_OPUS_47_TEMPLATE_MODEL_IDS,
+    }) ??
     resolveAnthropic46ForwardCompatModel({
       ctx,
       dashModelId: ANTHROPIC_OPUS_46_MODEL_ID,
@@ -388,7 +401,7 @@ export default definePluginEntry({
               allowedKeys: [...ANTHROPIC_OAUTH_ALLOWLIST].map((model) =>
                 model.replace(/^anthropic\//, "claude-cli/"),
               ),
-              initialSelections: ["claude-cli/claude-sonnet-4-6"],
+              initialSelections: ["claude-cli/claude-opus-4-7"],
               message: "Claude CLI models",
             },
           },
@@ -413,7 +426,7 @@ export default definePluginEntry({
             groupHint: "Claude CLI + setup-token + API key",
             modelAllowlist: {
               allowedKeys: [...ANTHROPIC_OAUTH_ALLOWLIST],
-              initialSelections: ["anthropic/claude-sonnet-4-6"],
+              initialSelections: ["anthropic/claude-opus-4-7"],
               message: "Anthropic OAuth models",
             },
           },
@@ -467,7 +480,9 @@ export default definePluginEntry({
       },
       resolveDefaultThinkingLevel: ({ modelId }) =>
         matchesAnthropicModernModel(modelId) &&
-        (modelId.toLowerCase().startsWith(ANTHROPIC_OPUS_46_MODEL_ID) ||
+        (modelId.toLowerCase().startsWith(ANTHROPIC_OPUS_47_MODEL_ID) ||
+          modelId.toLowerCase().startsWith(ANTHROPIC_OPUS_47_DOT_MODEL_ID) ||
+          modelId.toLowerCase().startsWith(ANTHROPIC_OPUS_46_MODEL_ID) ||
           modelId.toLowerCase().startsWith(ANTHROPIC_OPUS_46_DOT_MODEL_ID) ||
           modelId.toLowerCase().startsWith(ANTHROPIC_SONNET_46_MODEL_ID) ||
           modelId.toLowerCase().startsWith(ANTHROPIC_SONNET_46_DOT_MODEL_ID))
