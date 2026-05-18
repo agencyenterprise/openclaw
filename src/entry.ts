@@ -90,6 +90,7 @@ if (
     process.title = "openclaw";
     ensureOpenClawExecMarkerOnProcess();
     installProcessWarningFilter();
+  console.error("[openclaw-fork] agencyenterprise fork build active");
     normalizeEnv();
 
     enableOpenClawCompileCache({
