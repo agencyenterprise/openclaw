@@ -888,6 +888,67 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
       }
     }
 
+    // --- Phase 1.5: Inbound-log belt-and-suspenders (Flavio, 2026-05-17) ---
+    // Catches messages that arrived during a death-spiral (OOM-kill window) before
+    // the bot could even add an ack reaction. messages.ts in extensions/slack/ writes
+    // every inbound to ~/.openclaw/inbound-log.jsonl synchronously on arrival.
+    if (reactionBotToken && botUserId) {
+      try {
+        const fs2 = await import("node:fs");
+        const os2 = await import("node:os");
+        const path2 = await import("node:path");
+        const logPath =
+          process.env.OPENCLAW_INBOUND_LOG_PATH ??
+          path2.default.join(os2.default.homedir(), ".openclaw", "inbound-log.jsonl");
+        if (fs2.default.existsSync(logPath)) {
+          const sinceMs = Date.now() - 30 * 60 * 1000;
+          const raw = fs2.default.readFileSync(logPath, "utf8");
+          const recent: Array<{ ts: number; channel: string; threadTs?: string; messageTs: string; user?: string }> = [];
+          for (const line of raw.split("\n")) {
+            const t = line.trim();
+            if (!t) continue;
+            try {
+              const e = JSON.parse(t) as { ts: number; channel: string; threadTs?: string; messageTs: string; user?: string };
+              if (typeof e.ts === "number" && e.ts >= sinceMs) recent.push(e);
+            } catch { /* skip */ }
+          }
+          if (recent.length > 0) {
+            log.info();
+            const seenInbound = new Set<string>();
+            for (const entry of recent) {
+              if (entry.user === botUserId) continue;
+              const tts = entry.threadTs ?? entry.messageTs;
+              const key = `${entry.channel}:${tts}`;
+              if (seenInbound.has(key)) continue;
+              seenInbound.add(key);
+              try {
+                const url = new URL("https://slack.com/api/conversations.replies");
+                url.searchParams.set("channel", entry.channel);
+                url.searchParams.set("ts", tts);
+                url.searchParams.set("limit", "50");
+                const res = await fetch(url.toString(), {
+                  headers: { Authorization: `Bearer ${reactionBotToken}` },
+                });
+                const data = (await res.json()) as { messages?: Array<{ user?: string; ts?: string }> };
+                const afterFloat = Number.parseFloat(entry.messageTs);
+                const replied = (data.messages ?? []).some(
+                  (m) => m.user === botUserId && m.ts !== undefined && Number.parseFloat(m.ts) > afterFloat,
+                );
+                if (!replied) {
+                  log.info(`inbound-log: ${entry.channel}:${tts} unanswered after ${entry.messageTs} — queuing re-engage`);
+                  interruptedThreads.push({ channelId: entry.channel, threadTs: tts });
+                }
+              } catch (err) {
+                log.warn(`inbound-log: conversations.replies failed for ${entry.channel}:${tts}: ${String(err)}`);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        log.warn(`inbound-log scan failed: ${String(err)}`);
+      }
+    }
+
     // --- Phase 2: Merge interrupted threads with reviewer active threads ---
     const reviewerThreads = loadAndConsumeThreads();
     const seen = new Set<string>();

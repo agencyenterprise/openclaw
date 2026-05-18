@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { SlackEventMiddlewareArgs } from "@slack/bolt";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { danger } from "openclaw/plugin-sdk/runtime-env";
@@ -9,6 +12,33 @@ import type { SlackMessageHandler } from "../message-handler.js";
 import type { SlackMessageChangedEvent } from "../types.js";
 import { resolveSlackMessageSubtypeHandler } from "./message-subtype-handlers.js";
 import { authorizeAndResolveSlackSystemEventContext } from "./system-event-context.js";
+
+// Inbound message log — belt-and-suspenders for restart recovery.
+// Sync-append (fs.appendFileSync) so messages survive even if the process is OOM-killed
+// before normal processing completes. The reviewer-recovery hook reads this on
+// gateway:startup to detect inbound messages that arrived but never got a bot reply.
+function appendInboundLog(entry: {
+  channel: string;
+  threadTs: string | undefined;
+  messageTs: string;
+  user: string | undefined;
+  textLen: number;
+  source: "message" | "app_mention";
+}): void {
+  try {
+    const target =
+      process.env.OPENCLAW_INBOUND_LOG_PATH ??
+      path.join(os.homedir(), ".openclaw", "inbound-log.jsonl");
+    const dir = path.dirname(target);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.appendFileSync(target, JSON.stringify({ ts: Date.now(), ...entry }) + "\n");
+  } catch {
+    // Logging must never block dispatch.
+  }
+}
+
 
 type SlackAssistantMessageRecord = {
   bot_id?: unknown;
@@ -193,6 +223,19 @@ export function registerSlackMessageEvents(params: {
   // the source.  Bolt rejects `app.event("message.channels")` since v4.6
   // because it is a subscription label, not a valid event type.
   ctx.app.event("message", async ({ event, body }: SlackEventMiddlewareArgs<"message">) => {
+    try {
+      const m = event as unknown as { channel?: string; thread_ts?: string; ts?: string; user?: string; text?: string };
+      if (m?.ts) {
+        appendInboundLog({
+          channel: m.channel ?? "",
+          threadTs: m.thread_ts ?? undefined,
+          messageTs: m.ts,
+          user: m.user,
+          textLen: (m.text ?? "").length,
+          source: "message",
+        });
+      }
+    } catch { /* logging must never block dispatch */ }
     await handleIncomingMessageEvent({ event, body });
   });
 
@@ -211,6 +254,18 @@ export function registerSlackMessageEvents(params: {
         return;
       }
 
+      try {
+        if (mention.ts) {
+          appendInboundLog({
+            channel: mention.channel ?? "",
+            threadTs: mention.thread_ts ?? undefined,
+            messageTs: mention.ts,
+            user: mention.user,
+            textLen: (mention.text ?? "").length,
+            source: "app_mention",
+          });
+        }
+      } catch { /* logging must never block dispatch */ }
       await handleSlackMessage(mention as unknown as SlackMessageEvent, {
         source: "app_mention",
         wasMentioned: true,
