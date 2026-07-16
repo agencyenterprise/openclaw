@@ -13,7 +13,6 @@ import {
   resolveEnvelopeFormatOptions,
   toInboundMediaFacts,
 } from "openclaw/plugin-sdk/channel-inbound";
-import { resolveChannelMessageSourceReplyDeliveryMode } from "openclaw/plugin-sdk/channel-message";
 import { hasControlCommand } from "openclaw/plugin-sdk/command-detection";
 import { shouldHandleTextCommands } from "openclaw/plugin-sdk/command-surface";
 import { ensureConfiguredBindingRouteReady } from "openclaw/plugin-sdk/conversation-runtime";
@@ -76,6 +75,11 @@ const SLACK_HISTORY_MEDIA_MAX_ATTACHMENTS = 4;
 const SLACK_HISTORY_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
 const SLACK_HISTORY_MEDIA_IDLE_TIMEOUT_MS = 1_000;
 const SLACK_HISTORY_MEDIA_TOTAL_TIMEOUT_MS = 3_000;
+
+function resolveSlackSyntheticDedupeMessageId(message: SlackMessageEvent): string | undefined {
+  const syntheticMessageId = message.openclaw_synthetic_message_id?.trim();
+  return syntheticMessageId && syntheticMessageId !== message.ts ? syntheticMessageId : undefined;
+}
 
 function resolveCachedMentionRegexes(
   ctx: SlackMonitorContext,
@@ -523,6 +527,11 @@ export async function prepareSlackMessage(params: {
       hasSubteamMention: mentionMetadata.hasSubteamMention,
       source: opts.source,
     });
+  const explicitlyMentionsOnlyOthers =
+    hasAnyMention &&
+    !explicitlyMentionedBotUser &&
+    !explicitlyMentionedBotSubteam &&
+    opts.source !== "app_mention";
   // Channels with `requireMention: false` and a non-`off` reply mode produce
   // a Slack-side thread on every top-level bot reply (because `replyToMode`
   // creates one). Seed thread routing for the root turn too, so the inbound
@@ -643,7 +652,8 @@ export async function prepareSlackMessage(params: {
     ctx.botUserId &&
     message.thread_ts &&
     !ctx.threadRequireExplicitMention &&
-    !wasMentioned
+    !wasMentioned &&
+    !explicitlyMentionsOnlyOthers
   ) {
     const replyToBotKinds = implicitMentionKindWhen(
       "reply_to_bot",
@@ -741,10 +751,19 @@ export async function prepareSlackMessage(params: {
     logVerbose(`Blocked unauthorized slack sender ${senderId} (not in channel users)`);
     return null;
   }
+  const isExplicitHumanAttributedBotMention =
+    isRoom &&
+    isBotMessage &&
+    typeof message.user === "string" &&
+    /^U[A-Z0-9]+$/.test(message.user) &&
+    message.user !== ctx.botUserId &&
+    (effectiveWasMentioned || opts.source === "app_mention" || shouldBypassMention);
+
   if (
     isRoom &&
     isBotMessage &&
     allowBotsMode !== "off" &&
+    !isExplicitHumanAttributedBotMention &&
     !(await authorizeSlackBotRoomMessage({
       ctx,
       channelId: message.channel,
@@ -877,9 +896,6 @@ export async function prepareSlackMessage(params: {
     accountId: account.accountId,
   });
   const ackReactionValue = ackReaction ?? "";
-  const sourceRepliesAreToolOnly =
-    resolveChannelMessageSourceReplyDeliveryMode({ cfg, ctx: { ChatType: chatType } }) ===
-    "message_tool_only";
   const statusReactionsExplicitlyEnabled = cfg.messages?.statusReactions?.enabled === true;
   const shouldAckReaction = () =>
     Boolean(
@@ -897,14 +913,9 @@ export async function prepareSlackMessage(params: {
     );
 
   const ackReactionMessageTs = message.ts;
-  const allowToolOnlyStatusReaction =
-    statusReactionsExplicitlyEnabled && (effectiveWasMentioned || shouldBypassMention);
-  const shouldSendAckReaction =
-    shouldAckReaction() && (!sourceRepliesAreToolOnly || allowToolOnlyStatusReaction);
+  const shouldSendAckReaction = shouldAckReaction();
   const statusReactionsWillHandle =
-    Boolean(ackReactionMessageTs) &&
-    cfg.messages?.statusReactions?.enabled !== false &&
-    shouldSendAckReaction;
+    Boolean(ackReactionMessageTs) && statusReactionsExplicitlyEnabled && shouldSendAckReaction;
   const ackReactionPromise =
     !statusReactionsWillHandle && shouldSendAckReaction && ackReactionMessageTs && ackReactionValue
       ? reactSlackMessage(message.channel, ackReactionMessageTs, ackReactionValue, {
@@ -1056,6 +1067,7 @@ export async function prepareSlackMessage(params: {
         })
       : dmHistoryContext.inboundHistory;
   const commandBody = textForCommandDetection.trim();
+  const dedupeMessageId = resolveSlackSyntheticDedupeMessageId(message);
 
   const ctxPayload = buildChannelTurnContext({
     channel: "slack",
@@ -1063,6 +1075,7 @@ export async function prepareSlackMessage(params: {
     surface: "slack",
     accountId: route.accountId,
     messageId: message.ts,
+    dedupeMessageId,
     timestamp: message.ts ? Math.round(Number(message.ts) * 1000) : undefined,
     from: slackFrom,
     sender: {
@@ -1132,6 +1145,7 @@ export async function prepareSlackMessage(params: {
       groupSystemPrompt,
     },
     extra: {
+      ReplaceMessageTs: message.openclaw_replace_message_ts?.trim() || undefined,
       GroupSubject: isRoomish ? roomLabel : undefined,
       UntrustedContext: untrustedChannelMetadata ? [untrustedChannelMetadata] : undefined,
       IsFirstThreadTurn:

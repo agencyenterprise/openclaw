@@ -258,6 +258,41 @@ Codex analysis...
       expect(finalEmoji).toBe(fallbackEmoji);
     });
   });
+
+  describe("defangJuddMention — never emit a live Judd ping (2026-06-18)", () => {
+    // Mirror of the handler's sanitizer; the handler exports defangJuddMention.
+    const JUDD_USER_ID = "U02AX1XQ1";
+    const defang = (text: string): string =>
+      !text ? text : text.replace(new RegExp(`<@${JUDD_USER_ID}(\\|[^>]*)?>`, "g"), "`@Judd`");
+
+    it("converts a bare live Judd mention into an inert reference", () => {
+      const out = defang("Judd exception violation: your last message ends with <@U02AX1XQ1>.");
+      expect(out.includes("<@U02AX1XQ1>")).toBe(false);
+      expect(out.includes("`@Judd`")).toBe(true);
+    });
+
+    it("converts a labeled Judd mention too", () => {
+      const out = defang("ping <@U02AX1XQ1|judd> here");
+      expect(out.includes("<@U02AX1XQ1")).toBe(false);
+    });
+
+    it("defangs every occurrence", () => {
+      const out = defang("<@U02AX1XQ1> and again <@U02AX1XQ1>");
+      expect(out.includes("<@U02AX1XQ1>")).toBe(false);
+      expect((out.match(/`@Judd`/g) ?? []).length).toBe(2);
+    });
+
+    it("leaves other users' mentions (e.g. Flavio) untouched", () => {
+      const out = defang("Judd \u2014 your call. <@U03EH553GBE>");
+      expect(out.includes("<@U03EH553GBE>")).toBe(true);
+      expect(out.includes("`@Judd`")).toBe(false);
+    });
+
+    it("leaves plain-text 'Judd' untouched", () => {
+      const out = defang("Judd is the thread owner.");
+      expect(out).toBe("Judd is the thread owner.");
+    });
+  });
 });
 
 /**

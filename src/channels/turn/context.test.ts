@@ -44,6 +44,7 @@ describe("buildChannelTurnContext", () => {
       provider: "test-provider",
       surface: "test-surface",
       messageId: "msg-1",
+      dedupeMessageId: "dedupe-msg-1",
       timestamp: 123,
       from: "test:user:u1",
       sender: {
@@ -145,6 +146,7 @@ describe("buildChannelTurnContext", () => {
       ParentSessionKey: "agent:main:test:group",
       ModelParentSessionKey: "agent:main:test:model",
       MessageSid: "msg-1",
+      DedupeMessageSid: "dedupe-msg-1",
       ReplyToId: "root-1",
       ReplyToBody: "quoted",
       ReplyToSender: "Quoted User",

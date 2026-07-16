@@ -130,6 +130,17 @@ describe("thread session suffix parsing", () => {
       threadId: "1699999999.0001",
     });
   });
+
+  it("recovers Slack root ts from reviewer synthetic thread suffixes", () => {
+    expect(
+      parseThreadSessionSuffix(
+        "agent:main:slack:channel:c0ahskbndb6:thread:reviewer:c0ahskbndb6:1779906121.390019:mpoev9dc:srpr12s0",
+      ),
+    ).toEqual({
+      baseSessionKey: "agent:main:slack:channel:c0ahskbndb6",
+      threadId: "1779906121.390019",
+    });
+  });
 });
 
 describe("session key canonicalization", () => {

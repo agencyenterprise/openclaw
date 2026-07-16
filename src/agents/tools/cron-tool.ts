@@ -497,7 +497,9 @@ export function createCronTool(opts?: CronToolOptions, deps?: CronToolDeps): Any
     name: "cron",
     ownerOnly: isOpenClawOwnerOnlyCoreToolName("cron"),
     displaySummary: CRON_TOOL_DISPLAY_SUMMARY,
-    description: `Manage Gateway cron jobs (status/list/get/add/update/remove/run/runs) and send wake events. Use this for reminders, "check back later" requests, delayed follow-ups, and recurring tasks. Do not emulate scheduling with exec sleep or process polling.
+    description: `Manage Gateway cron jobs (status/list/get/add/update/remove/run/runs) and send wake events. Use this for reminders, "check back later" requests, delayed follow-ups, and recurring tasks. Use this also for visible update monitors. Do not emulate scheduling with exec sleep or process polling.
+
+Visible update loops in Slack/channel threads count as recurring tasks: when a user asks for updates/continuous updates, or a long-running job needs periodic visible progress, create a recurring current-session monitor cron that posts to the source thread until completion. Private exec/process polling is not a substitute.
 
 Main-session cron jobs enqueue system events for heartbeat handling. Isolated cron jobs create background task runs that appear in \`openclaw tasks\`.
 
@@ -538,6 +540,10 @@ SCHEDULE TYPES (schedule.kind):
   { "kind": "at", "at": "<ISO-8601 timestamp>" }
 - "every": Recurring interval
   { "kind": "every", "everyMs": <interval-ms>, "anchorMs": <optional-start-ms> }
+
+EXPERIMENT MONITORING RULE:
+- For live experiment, RunPod/Spark, Codex-review, or "keep checking until done" monitoring, use schedule.kind="every" with sessionTarget="isolated" or "current" and an explicit thread-bound sessionKey. The payload must say when to remove/disable the current cron: RESULT_READY, RUN_FAILED, verified cleanup, or hard blocker.
+- Do NOT implement primary experiment monitoring as one-shot schedule.kind="at" jobs that say "if still running, schedule the next cron". One missed reschedule, restart, or routing failure silently stops monitoring. One-shot "at" jobs are fine for ordinary reminders, hardcaps, and backup checks.
 - "cron": Cron expression evaluated in the supplied timezone, or the Gateway host local timezone when tz is omitted
   { "kind": "cron", "expr": "<cron-expression>", "tz": "<optional-IANA-timezone>" }
   Write expr in the selected timezone's local wall-clock time; do not convert the requested local time to UTC first.

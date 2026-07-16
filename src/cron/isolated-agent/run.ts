@@ -368,6 +368,22 @@ async function resolveCronDeliveryContext(params: {
     };
   }
   if (deliveryPlan.mode === "none" && !hasExplicitCronDeliveryTarget(deliveryPlan)) {
+    const sessionKey = params.job.sessionKey?.trim();
+    if (sessionKey) {
+      const { resolveDeliveryTarget } = await loadCronDeliveryRuntime();
+      const resolvedDelivery = await resolveDeliveryTarget(params.cfg, params.agentId, {
+        channel: "last",
+        sessionKey,
+      });
+      return {
+        deliveryPlan,
+        deliveryRequested: false,
+        resolvedDelivery,
+        toolPolicy: resolveCronToolPolicy({
+          deliveryMode: deliveryPlan.mode,
+        }),
+      };
+    }
     return {
       deliveryPlan,
       deliveryRequested: false,

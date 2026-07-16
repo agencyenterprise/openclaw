@@ -974,6 +974,37 @@ describe("buildGatewayCronService", () => {
     }
   });
 
+  it("uses job sessionKey for isolated cron jobs when present", async () => {
+    const cfg = createCronConfig("server-cron-job-session-key");
+    loadConfigMock.mockReturnValue(cfg);
+
+    const state = buildGatewayCronService({
+      cfg,
+      deps: {} as CliDeps,
+      broadcast: () => {},
+    });
+    try {
+      const sessionKey = "agent:main:slack:channel:c0ahskbndb6:thread:1778892075.014669";
+      const job = await state.cron.add({
+        name: "thread-bound-isolated",
+        enabled: true,
+        schedule: { kind: "at", at: new Date(1).toISOString() },
+        sessionTarget: "isolated",
+        sessionKey,
+        wakeMode: "next-heartbeat",
+        payload: { kind: "agentTurn", message: "hello" },
+      });
+
+      await state.cron.run(job.id, "force");
+
+      const options = expectIsolatedRunFields({ sessionKey });
+      expect(requireRecord(options.job, "isolated job").id).toBe(job.id);
+      expectCleanupForSessionKeys([sessionKey]);
+    } finally {
+      state.cron.stop();
+    }
+  });
+
   it("uses a dedicated cron session key for isolated jobs with model overrides", async () => {
     const cfg = createCronConfig("server-cron-isolated-key");
     loadConfigMock.mockReturnValue(cfg);

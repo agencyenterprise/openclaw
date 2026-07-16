@@ -40,6 +40,52 @@ describe("sessions_yield tool", () => {
     expect(onYield).toHaveBeenCalledWith("Waiting for fact-checker");
   });
 
+  it("requires a visible source reply before yielding in message-tool-only turns", async () => {
+    const onYield = vi.fn();
+    const hasRepliedRef = { value: false };
+    const tool = createSessionsYieldTool({
+      sessionId: "test-session",
+      onYield,
+      sourceReplyDeliveryMode: "message_tool_only",
+      hasRepliedRef,
+    });
+    const blocked = await tool.execute("call-1", { message: "Waiting for steelman" });
+    expect((blocked.details as SessionsYieldDetails).status).toBe("error");
+    expect((blocked.details as SessionsYieldDetails).error).toContain("Visible status required");
+    expect(onYield).not.toHaveBeenCalled();
+
+    hasRepliedRef.value = true;
+    const yielded = await tool.execute("call-2", { message: "Waiting for steelman" });
+    expect((yielded.details as SessionsYieldDetails).status).toBe("yielded");
+    expect(onYield).toHaveBeenCalledWith("Waiting for steelman");
+  });
+
+  it("allows an explicitly silent yield without a prior visible source reply", async () => {
+    const onYield = vi.fn();
+    const tool = createSessionsYieldTool({
+      sessionId: "test-session",
+      onYield,
+      sourceReplyDeliveryMode: "message_tool_only",
+      hasRepliedRef: { value: false },
+    });
+
+    const blocked = await tool.execute("call-1", {
+      message: "Waiting privately for editor",
+      silent: false,
+    });
+    expect((blocked.details as SessionsYieldDetails).status).toBe("error");
+    expect(onYield).not.toHaveBeenCalled();
+
+    const yielded = await tool.execute("call-2", {
+      message: "Waiting privately for editor",
+      silent: true,
+    });
+    expect((yielded.details as SessionsYieldDetails).status).toBe("yielded");
+    expect((yielded.details as SessionsYieldDetails).message).toBe("Waiting privately for editor");
+    expect(onYield).toHaveBeenCalledOnce();
+    expect(onYield).toHaveBeenCalledWith("Waiting privately for editor");
+  });
+
   it("returns error without onYield callback", async () => {
     const tool = createSessionsYieldTool({ sessionId: "test-session" });
     const result = await tool.execute("call-1", {});

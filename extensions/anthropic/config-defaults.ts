@@ -98,7 +98,7 @@ function resolveAnthropicPrimaryModelRef(raw?: string): string | null {
   }
   const aliasKey = normalizeLowercaseStringOrEmpty(trimmed);
   if (aliasKey === "opus") {
-    return "anthropic/claude-opus-4-7";
+    return "anthropic/claude-opus-4-8";
   }
   if (aliasKey === "sonnet") {
     return "anthropic/claude-sonnet-4-6";

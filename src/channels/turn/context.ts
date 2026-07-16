@@ -28,6 +28,7 @@ export type BuildChannelTurnContextParams = {
   surface?: string;
   messageId?: string;
   messageIdFull?: string;
+  dedupeMessageId?: string;
   timestamp?: number;
   from: string;
   sender: SenderFacts;
@@ -178,6 +179,7 @@ export function buildChannelTurnContext(
     ModelParentSessionKey: params.route.modelParentSessionKey,
     MessageSid: params.messageId,
     MessageSidFull: params.messageIdFull,
+    DedupeMessageSid: params.dedupeMessageId,
     ReplyToId: params.reply.replyToId ?? supplemental?.quote?.id,
     ReplyToIdFull: params.reply.replyToIdFull ?? supplemental?.quote?.fullId,
     ReplyToBody: supplemental?.quote?.body,

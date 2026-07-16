@@ -474,6 +474,27 @@ describe("slackPlugin status", () => {
     });
   });
 
+  it("recovers canonical Slack thread routing from reviewer synthetic session keys", async () => {
+    const resolveRoute = slackPlugin.messaging?.resolveOutboundSessionRoute;
+    if (!resolveRoute) {
+      throw new Error("slack messaging.resolveOutboundSessionRoute unavailable");
+    }
+
+    const route = await resolveRoute({
+      cfg: {} as OpenClawConfig,
+      agentId: "main",
+      target: "channel:C0AHSKBNDB6",
+      currentSessionKey:
+        "agent:main:slack:channel:c0ahskbndb6:thread:reviewer:c0ahskbndb6:1779906121.390019:mpoev9dc:srpr12s0",
+    });
+
+    expectRecordFields(route, "Slack route", {
+      sessionKey: "agent:main:slack:channel:c0ahskbndb6:thread:1779906121.390019",
+      baseSessionKey: "agent:main:slack:channel:c0ahskbndb6",
+      threadId: "1779906121.390019",
+    });
+  });
+
   it("canonicalizes bare Slack IM channel targets to direct user session routes", async () => {
     const resolveRoute = slackPlugin.messaging?.resolveOutboundSessionRoute;
     if (!resolveRoute) {

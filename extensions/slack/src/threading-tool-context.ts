@@ -20,7 +20,12 @@ export function buildSlackThreadingToolContext(params: {
   const configuredReplyToMode = resolveSlackReplyToMode(account, params.context.ChatType);
   const hasExplicitThreadTarget = params.context.MessageThreadId != null;
   const effectiveReplyToMode = hasExplicitThreadTarget ? "all" : configuredReplyToMode;
-  const threadId = params.context.MessageThreadId ?? params.context.ReplyToId;
+  const messageThreadId = normalizeSlackThreadTsCandidate(params.context.MessageThreadId);
+  const replyToId = normalizeSlackThreadTsCandidate(params.context.ReplyToId);
+  const threadId =
+    messageThreadId && replyToId && messageThreadId !== replyToId
+      ? replyToId
+      : (messageThreadId ?? replyToId);
   // For channel messages, To is "channel:C…" — extract the bare ID.
   // For DMs, To is "user:U…" which can't be used for reactions; fall back
   // to NativeChannelId (the raw Slack channel id, e.g. "D…").
@@ -29,7 +34,7 @@ export function buildSlackThreadingToolContext(params: {
     : normalizeOptionalString(params.context.NativeChannelId);
   return {
     currentChannelId,
-    currentThreadTs: normalizeSlackThreadTsCandidate(threadId),
+    currentThreadTs: threadId,
     replyToMode: effectiveReplyToMode,
     hasRepliedRef: params.hasRepliedRef,
   };

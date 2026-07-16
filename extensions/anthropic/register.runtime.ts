@@ -44,9 +44,9 @@ import { buildAnthropicReplayPolicy } from "./replay-policy.js";
 import { wrapAnthropicProviderStream } from "./stream-wrappers.js";
 
 const PROVIDER_ID = "anthropic";
-const DEFAULT_ANTHROPIC_MODEL = "anthropic/claude-opus-4-7";
-const ANTHROPIC_OPUS_47_MODEL_ID = "claude-opus-4-7";
-const ANTHROPIC_OPUS_47_DOT_MODEL_ID = "claude-opus-4.7";
+const DEFAULT_ANTHROPIC_MODEL = "anthropic/claude-opus-4-8";
+const ANTHROPIC_OPUS_47_MODEL_ID = "claude-opus-4-8";
+const ANTHROPIC_OPUS_47_DOT_MODEL_ID = "claude-opus-4.8";
 const ANTHROPIC_OPUS_47_CONTEXT_TOKENS = 1_048_576;
 const ANTHROPIC_OPUS_46_MODEL_ID = "claude-opus-4-6";
 const ANTHROPIC_OPUS_46_DOT_MODEL_ID = "claude-opus-4.6";
@@ -61,7 +61,7 @@ const ANTHROPIC_SONNET_46_MODEL_ID = "claude-sonnet-4-6";
 const ANTHROPIC_SONNET_46_DOT_MODEL_ID = "claude-sonnet-4.6";
 const ANTHROPIC_SONNET_TEMPLATE_MODEL_IDS = ["claude-sonnet-4-5", "claude-sonnet-4.5"] as const;
 const ANTHROPIC_MODERN_MODEL_PREFIXES = [
-  "claude-opus-4-7",
+  "claude-opus-4-8",
   "claude-opus-4-6",
   "claude-sonnet-4-6",
   "claude-opus-4-5",

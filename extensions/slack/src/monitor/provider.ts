@@ -386,11 +386,12 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     registerReviewerDispatch(async (params) => {
       try {
         const syntheticMessage = buildReviewerSyntheticMessage(params, ctx.botUserId);
-        await handleSlackMessage(syntheticMessage, {
+        return await handleSlackMessage(syntheticMessage, {
           source: "message",
           wasMentioned: true,
+          bypassSeen: true,
+          bypassDebounce: true,
         });
-        return true;
       } catch (err) {
         console.error(`[reviewer-dispatch] failed: ${String(err)}`);
         return false;

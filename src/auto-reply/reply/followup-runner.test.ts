@@ -1509,6 +1509,32 @@ describe("createFollowupRunner messaging delivery and dedupe", () => {
     expect(onBlockReply).not.toHaveBeenCalled();
   });
 
+  it("forces Slack room followups through the message tool and canonical session thread", async () => {
+    const queued = baseQueuedRun("slack");
+    const { onBlockReply } = await runMessagingCase({
+      agentResult: { payloads: [{ text: "hello world!" }] },
+      queued: {
+        ...queued,
+        originatingChannel: "slack",
+        originatingTo: "channel:C0AHSKBNDB6",
+        originatingThreadId: "999.000",
+        run: {
+          ...queued.run,
+          sessionKey: "agent:main:slack:channel:c0ahskbndb6:thread:111.222",
+          sourceReplyDeliveryMode: undefined,
+        },
+      } as FollowupRun,
+    });
+
+    const runArg = requireMockCallArg(runEmbeddedPiAgentMock, 0);
+    expect(runArg.sourceReplyDeliveryMode).toBe("message_tool_only");
+    expect(runArg.forceMessageTool).toBe(true);
+    expect(runArg.messageThreadId).toBe("111.222");
+    expect(runArg.currentThreadTs).toBe("111.222");
+    expect(routeReplyMock).not.toHaveBeenCalled();
+    expect(onBlockReply).not.toHaveBeenCalled();
+  });
+
   it("lets provider followup route hooks force dispatcher delivery", async () => {
     resolveProviderFollowupFallbackRouteMock.mockReturnValue({
       route: "dispatcher",

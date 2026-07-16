@@ -444,6 +444,48 @@ describe("slack prepareSlackMessage inbound contract", () => {
     expect(await prepared.ackReactionPromise).toBe(true);
   });
 
+  it("still sends ack reactions when message-tool-only replies disable status reactions", async () => {
+    const reactionsAdd = vi.fn(async () => ({}));
+    const slackCtx = createInboundSlackCtx({
+      appClient: { reactions: { add: reactionsAdd } } as unknown as App["client"],
+      cfg: {
+        messages: {
+          ackReaction: "eyes",
+          ackReactionScope: "all",
+          groupChat: { visibleReplies: "message_tool" },
+          statusReactions: { enabled: false },
+        },
+        channels: {
+          slack: {
+            enabled: true,
+            groupPolicy: "open",
+            replyToMode: "all",
+          },
+        },
+      } as OpenClawConfig,
+      replyToMode: "all",
+    });
+    slackCtx.resolveUserName = async () => ({ name: "Alice" }) as any;
+    slackCtx.resolveChannelName = async () => ({ name: "general", type: "channel" });
+
+    const prepared = await prepareMessageWith(slackCtx, defaultAccount, {
+      channel: "C123",
+      channel_type: "channel",
+      user: "U1",
+      text: "<@B1> hi",
+      ts: "1.000",
+    } as SlackMessageEvent);
+
+    assertPrepared(prepared);
+    expect(prepared.ackReactionPromise).toBeInstanceOf(Promise);
+    expect(await prepared.ackReactionPromise).toBe(true);
+    expect(reactionsAdd).toHaveBeenCalledWith({
+      channel: "C123",
+      timestamp: "1.000",
+      name: "eyes",
+    });
+  });
+
   it("includes forwarded shared attachment text in raw body", async () => {
     const prepared = await prepareWithDefaultCtx(
       createSlackMessage({
@@ -614,6 +656,38 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
     assertPrepared(prepared);
     expect(prepared.ctxPayload.RawBody).toContain("Readiness probe failed");
     expect(members).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows human-attributed bot app mentions without explicit owner presence", async () => {
+    const members = vi.fn();
+    const slackCtx = createInboundSlackCtx({
+      cfg: {
+        channels: {
+          slack: { enabled: true },
+        },
+      } as OpenClawConfig,
+      appClient: { conversations: { members } } as unknown as App["client"],
+      defaultRequireMention: true,
+    });
+    slackCtx.resolveUserName = async () => ({ name: "Judd" }) as any;
+
+    const prepared = await prepareSlackMessage({
+      ctx: slackCtx,
+      account: createSlackAccount({ allowBots: true }),
+      message: createSlackMessage({
+        channel: "C123",
+        channel_type: "channel",
+        user: "U02AX1XQ1",
+        bot_id: "B07SPAXNU5U",
+        text: "<@B1> <https://github.com/aaronjmars/aeon>",
+        ts: "1779252500.236419",
+      }),
+      opts: { source: "app_mention", wasMentioned: true },
+    });
+
+    assertPrepared(prepared);
+    expect(prepared.ctxPayload.RawBody).toContain("github.com/aaronjmars/aeon");
+    expect(members).not.toHaveBeenCalled();
   });
 
   it("allows bot-authored room messages when the bot is explicitly channel-allowlisted (#59284)", async () => {
@@ -1770,7 +1844,7 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
     expect(new Set([root.ctxPayload.SessionKey, followUp.ctxPayload.SessionKey]).size).toBe(1);
   });
 
-  it("preserves explicit Slack mention targets when an implicit thread wake mentions someone else", async () => {
+  it("drops implicit thread wakes that explicitly mention someone else", async () => {
     const { storePath } = storeFixture.makeTmpStorePath();
     const slackCtx = createInboundSlackCtx({
       cfg: {
@@ -1799,14 +1873,44 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
       opts: { source: "message" },
     });
 
+    expect(prepared).toBeNull();
+  });
+
+  it("allows explicit bot mentions even when another user is also mentioned", async () => {
+    const { storePath } = storeFixture.makeTmpStorePath();
+    const slackCtx = createInboundSlackCtx({
+      cfg: {
+        session: { store: storePath },
+        channels: { slack: { enabled: true, replyToMode: "all", groupPolicy: "open" } },
+      } as OpenClawConfig,
+      defaultRequireMention: true,
+      replyToMode: "all",
+    });
+    slackCtx.resolveChannelName = async () => ({ name: "proj-openclaw", type: "channel" });
+    slackCtx.resolveUserName = async () => ({ name: "Bek" });
+
+    const prepared = await prepareSlackMessage({
+      ctx: slackCtx,
+      account: createSlackAccount({ replyToMode: "all" }),
+      message: {
+        type: "message",
+        channel: "C0AHZFCAS1K",
+        channel_type: "channel",
+        user: "U_BEK",
+        text: "<@B1> <@UOTHER> can you check this?",
+        ts: "1777244714.000101",
+        thread_ts: "1777244692.409919",
+        parent_user_id: "B1",
+      } as SlackMessageEvent,
+      opts: { source: "message" },
+    });
+
     if (!prepared) {
       throw new Error("expected prepared Slack message");
     }
     expect(prepared.ctxPayload.WasMentioned).toBe(true);
-    expect(prepared.ctxPayload.ExplicitlyMentionedBot).toBe(false);
-    expect(prepared.ctxPayload.MentionedUserIds).toEqual(["UOTHER"]);
-    expect(prepared.ctxPayload.ImplicitMentionKinds).toEqual(["reply_to_bot"]);
-    expect(prepared.ctxPayload.MentionSource).toBe("implicit_thread");
+    expect(prepared.ctxPayload.ExplicitlyMentionedBot).toBe(true);
+    expect(prepared.ctxPayload.MentionedUserIds).toEqual(["B1", "UOTHER"]);
   });
 
   it("marks authorized implicit thread control-command wakes as command bypass source", async () => {
@@ -2308,6 +2412,63 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
     expect(prepared.ctxPayload.MessageThreadId).toBe(rootTs);
     expect(prepared.ctxPayload.ReplyToId).toBe(rootTs);
     expect(prepared.ctxPayload.MessageSid).toBe(childTs);
+    expect(prepared.ctxPayload.WasMentioned).toBe(true);
+  });
+
+  it("uses synthetic reviewer ids for inbound dedupe while preserving Slack thread routing", async () => {
+    const { storePath } = storeFixture.makeTmpStorePath();
+    const rootTs = "1779898076.795559";
+    const syntheticMessageId = `reviewer:C0AHSKBNDB6:${rootTs}:test`;
+    const replaceMessageTs = "1779898090.123456";
+    const replies = vi.fn().mockResolvedValue({
+      messages: [
+        {
+          text: "Original Slack thread root",
+          user: "U_ROOT",
+          ts: rootTs,
+        },
+      ],
+      response_metadata: { next_cursor: "" },
+    });
+    const slackCtx = createInboundSlackCtx({
+      cfg: {
+        session: { store: storePath },
+        channels: { slack: { enabled: true, replyToMode: "all", groupPolicy: "open" } },
+      } as OpenClawConfig,
+      appClient: { conversations: { replies } } as unknown as App["client"],
+      defaultRequireMention: true,
+      replyToMode: "all",
+    });
+    slackCtx.resolveChannelName = async () => ({ name: "proj-openclaw", type: "group" });
+    slackCtx.resolveUserName = async () => ({ name: "Reviewer" });
+
+    const prepared = await prepareSlackMessage({
+      ctx: slackCtx,
+      account: createSlackAccount({ replyToMode: "all" }),
+      message: {
+        type: "message",
+        channel: "C0AHSKBNDB6",
+        channel_type: "group",
+        user: "U_BOT",
+        text: "Reviewer feedback.",
+        ts: rootTs,
+        event_ts: rootTs,
+        thread_ts: rootTs,
+        parent_user_id: "U_BOT",
+        openclaw_synthetic_message_id: syntheticMessageId,
+        openclaw_replace_message_ts: replaceMessageTs,
+      } as SlackMessageEvent,
+      opts: { source: "message", wasMentioned: true },
+    });
+
+    assertPrepared(prepared);
+    expect(prepared.ctxPayload.SessionKey).toContain(rootTs);
+    expect(prepared.ctxPayload.SessionKey).not.toContain("reviewer:");
+    expect(prepared.ctxPayload.MessageThreadId).toBe(rootTs);
+    expect(prepared.ctxPayload.ReplyToId).toBe(rootTs);
+    expect(prepared.ctxPayload.MessageSid).toBe(rootTs);
+    expect(prepared.ctxPayload.DedupeMessageSid).toBe(syntheticMessageId);
+    expect(prepared.ctxPayload.ReplaceMessageTs).toBe(replaceMessageTs);
     expect(prepared.ctxPayload.WasMentioned).toBe(true);
   });
 

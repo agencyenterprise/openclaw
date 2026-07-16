@@ -96,7 +96,7 @@
     "anthropic": {
       "capabilities": ["image"],
       "defaultModels": {
-        "image": "claude-opus-4-7"
+        "image": "claude-opus-4-8"
       },
       "autoPriority": {
         "image": 20

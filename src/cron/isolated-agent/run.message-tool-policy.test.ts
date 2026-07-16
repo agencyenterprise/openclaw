@@ -374,6 +374,54 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
     expect(embeddedRun.messageTo).toBeUndefined();
   });
 
+  it('uses the stored session route as message-tool context for delivery.mode "none"', async () => {
+    mockRunCronFallbackPassthrough();
+    resolveCronDeliveryPlanMock.mockReturnValue({
+      requested: false,
+      mode: "none",
+    });
+    resolveDeliveryTargetMock.mockResolvedValue({
+      ok: true,
+      channel: "slack",
+      to: "channel:C0AHSKBNDB6",
+      threadId: "1780004949.036469",
+      accountId: undefined,
+      mode: "implicit",
+    });
+    const sessionKey = "agent:main:slack:channel:c0ahskbndb6:thread:1780004949.036469";
+
+    await runCronIsolatedAgentTurn({
+      ...makeParams(),
+      job: {
+        ...makeMessageToolPolicyJob({ mode: "none" }),
+        sessionKey,
+      } as never,
+    });
+
+    expect(resolveDeliveryTargetMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agents: expect.any(Object),
+      }),
+      "default",
+      {
+        channel: "last",
+        sessionKey,
+      },
+    );
+    expect(runEmbeddedPiAgentMock).toHaveBeenCalledTimes(1);
+    expectEmbeddedRunFields({
+      disableMessageTool: false,
+      forceMessageTool: true,
+      messageChannel: "slack",
+      messageTo: "channel:C0AHSKBNDB6",
+      messageThreadId: "1780004949.036469",
+      currentChannelId: "channel:C0AHSKBNDB6",
+    });
+    expectDispatchFields({
+      deliveryRequested: false,
+    });
+  });
+
   it('suppresses automatic exec completion notifications when delivery.mode is "none"', async () => {
     mockRunCronFallbackPassthrough();
     resolveCronDeliveryPlanMock.mockReturnValue({

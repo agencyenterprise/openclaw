@@ -23,6 +23,15 @@ describe("Slack thread_ts resolution", () => {
     ).toBe("1712345678.123456");
   });
 
+  it("prefers an explicit threadId over a valid replyToId", () => {
+    expect(
+      resolveSlackThreadTsValue({
+        replyToId: "1779813851.770000",
+        threadId: "1776866792.951289",
+      }),
+    ).toBe("1776866792.951289");
+  });
+
   it("validates fallback threadId before using it", () => {
     expect(
       resolveSlackThreadTsValue({

@@ -89,6 +89,10 @@ export type MsgContext = {
   MessageSid?: string;
   /** Provider-specific full message id when MessageSid is a shortened alias. */
   MessageSidFull?: string;
+  /** Optional internal dedupe id; does not replace the provider message id. */
+  DedupeMessageSid?: string;
+  /** Internal target for replacing an already-delivered source reply. */
+  ReplaceMessageTs?: string;
   MessageSids?: string[];
   MessageSidFirst?: string;
   MessageSidLast?: string;

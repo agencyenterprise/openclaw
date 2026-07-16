@@ -1281,6 +1281,7 @@ export async function runEmbeddedPiAgent(
             currentChannelId: params.currentChannelId,
             currentThreadTs: params.currentThreadTs,
             currentMessageId: params.currentMessageId,
+            currentReplaceMessageTs: params.currentReplaceMessageTs,
             replyToMode: params.replyToMode,
             hasRepliedRef: params.hasRepliedRef,
             sessionFile: activeSessionFile,

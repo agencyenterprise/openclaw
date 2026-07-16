@@ -797,6 +797,33 @@ export async function registerSlackMonitorSlashCommands(params: {
     }
   }
 
+  // Fractal Foundry: /foundry -> the main-agent portfolio status (direct call to Foundry API).
+  ctx.app.command("/foundry", async ({ ack, respond }: SlackCommandMiddlewareArgs) => {
+    await ack(
+      "\u{1F50E} Reading every experiment fresh from the board \u2014 status in ~30\u201360s\u2026",
+    );
+    try {
+      const res: any = await (globalThis as any).fetch("http://127.0.0.1:8788/api/status_report");
+      if (!res.ok) throw new Error(`Foundry HTTP ${res.status}`);
+      const data: any = await res.json();
+      const counts = data.counts
+        ? Object.entries(data.counts)
+            .sort((a: any, b: any) => b[1] - a[1])
+            .map(([k, v]: any) => `${v} ${k}`)
+            .join(" \u00B7 ")
+        : "";
+      const header = `*Foundry \u2014 portfolio status* \u00B7 ${data.n ?? "?"} experiments${counts ? " \u00B7 " + counts : ""}`;
+      let report = String(data.report ?? "(no report)").trim();
+      if (report.length > 3600) report = report.slice(0, 3600) + "\u2026";
+      await respond({ response_type: "ephemeral", text: `${header}\n\n${report}` });
+    } catch (err) {
+      await respond({
+        response_type: "ephemeral",
+        text: `\u26A0\uFE0F Couldn\u0027t reach Foundry: ${formatErrorMessage(err)}`,
+      });
+    }
+  });
+
   if (nativeCommands.length > 0) {
     if (!slashCommandsRuntime) {
       throw new Error("Missing commands runtime for native Slack commands.");

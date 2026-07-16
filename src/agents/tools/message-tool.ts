@@ -20,9 +20,14 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { GATEWAY_CLIENT_IDS, GATEWAY_CLIENT_MODES } from "../../gateway/protocol/client-info.js";
 import { getToolResult, runMessageAction } from "../../infra/outbound/message-action-runner.js";
 import { resolveAllowedMessageActions } from "../../infra/outbound/outbound-policy.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { stringifyRouteThreadId } from "../../plugin-sdk/channel-route.js";
 import { POLL_CREATION_PARAM_DEFS, SHARED_POLL_CREATION_PARAM_NAMES } from "../../poll-params.js";
 import { normalizeAccountId } from "../../routing/session-key.js";
+import {
+  parseRawSessionConversationRef,
+  parseThreadSessionSuffix,
+} from "../../sessions/session-key-utils.js";
 import { normalizeOptionalString } from "../../shared/string-coerce.js";
 import { stripReasoningTagsFromText } from "../../shared/text/reasoning-tags.js";
 import { normalizeMessageChannel } from "../../utils/message-channel.js";
@@ -34,6 +39,7 @@ import { jsonResult, readNumberParam, readStringParam } from "./common.js";
 import { resolveGatewayOptions } from "./gateway.js";
 
 const AllMessageActions = CHANNEL_MESSAGE_ACTION_NAMES;
+const log = createSubsystemLogger("tools/message");
 const MESSAGE_TOOL_THREAD_READ_HINT =
   ' Use action="read" with threadId to fetch prior messages in a thread when you need conversation context you do not have yet.';
 const EXPLICIT_TARGET_ACTIONS = new Set<ChannelMessageActionName>([
@@ -566,6 +572,7 @@ type MessageToolOptions = {
   currentThreadTs?: string;
   agentThreadId?: string | number;
   currentMessageId?: string | number;
+  currentReplaceMessageTs?: string;
   replyToMode?: "off" | "first" | "all" | "batched";
   hasRepliedRef?: { value: boolean };
   sandboxRoot?: string;
@@ -787,6 +794,60 @@ function appendMessageToolReadHint(
   return description;
 }
 
+function normalizeSlackChannelIdCandidate(value: unknown): string | undefined {
+  const normalized = normalizeOptionalString(value);
+  if (!normalized) {
+    return undefined;
+  }
+  const channelMention = normalized.match(/^<#(C[A-Z0-9]+)(?:\|[^>]*)?>$/i)?.[1];
+  const stripped = (channelMention ?? normalized).replace(/^(?:slack:)?(?:channel:|#)/i, "");
+  return /^C[A-Z0-9]+$/i.test(stripped) ? stripped.toUpperCase() : undefined;
+}
+
+function resolveSlackSessionChannelId(sessionKey?: string): string | undefined {
+  const thread = parseThreadSessionSuffix(sessionKey);
+  const ref = parseRawSessionConversationRef(thread.baseSessionKey ?? sessionKey);
+  if (normalizeMessageChannel(ref?.channel) !== "slack") {
+    return undefined;
+  }
+  return normalizeSlackChannelIdCandidate(ref?.rawId);
+}
+
+function explicitMessageTarget(params: Record<string, unknown>): string | undefined {
+  return (
+    readStringParam(params, "target") ??
+    readStringParam(params, "to") ??
+    readStringParam(params, "channelId")
+  );
+}
+
+function isCurrentSlackSourceTarget(params: {
+  actionParams: Record<string, unknown>;
+  currentChannelId?: string;
+  sessionChannelId?: string;
+}): boolean {
+  const target = explicitMessageTarget(params.actionParams);
+  if (!target) {
+    return true;
+  }
+  const targetChannelId = normalizeSlackChannelIdCandidate(target);
+  if (!targetChannelId) {
+    return false;
+  }
+  const currentChannelId = normalizeSlackChannelIdCandidate(params.currentChannelId);
+  const sessionChannelId = normalizeSlackChannelIdCandidate(params.sessionChannelId);
+  return targetChannelId === currentChannelId || targetChannelId === sessionChannelId;
+}
+
+function suppressesSlackThreadBinding(params: Record<string, unknown>): boolean {
+  return (
+    params.topLevel === true ||
+    params.threadId === null ||
+    params.threadTs === null ||
+    params.replyTo === null
+  );
+}
+
 export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
   const loadConfigForTool = options?.getRuntimeConfig ?? getRuntimeConfig;
   const getScopedSecretTargetsForTool =
@@ -795,9 +856,26 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
     options?.resolveCommandSecretRefsViaGateway ?? resolveCommandSecretRefsViaGateway;
   const runMessageActionForTool = options?.runMessageAction ?? runMessageAction;
   const agentAccountId = resolveAgentAccountId(options?.agentAccountId);
-  const currentThreadTs =
-    options?.currentThreadTs ??
-    (options?.agentThreadId != null ? stringifyRouteThreadId(options.agentThreadId) : undefined);
+  const sessionConversationRef = options?.agentSessionKey
+    ? parseRawSessionConversationRef(options.agentSessionKey)
+    : undefined;
+  const sessionSlackChannelId = resolveSlackSessionChannelId(options?.agentSessionKey);
+  const sessionThreadTs = options?.agentSessionKey
+    ? parseThreadSessionSuffix(options.agentSessionKey).threadId
+    : undefined;
+  const sessionChannel = normalizeMessageChannel(sessionConversationRef?.channel);
+  const normalizedCurrentChannel =
+    normalizeMessageChannel(options?.currentChannelProvider) ?? sessionChannel;
+  const slackSessionThreadTs =
+    normalizedCurrentChannel === "slack" && sessionThreadTs ? sessionThreadTs : undefined;
+  const agentThreadTs = slackSessionThreadTs
+    ? slackSessionThreadTs
+    : options?.agentThreadId != null
+      ? stringifyRouteThreadId(options.agentThreadId)
+      : sessionThreadTs;
+  const currentThreadTs = slackSessionThreadTs
+    ? slackSessionThreadTs
+    : (options?.currentThreadTs ?? agentThreadTs);
   const replyToMode = options?.replyToMode ?? (currentThreadTs ? "all" : undefined);
   const resolvedAgentId =
     options?.agentId ??
@@ -863,7 +941,7 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
       }
       params.presentation = sanitizePresentationTextFields(params.presentation);
 
-      const action = readStringParam(params, "action", {
+      let action = readStringParam(params, "action", {
         required: true,
       }) as ChannelMessageActionName;
       const requireExplicitTarget = options?.requireExplicitTarget === true;
@@ -878,6 +956,25 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
           throw new Error(
             "Explicit message target required for this run. Provide target/targets (and channel when needed).",
           );
+        }
+      }
+
+      const replaceMessageTs = normalizeOptionalString(options?.currentReplaceMessageTs);
+      const shouldReplaceCurrentSlackMessage =
+        action === "send" &&
+        normalizedCurrentChannel === "slack" &&
+        Boolean(replaceMessageTs) &&
+        isCurrentSlackSourceTarget({
+          actionParams: params,
+          currentChannelId: options?.currentChannelId,
+          sessionChannelId: sessionSlackChannelId,
+        });
+      if (shouldReplaceCurrentSlackMessage && replaceMessageTs) {
+        action = "edit";
+        params.action = action;
+        params.messageId = replaceMessageTs;
+        if (!readStringParam(params, "channelId") && options?.currentChannelId) {
+          params.channelId = options.currentChannelId;
         }
       }
 
@@ -947,6 +1044,79 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
               skipCrossContextDecoration: true,
             }
           : undefined;
+      const requestedChannel = normalizeMessageChannel(readStringParam(params, "channel"));
+      const slackLikeSend =
+        requestedChannel === "slack" ||
+        normalizedCurrentChannel === "slack" ||
+        sessionChannel === "slack" ||
+        (typeof params.to === "string" && /^<?#?C[A-Z0-9]+>?$/i.test(params.to.trim())) ||
+        (typeof params.target === "string" && /^<?#?C[A-Z0-9]+>?$/i.test(params.target.trim()));
+      const explicitThreadId =
+        readStringParam(params, "threadId") ??
+        readStringParam(params, "threadTs") ??
+        readStringParam(params, "replyTo");
+      const shouldBindSlackSourceThread =
+        action === "send" &&
+        slackLikeSend &&
+        !explicitThreadId &&
+        !suppressesSlackThreadBinding(params) &&
+        currentThreadTs &&
+        isCurrentSlackSourceTarget({
+          actionParams: params,
+          currentChannelId: options?.currentChannelId,
+          sessionChannelId: sessionSlackChannelId,
+        });
+      if (shouldBindSlackSourceThread) {
+        params.threadId = currentThreadTs;
+      }
+      if (slackLikeSend) {
+        if (sessionThreadTs && currentThreadTs !== sessionThreadTs) {
+          log.warn("Slack message tool thread context was not clamped to session root", {
+            action,
+            sessionKey: options?.agentSessionKey,
+            sessionThreadTs,
+            currentThreadTs,
+            currentThreadTsOption: options?.currentThreadTs,
+            agentThreadId: options?.agentThreadId,
+            currentMessageId: options?.currentMessageId,
+            currentChannelId: options?.currentChannelId,
+            currentChannelProvider: options?.currentChannelProvider,
+            explicitThreadId,
+          });
+        }
+        if (!currentThreadTs && action === "send") {
+          log.warn("Slack message tool send has no thread context; top-level post is possible", {
+            action,
+            sessionKey: options?.agentSessionKey,
+            sessionThreadTs,
+            currentThreadTsOption: options?.currentThreadTs,
+            agentThreadId: options?.agentThreadId,
+            currentMessageId: options?.currentMessageId,
+            currentChannelId: options?.currentChannelId,
+            currentChannelProvider: options?.currentChannelProvider,
+            explicitThreadId,
+            paramsThreadId: params.threadId,
+            paramsThreadTs: params.threadTs,
+            paramsReplyTo: params.replyTo,
+            paramsTopLevel: params.topLevel,
+          });
+        } else if (
+          sessionThreadTs &&
+          explicitThreadId &&
+          explicitThreadId !== sessionThreadTs &&
+          params.topLevel !== true
+        ) {
+          log.warn("Slack message tool send has explicit thread differing from session root", {
+            action,
+            sessionKey: options?.agentSessionKey,
+            sessionThreadTs,
+            currentThreadTs,
+            explicitThreadId,
+            currentMessageId: options?.currentMessageId,
+            currentChannelId: options?.currentChannelId,
+          });
+        }
+      }
 
       const result = await runMessageActionForTool({
         cfg,
@@ -965,6 +1135,19 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         inboundTurnKind: options?.inboundTurnKind,
         abortSignal: signal,
       });
+
+      if (
+        (action === "send" || shouldReplaceCurrentSlackMessage) &&
+        options?.sourceReplyDeliveryMode === "message_tool_only" &&
+        options.hasRepliedRef &&
+        isCurrentSlackSourceTarget({
+          actionParams: params,
+          currentChannelId: options?.currentChannelId,
+          sessionChannelId: sessionSlackChannelId,
+        })
+      ) {
+        options.hasRepliedRef.value = true;
+      }
 
       const toolResult = getToolResult(result);
       if (toolResult) {

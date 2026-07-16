@@ -642,10 +642,10 @@ describe("tool descriptions", () => {
       "Use write/send-keys/submit/paste/kill for input or intervention.",
     );
     expect(execWithCron.description).toContain(
-      "Do not use exec sleep or delay loops for reminders or deferred follow-ups; use cron instead.",
+      "Do not use exec sleep or delay loops for reminders, deferred follow-ups, or visible update cadence; use cron instead.",
     );
     expect(processWithCron.description).toContain(
-      "Do not use process polling to emulate timers or reminders; use cron for scheduled follow-ups.",
+      "Do not use process polling to emulate timers, reminders, or visible update cadence; use cron for scheduled follow-ups and recurring update monitors.",
     );
     expect(execTool.description).not.toContain("use cron instead");
     expect(processTool.description).not.toContain("scheduled follow-ups");

@@ -382,6 +382,8 @@ export function createOpenClawCodingTools(options?: {
   currentThreadTs?: string;
   /** Current inbound message id for action fallbacks (e.g. Telegram react). */
   currentMessageId?: string | number;
+  /** Existing source message to replace instead of creating another reply. */
+  currentReplaceMessageTs?: string;
   /** Group id for channel-level tool policy resolution. */
   groupId?: string | null;
   /** Group channel label (e.g. #general) for channel-level tool policy resolution. */
@@ -903,6 +905,7 @@ export function createOpenClawCodingTools(options?: {
           currentChannelId: options?.currentChannelId,
           currentThreadTs: options?.currentThreadTs,
           currentMessageId: options?.currentMessageId,
+          currentReplaceMessageTs: options?.currentReplaceMessageTs,
           modelProvider: options?.modelProvider,
           modelId: options?.modelId,
           replyToMode: options?.replyToMode,

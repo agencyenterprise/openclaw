@@ -437,6 +437,8 @@ describe("cron tool", () => {
     expect(tool.description).toContain(
       'Use this for reminders, "check back later" requests, delayed follow-ups, and recurring tasks.',
     );
+    expect(tool.description).toContain("Use this also for visible update monitors.");
+    expect(tool.description).toContain("when a user asks for updates/continuous updates");
     expect(tool.description).toContain(
       "Do not emulate scheduling with exec sleep or process polling.",
     );

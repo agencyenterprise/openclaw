@@ -15,28 +15,42 @@ export type ReviewerDispatchFn = (params: {
   channelId: string;
   threadTs: string;
   text: string;
+  syntheticMessageId?: string;
+  replaceMessageTs?: string;
 }) => Promise<boolean>;
 
 const REVIEWER_DISPATCH_KEY = Symbol.for("openclaw.reviewerDispatch");
+
+function createReviewerSyntheticMessageId(params: { channelId: string; threadTs: string }): string {
+  const now = Date.now().toString(36);
+  const entropy = Math.random().toString(36).slice(2, 10);
+  return `reviewer:${params.channelId}:${params.threadTs}:${now}:${entropy}`;
+}
 
 /**
  * Build the synthetic Slack message used for reviewer/startup continuations.
  *
  * The synthetic event must use the real Slack thread timestamp as its message
- * timestamp. Earlier code used a non-Slack id (`reviewer-${Date.now()}`); if
- * the dispatch path later fell back to the event ts as the reply thread, Slack
- * rejected the bot response with `invalid_thread_ts` and the continuation died.
+ * timestamp. Reviewer continuations are not real Slack messages; if they use a
+ * made-up message ts, downstream routing can accidentally treat that synthetic
+ * ts as the session thread root and send the agent's correction top-level.
  *
  * Keep `parent_user_id` populated too. The Slack router intentionally treats
  * `thread_ts === ts` without `parent_user_id` as a top-level message, which
  * would put reviewer continuations into the channel-level session and let them
  * inherit unrelated thread state.
+ *
+ * The event also carries an OpenClaw-only synthetic message id. Slack routing
+ * needs the real thread ts above, but inbound dedupe must see this as a fresh
+ * reviewer turn rather than the original thread-root message.
  */
 export function buildReviewerSyntheticMessage(
   params: {
     channelId: string;
     threadTs: string;
     text: string;
+    syntheticMessageId?: string;
+    replaceMessageTs?: string;
   },
   botUserId?: string,
 ): SlackMessageEvent {
@@ -50,6 +64,9 @@ export function buildReviewerSyntheticMessage(
     text: params.text,
     type: "message",
     channel_type: "group",
+    openclaw_synthetic_message_id:
+      params.syntheticMessageId ?? createReviewerSyntheticMessageId(params),
+    openclaw_replace_message_ts: params.replaceMessageTs,
   };
 }
 
@@ -63,6 +80,8 @@ export function dispatchReviewerFeedback(params: {
   channelId: string;
   threadTs: string;
   text: string;
+  syntheticMessageId?: string;
+  replaceMessageTs?: string;
 }): Promise<boolean> {
   const fn = (globalThis as Record<symbol, ReviewerDispatchFn | undefined>)[REVIEWER_DISPATCH_KEY];
   if (!fn) {

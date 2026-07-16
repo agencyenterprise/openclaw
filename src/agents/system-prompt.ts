@@ -1017,6 +1017,7 @@ export function buildAgentSystemPrompt(params: {
           ].join("\n"),
       "TOOLS.md is usage guidance, not availability.",
       `For long waits, avoid rapid poll loops: use ${execToolName} with enough yieldMs or ${processToolName}(action=poll, timeout=<ms>).`,
+      'For user-visible update cadence in channel threads (for example, "updates?", "keep me updated", or long GPU jobs), create a current-session recurring cron monitor; exec/process polling is private and is not enough.',
       "Larger work: use `sessions_spawn`; completion is push-based.",
       '`sessions_spawn`: omit `context` unless transcript needed; then set `context:"fork"`.',
       ...nativeCommandGuidanceLines,

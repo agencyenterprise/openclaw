@@ -188,7 +188,7 @@ export function buildAnthropicCliMigrationResult(
     defaults?.models ??
     {}) as NonNullable<AgentDefaultsModels>;
   const nextModels = seedClaudeCliAllowlist(existingModels);
-  const defaultModel = rewrittenModel.primary ?? "anthropic/claude-opus-4-7";
+  const defaultModel = rewrittenModel.primary ?? "anthropic/claude-opus-4-8";
 
   return {
     profiles: buildClaudeCliAuthProfiles(credential),

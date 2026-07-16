@@ -15,6 +15,10 @@ import { logVerbose } from "../../globals.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { defaultRuntime } from "../../runtime.js";
+import {
+  parseRawSessionConversationRef,
+  parseThreadSessionSuffix,
+} from "../../sessions/session-key-utils.js";
 import { isInternalMessageChannel } from "../../utils/message-channel.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { runPreflightCompactionIfNeeded } from "./agent-runner-memory.js";
@@ -39,6 +43,11 @@ import { createTypingSignaler } from "./typing-mode.js";
 import type { TypingController } from "./typing.js";
 
 type EmbeddedAgentRunResult = Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
+
+function isSlackRoomSessionKey(sessionKey: string | undefined): boolean {
+  const ref = parseRawSessionConversationRef(sessionKey);
+  return ref?.channel === "slack" && (ref.kind === "channel" || ref.kind === "group");
+}
 
 export function createFollowupRunner(params: {
   opts?: GetReplyOptions;
@@ -222,10 +231,35 @@ export function createFollowupRunner(params: {
       });
       const replySessionKey = queued.run.sessionKey ?? sessionKey;
       const runtimeConfig = resolveQueuedReplyRuntimeConfig(queued.run.config);
-      const effectiveQueued =
+      let effectiveQueued =
         runtimeConfig === queued.run.config
           ? queued
           : { ...queued, run: { ...queued.run, config: runtimeConfig } };
+      const routingSessionKey = effectiveQueued.run.sessionKey ?? replySessionKey;
+      const sessionThreadId = parseThreadSessionSuffix(routingSessionKey).threadId;
+      const slackRoomFollowupRequiresMessageTool = isSlackRoomSessionKey(routingSessionKey);
+      const effectiveOriginatingThreadId =
+        slackRoomFollowupRequiresMessageTool && sessionThreadId
+          ? sessionThreadId
+          : (effectiveQueued.originatingThreadId ?? sessionThreadId);
+      const effectiveSourceReplyDeliveryMode = slackRoomFollowupRequiresMessageTool
+        ? "message_tool_only"
+        : effectiveQueued.run.sourceReplyDeliveryMode;
+      if (
+        effectiveOriginatingThreadId !== effectiveQueued.originatingThreadId ||
+        effectiveSourceReplyDeliveryMode !== effectiveQueued.run.sourceReplyDeliveryMode
+      ) {
+        effectiveQueued = {
+          ...effectiveQueued,
+          ...(effectiveOriginatingThreadId != null
+            ? { originatingThreadId: effectiveOriginatingThreadId }
+            : {}),
+          run: {
+            ...effectiveQueued.run,
+            sourceReplyDeliveryMode: effectiveSourceReplyDeliveryMode,
+          },
+        };
+      }
       const run = effectiveQueued.run;
       replyOperation = createReplyOperation({
         sessionId: run.sessionId,
@@ -236,7 +270,7 @@ export function createFollowupRunner(params: {
       const runId = crypto.randomUUID();
       const shouldSurfaceToControlUi = isInternalMessageChannel(
         resolveOriginMessageProvider({
-          originatingChannel: queued.originatingChannel,
+          originatingChannel: effectiveQueued.originatingChannel,
           provider: run.messageProvider,
         }),
       );
@@ -289,15 +323,15 @@ export function createFollowupRunner(params: {
                 sessionKey: run.sessionKey,
                 agentId: run.agentId,
                 trigger: "user",
-                messageChannel: queued.originatingChannel ?? undefined,
+                messageChannel: effectiveQueued.originatingChannel ?? undefined,
                 messageProvider: run.messageProvider,
                 agentAccountId: run.agentAccountId,
-                messageTo: queued.originatingTo,
-                messageThreadId: queued.originatingThreadId,
-                currentChannelId: queued.originatingTo,
+                messageTo: effectiveQueued.originatingTo,
+                messageThreadId: effectiveQueued.originatingThreadId,
+                currentChannelId: effectiveQueued.originatingTo,
                 currentThreadTs:
-                  queued.originatingThreadId != null
-                    ? String(queued.originatingThreadId)
+                  effectiveQueued.originatingThreadId != null
+                    ? String(effectiveQueued.originatingThreadId)
                     : undefined,
                 groupId: run.groupId,
                 groupChannel: run.groupChannel,
@@ -422,10 +456,10 @@ export function createFollowupRunner(params: {
         cfg: runtimeConfig,
         payloads: payloadArray,
         messageProvider: run.messageProvider,
-        originatingAccountId: queued.originatingAccountId ?? run.agentAccountId,
-        originatingChannel: queued.originatingChannel,
-        originatingChatType: queued.originatingChatType,
-        originatingTo: queued.originatingTo,
+        originatingAccountId: effectiveQueued.originatingAccountId ?? run.agentAccountId,
+        originatingChannel: effectiveQueued.originatingChannel,
+        originatingChatType: effectiveQueued.originatingChatType,
+        originatingTo: effectiveQueued.originatingTo,
         sentMediaUrls: runResult.messagingToolSentMediaUrls,
         sentTargets: runResult.messagingToolSentTargets,
         sentTexts: runResult.messagingToolSentTexts,

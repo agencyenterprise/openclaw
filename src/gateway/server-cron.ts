@@ -19,7 +19,7 @@ import {
 } from "../cron/run-log.js";
 import type { CronServiceContract } from "../cron/service-contract.js";
 import { CronService } from "../cron/service.js";
-import { resolveCronSessionTargetSessionKey } from "../cron/session-target.js";
+import { resolveCronDeliverySessionKey } from "../cron/session-target.js";
 import { resolveCronStorePath } from "../cron/store.js";
 import type { CronJob } from "../cron/types.js";
 import { formatErrorMessage } from "../infra/errors.js";
@@ -344,7 +344,7 @@ export function buildGatewayCronService(params: {
       onExecutionPhase,
     }) => {
       const { agentId, cfg: runtimeConfig } = resolveCronAgent(job.agentId);
-      const sessionKey = resolveCronSessionTargetSessionKey(job.sessionTarget) ?? `cron:${job.id}`;
+      const sessionKey = resolveCronDeliverySessionKey(job) ?? `cron:${job.id}`;
       try {
         return await runCronIsolatedAgentTurn({
           cfg: runtimeConfig,

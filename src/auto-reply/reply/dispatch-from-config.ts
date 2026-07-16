@@ -797,11 +797,15 @@ export async function dispatchReplyFromConfig(
     subagentPolicy,
     inheritedToolPolicy,
   ]);
+  const slackRoomSessionRequiresMessageTool = /:slack:(?:channel|group):/.test(
+    acpDispatchSessionKey ?? "",
+  );
   const sourceReplyPolicy = resolveSourceReplyVisibilityPolicy({
     cfg,
     ctx,
     requested: params.replyOptions?.sourceReplyDeliveryMode,
-    strictMessageToolOnly: ctx.InboundTurnKind === "room_event",
+    strictMessageToolOnly:
+      ctx.InboundTurnKind === "room_event" || slackRoomSessionRequiresMessageTool,
     sendPolicy,
     suppressAcpChildUserDelivery,
     explicitSuppressTyping: params.replyOptions?.suppressTyping === true,
@@ -949,10 +953,17 @@ export async function dispatchReplyFromConfig(
 
   // Bridge to internal hooks (HOOK.md discovery system) - refs #8807
   if (sessionKey) {
+    const internalReceivedContext = toInternalMessageReceivedContext(hookContext);
     fireAndForgetHook(
       triggerInternalHook(
         createInternalHookEvent("message", "received", sessionKey, {
-          ...toInternalMessageReceivedContext(hookContext),
+          ...internalReceivedContext,
+          metadata: {
+            ...internalReceivedContext.metadata,
+            // [openclaw-fork] expose the mention signal so the reviewer in-flight ledger can
+            // scope acked-but-unanswered tracking to messages the bot is committed to answering.
+            wasMentioned: typeof ctx.WasMentioned === "boolean" ? ctx.WasMentioned : undefined,
+          },
           timestamp,
         }),
       ),

@@ -3,6 +3,7 @@ import { readBooleanParam } from "openclaw/plugin-sdk/boolean-param";
 import { isSingleUseReplyToMode } from "openclaw/plugin-sdk/reply-reference";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { parseSlackBlocksInput } from "./blocks-input.js";
+import { normalizeSlackOutboundText } from "./format.js";
 import {
   createActionGate,
   imageResultFromFile,
@@ -142,8 +143,30 @@ function resolveThreadTsFromContext(
   return undefined;
 }
 
+function readExplicitMessageThreadTs(params: Record<string, unknown>): string | undefined {
+  return (
+    readStringParam(params, "threadTs") ??
+    readStringParam(params, "threadId") ??
+    readStringParam(params, "replyTo")
+  );
+}
+
+function suppressesImplicitMessageThreading(params: Record<string, unknown>): boolean {
+  return (
+    params.topLevel === true ||
+    params.threadTs === null ||
+    params.threadId === null ||
+    params.replyTo === null
+  );
+}
+
 function readSlackBlocksParam(params: Record<string, unknown>) {
   return slackActionRuntime.parseSlackBlocksInput(params.blocks);
+}
+
+function isSlackChannelTarget(value: string | undefined): boolean {
+  const normalized = value?.trim().replace(/^channel:/i, "");
+  return Boolean(normalized && /^C[A-Z0-9]+$/i.test(normalized));
 }
 
 function isImageContentType(value: string | undefined): boolean {
@@ -253,14 +276,30 @@ export async function handleSlackAction(
             "Slack replyBroadcast is only supported for text or block thread replies.",
           );
         }
-        const threadTs = resolveThreadTsFromContext(
-          readStringParam(params, "threadTs"),
-          to,
-          context,
-          {
-            suppressImplicitThread: params.topLevel === true || params.threadTs === null,
-          },
-        );
+        const explicitThreadTs = readExplicitMessageThreadTs(params);
+        const suppressImplicitThread = suppressesImplicitMessageThreading(params);
+        const threadTs = resolveThreadTsFromContext(explicitThreadTs, to, context, {
+          suppressImplicitThread,
+        });
+        if (
+          !threadTs &&
+          isSlackChannelTarget(to) &&
+          !suppressImplicitThread &&
+          context?.currentChannelId
+        ) {
+          console.warn(
+            `[slack/action-runtime] sendMessage without threadTs to=${to} explicitThreadTs=${explicitThreadTs ?? "-"} contextThreadTs=${context?.currentThreadTs ?? "-"} currentChannelId=${context?.currentChannelId ?? "-"} replyToMode=${context?.replyToMode ?? "-"} suppressImplicitThread=${suppressImplicitThread}`,
+          );
+        } else if (
+          threadTs &&
+          context?.currentThreadTs &&
+          threadTs !== context.currentThreadTs &&
+          isSlackChannelTarget(to)
+        ) {
+          console.warn(
+            `[slack/action-runtime] sendMessage threadTs differs from context to=${to} threadTs=${threadTs} contextThreadTs=${context.currentThreadTs} explicitThreadTs=${explicitThreadTs ?? "-"} replyToMode=${context.replyToMode ?? "-"}`,
+          );
+        }
         const sendOpts = {
           ...writeOpts,
           mediaLocalRoots: context?.mediaLocalRoots,
@@ -315,11 +354,11 @@ export async function handleSlackAction(
           );
         }
         const threadTs = resolveThreadTsFromContext(
-          readStringParam(params, "threadTs"),
+          readExplicitMessageThreadTs(params),
           to,
           context,
           {
-            suppressImplicitThread: params.topLevel === true || params.threadTs === null,
+            suppressImplicitThread: suppressesImplicitMessageThreading(params),
           },
         );
         const result = await slackActionRuntime.sendSlackMessage(to, initialComment ?? "", {
@@ -352,13 +391,14 @@ export async function handleSlackAction(
         if (!content && !blocks) {
           throw new Error("Slack editMessage requires content or blocks.");
         }
+        const normalizedContent = normalizeSlackOutboundText(content ?? "");
         if (writeOpts) {
-          await slackActionRuntime.editSlackMessage(channelId, messageId, content ?? "", {
+          await slackActionRuntime.editSlackMessage(channelId, messageId, normalizedContent, {
             ...writeOpts,
             blocks,
           });
         } else {
-          await slackActionRuntime.editSlackMessage(channelId, messageId, content ?? "", {
+          await slackActionRuntime.editSlackMessage(channelId, messageId, normalizedContent, {
             blocks,
           });
         }

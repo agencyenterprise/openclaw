@@ -111,6 +111,37 @@ const UNICODE_TO_SLACK: Record<string, string> = {
   "💻": "computer",
 };
 
+const recentSlackTextByThread = new Map<string, { text: string; atMs: number }>();
+const RECENT_SLACK_DUPLICATE_TTL_MS = 10 * 60 * 1000;
+
+/** Suppress exact cross-turn duplicate answers while allowing later restatements. */
+export function shouldSuppressRecentSlackDuplicate(params: {
+  threadKey: string;
+  text: string;
+  nowMs?: number;
+  ttlMs?: number;
+}): boolean {
+  const nowMs = params.nowMs ?? Date.now();
+  const ttlMs = params.ttlMs ?? RECENT_SLACK_DUPLICATE_TTL_MS;
+  const text = params.text.replace(/\s+/g, " ").trim();
+  if (!text) {
+    return false;
+  }
+  const previous = recentSlackTextByThread.get(params.threadKey);
+  if (previous && previous.text === text && nowMs - previous.atMs <= ttlMs) {
+    return true;
+  }
+  recentSlackTextByThread.set(params.threadKey, { text, atMs: nowMs });
+  if (recentSlackTextByThread.size > 500) {
+    for (const [key, entry] of recentSlackTextByThread) {
+      if (nowMs - entry.atMs > ttlMs) {
+        recentSlackTextByThread.delete(key);
+      }
+    }
+  }
+  return false;
+}
+
 function resolveSlackMessageTimestampMs(message: SlackMessageEvent): number | undefined {
   const ts = message.event_ts ?? message.ts;
   if (!ts) {
@@ -409,7 +440,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
   const statusReactionsEnabled =
     Boolean(prepared.ackReactionPromise) &&
     Boolean(reactionMessageTs) &&
-    cfg.messages?.statusReactions?.enabled !== false;
+    cfg.messages?.statusReactions?.enabled === true;
   const slackStatusAdapter: StatusReactionAdapter = {
     setReaction: async (emoji) => {
       await reactSlackMessage(message.channel, reactionMessageTs ?? "", toSlackEmojiName(emoji), {
@@ -877,6 +908,51 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
     ...replyPipeline,
     humanDelay: resolveHumanDelayConfig(cfg, route.agentId),
     deliver: async (payload, info) => {
+      const privateReplacementTs = prepared.message.openclaw_replace_message_ts?.trim();
+      if (privateReplacementTs) {
+        if (info.kind === "tool" || payload.isError) {
+          return;
+        }
+        const replacement = resolveSendableOutboundReplyParts(payload);
+        const replacementBlocks = readSlackReplyBlocks(payload);
+        const replacementText = normalizeSlackOutboundText(replacement.trimmedText);
+        if (!replacementText && !replacementBlocks?.length) {
+          return;
+        }
+        await ctx.app.client.chat.update({
+          channel: message.channel,
+          ts: privateReplacementTs,
+          text: replacementText || "Updated answer",
+          ...(replacementBlocks?.length ? { blocks: replacementBlocks } : {}),
+        });
+        observedReplyDelivery = true;
+        replyPlan.markSent();
+        deliveryTracker.markDelivered({
+          kind: info.kind,
+          payload,
+          threadTs: usedReplyThreadTs ?? statusThreadTs,
+          textOverride: replacementText,
+        });
+        logVerbose(
+          `slack: private reviewer correction replaced ${message.channel}/${privateReplacementTs}`,
+        );
+        return;
+      }
+
+      if (info.kind === "final") {
+        const candidate = resolveSendableOutboundReplyParts(payload).trimmedText;
+        const threadKey = `${message.channel}:${message.thread_ts ?? message.ts ?? "root"}`;
+        if (
+          shouldSuppressRecentSlackDuplicate({
+            threadKey,
+            text: candidate,
+          })
+        ) {
+          logVerbose(`slack: suppressed recent cross-turn duplicate for ${threadKey}`);
+          return;
+        }
+      }
+
       if (useStreaming) {
         await deliverWithStreaming({ payload, kind: info.kind });
         return;

@@ -1416,6 +1416,52 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  it("keeps deferred subagent completion finals private after message-tool delivery", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [
+          {
+            text: "Raw assistant narration that must not be auto-delivered.",
+          },
+        ],
+        messagingToolSentTargets: [
+          {
+            tool: "message",
+            provider: "slack",
+            accountId: "acct-1",
+            to: "channel:C123",
+            text: "The edited completion is ready.",
+          },
+        ],
+      },
+    });
+    const sendMessage = createSendMessageMock();
+
+    const result = await deliverSlackChannelAnnouncement({
+      callGateway,
+      sendMessage,
+      sessionId: "requester-session-channel",
+      isActive: false,
+      expectsCompletionMessage: true,
+      directIdempotencyKey: "announce-channel-subagent-message-tool-dedupe",
+      sourceTool: "subagent_announce",
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "direct",
+    });
+    expectGatewayAgentParams(callGateway, {
+      deliver: false,
+      channel: "slack",
+      accountId: "acct-1",
+      to: "channel:C123",
+      threadId: undefined,
+      sourceReplyDeliveryMode: "message_tool_only",
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   it("falls back to a forced message-tool handoff when the active requester run cannot accept one", async () => {
     const callGateway = createGatewayMock({
       result: {

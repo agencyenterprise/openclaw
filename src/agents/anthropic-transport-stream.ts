@@ -114,12 +114,17 @@ function isClaudeOpus47Model(modelId: string): boolean {
   return modelId.includes("opus-4-7") || modelId.includes("opus-4.7");
 }
 
+function isClaudeOpus48Model(modelId: string): boolean {
+  return modelId.includes("opus-4-8") || modelId.includes("opus-4.8");
+}
+
 function isClaudeOpus46Model(modelId: string): boolean {
   return modelId.includes("opus-4-6") || modelId.includes("opus-4.6");
 }
 
 function supportsAdaptiveThinking(modelId: string): boolean {
   return (
+    isClaudeOpus48Model(modelId) ||
     isClaudeOpus47Model(modelId) ||
     isClaudeOpus46Model(modelId) ||
     modelId.includes("sonnet-4-6") ||
@@ -135,7 +140,7 @@ function mapThinkingLevelToEffort(level: ThinkingLevel, modelId: string): Anthro
     case "medium":
       return "medium";
     case "xhigh":
-      if (isClaudeOpus47Model(modelId)) {
+      if (isClaudeOpus47Model(modelId) || isClaudeOpus48Model(modelId)) {
         return "xhigh";
       }
       return isClaudeOpus46Model(modelId) ? "max" : "high";

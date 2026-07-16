@@ -485,6 +485,31 @@ describe("handleSlackAction", () => {
     });
   });
 
+  it("routes uploadFile threadId through sendSlackMessage", async () => {
+    const cfg = slackConfig();
+    await handleSlackAction(
+      {
+        action: "uploadFile",
+        to: "channel:C123",
+        filePath: "/tmp/report.md",
+        initialComment: "fresh report",
+        threadId: "333.444",
+      },
+      cfg,
+      {
+        currentChannelId: "C123",
+        currentThreadTs: "111.222",
+        replyToMode: "all",
+      },
+    );
+
+    expectSlackSendCall(0, "channel:C123", "fresh report", {
+      cfg,
+      mediaUrl: "/tmp/report.md",
+      threadTs: "333.444",
+    });
+  });
+
   it("rejects replyBroadcast for uploadFile", async () => {
     await expect(
       handleSlackAction(
@@ -572,6 +597,24 @@ describe("handleSlackAction", () => {
     });
   });
 
+  it("converts standard Markdown to Slack mrkdwn before editing", async () => {
+    const cfg = slackConfig();
+    await handleSlackAction(
+      {
+        action: "editMessage",
+        channelId: "C123",
+        messageId: "123.456",
+        content: "**Correcting myself** — see [the artifact](https://example.com/result).",
+      },
+      cfg,
+    );
+
+    const editCall = requireMockCall(editSlackMessage, "editSlackMessage");
+    expect(editCall[2]).toBe(
+      "*Correcting myself* — see <https://example.com/result|the artifact>.",
+    );
+  });
+
   it("requires content or blocks for editMessage", async () => {
     await expect(
       handleSlackAction(
@@ -607,6 +650,8 @@ describe("handleSlackAction", () => {
   it.each([
     { name: "topLevel true", patch: { topLevel: true } },
     { name: "threadTs null", patch: { threadTs: null } },
+    { name: "threadId null", patch: { threadId: null } },
+    { name: "replyTo null", patch: { replyTo: null } },
   ] as const)("does not auto-inject threadTs for $name", async (testCase) => {
     const cfg = slackConfig();
     await handleSlackAction(
@@ -736,6 +781,44 @@ describe("handleSlackAction", () => {
       },
     );
     expectLastSlackSend("Explicit wins", cfg, "9999999999.999999");
+  });
+
+  it("explicit threadId overrides context threadTs", async () => {
+    const cfg = slackConfig();
+    await handleSlackAction(
+      {
+        action: "sendMessage",
+        to: "channel:C123",
+        content: "ThreadId wins",
+        threadId: "9999999999.999999",
+      },
+      cfg,
+      {
+        currentChannelId: "C123",
+        currentThreadTs: "1111111111.111111",
+        replyToMode: "all",
+      },
+    );
+    expectLastSlackSend("ThreadId wins", cfg, "9999999999.999999");
+  });
+
+  it("explicit replyTo overrides context threadTs", async () => {
+    const cfg = slackConfig();
+    await handleSlackAction(
+      {
+        action: "sendMessage",
+        to: "channel:C123",
+        content: "ReplyTo wins",
+        replyTo: "9999999999.999999",
+      },
+      cfg,
+      {
+        currentChannelId: "C123",
+        currentThreadTs: "1111111111.111111",
+        replyToMode: "all",
+      },
+    );
+    expectLastSlackSend("ReplyTo wins", cfg, "9999999999.999999");
   });
 
   it("handles channel target without prefix when replyToMode=all", async () => {

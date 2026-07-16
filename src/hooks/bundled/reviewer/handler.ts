@@ -19,7 +19,15 @@ import { createSubsystemLogger } from "../../../logging/subsystem.js";
 import { resolveHookConfig } from "../../config.js";
 import type { HookHandler } from "../../hooks.js";
 import type { InternalHookEvent, MessageSentHookContext } from "../../internal-hooks.js";
-import { addThread, removeThread, loadAndConsumeThreads } from "./active-threads.js";
+import {
+  upsertInflightTurn,
+  closeInflightTurn,
+  closeInflightTurnIfUnchanged,
+  getOpenInflightTurn,
+  markInflightAttempt,
+  recoverInflightTurns,
+  checkpointInflightLedger,
+} from "./inflight-ledger.js";
 import { loadAndConsumePendingReactions } from "./pending-reactions.js";
 
 const log = createSubsystemLogger("hooks/reviewer");
@@ -581,7 +589,27 @@ async function queryHindsight(query: string): Promise<string[]> {
   }
 }
 
+function usesOpenAIChatReviewerModel(model: string): boolean {
+  const m = model.trim().toLowerCase();
+  return m.startsWith("gpt-") || m.startsWith("openai/");
+}
+
+function normalizeOpenAIChatReviewerModel(model: string): string {
+  const trimmed = model.trim();
+  return trimmed.toLowerCase().startsWith("openai/") ? trimmed.slice("openai/".length) : trimmed;
+}
+
+function extractJsonObjectText(raw: string): string {
+  const trimmed = raw.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const candidate = (fenced?.[1] ?? trimmed).trim();
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  return start >= 0 && end > start ? candidate.slice(start, end + 1) : candidate;
+}
+
 async function callReviewer(params: {
+  cfg: OpenClawConfig;
   model: string;
   systemPrompt: string;
   threadMessages: Array<{ role: string; text: string; ts?: string }>;
@@ -591,15 +619,6 @@ async function callReviewer(params: {
   toolCalls?: string[];
   memories?: string[];
 }): Promise<ReviewResult> {
-  const apiKey = resolveOpenAIApiKey();
-  if (!apiKey) {
-    log.warn("No OpenAI API key found — auto-approving");
-    return { action: "approve", message: "", confidence: 1.0 };
-  }
-  // Dynamic import to avoid bundling openai in the main gateway
-  const { default: OpenAI } = await import("openai");
-  const client = new OpenAI({ apiKey });
-
   // Full thread with human-readable timestamps so the reviewer can gauge recency.
   const transcript = params.threadMessages
     .map((m) => {
@@ -615,7 +634,7 @@ async function callReviewer(params: {
   // ~4 chars per token, so 100K tokens ≈ 400K chars budget for tool activity.
   let toolSection = "";
   if (params.toolCalls && params.toolCalls.length > 0) {
-    const TOKEN_BUDGET_CHARS = 400_000; // ~100K tokens
+    const TOKEN_BUDGET_CHARS = 120_000; // ~30K tokens; keep reviewer prompt bounded
     // Walk backwards (newest first), accumulate until budget is spent
     const selected: string[] = [];
     let charCount = 0;
@@ -630,7 +649,7 @@ async function callReviewer(params: {
     const dropped = params.toolCalls.length - selected.length;
     const header =
       dropped > 0
-        ? `(showing ${selected.length}/${params.toolCalls.length} tool calls — ${dropped} older calls trimmed to fit 100K token budget)`
+        ? `(showing ${selected.length}/${params.toolCalls.length} tool calls — ${dropped} older calls trimmed to fit reviewer prompt budget)`
         : `(${selected.length} tool calls from current turn)`;
     toolSection = `\n\n--- AGENT TOOL ACTIVITY ${header} ---\n${selected.join("\n")}\n--- END TOOL ACTIVITY ---`;
   }
@@ -644,26 +663,163 @@ ${params.memories.map((m, i) => `${i + 1}. ${m}`).join("\n")}
 --- END MEMORIES ---`;
   }
 
-  const userContent = `Review this conversation thread. The assistant is Opus.\n\n--- THREAD ---\n${transcript}\n--- END ---${toolSection}${memorySection}\n\nEvaluate the assistant's last response. Respond with JSON only.`;
+  const userContent = `Review this conversation thread. The assistant is Opus.
+
+--- THREAD ---
+${transcript}
+--- END ---${toolSection}${memorySection}
+
+Evaluate the assistant's last response. Respond with JSON only. Hard output limit: if action=continue, keep message under 700 characters and name only the concrete next correction. Do not include analysis, long evidence dumps, or multi-paragraph explanations.`;
   const messages: Array<{ role: "system" | "user"; content: string }> = [
     { role: "system", content: params.systemPrompt },
     { role: "user", content: userContent },
   ];
 
-  const response = await client.chat.completions.create({
-    model: params.model,
-    messages,
-    temperature: 0.3,
-    max_completion_tokens: 1000,
-    response_format: { type: "json_object" },
-  });
+  // Reviewer is a structured-output JSON classifier. GPT-5.5 uses OpenAI JSON mode;
+  // other configured models go through OpenClaw's model runtime and are parsed from text.
+  let finishReason: string | undefined = "stop";
+  let rawOutput = "{}";
+  let usageForTrace: { input?: number; output?: number } = {};
 
-  const rawOutput = response.choices[0]?.message?.content ?? "{}";
+  if (usesOpenAIChatReviewerModel(params.model)) {
+    const apiKey = resolveOpenAIApiKey();
+    if (!apiKey) {
+      log.warn("No OpenAI API key found — auto-approving");
+      return { action: "approve", message: "", confidence: 1.0 };
+    }
+    const { default: OpenAI } = await import("openai");
+    const client = new OpenAI({ apiKey });
+    const openAIModel = normalizeOpenAIChatReviewerModel(params.model);
+    const callBody = {
+      model: openAIModel,
+      messages,
+      max_completion_tokens: 4000,
+      response_format: { type: "json_object" as const },
+    };
+    log.info(
+      `reviewer call: model=${params.model} resolved=${openAIModel} message_count=${messages.length} body_keys=${Object.keys(callBody).join(",")}`,
+    );
+    log.info(
+      `reviewer call body (sans messages): ${JSON.stringify({ ...callBody, messages: undefined })}`,
+    );
+    let response;
+    try {
+      response = await client.chat.completions.create(callBody);
+      log.info(
+        `reviewer response ok: choices=${response.choices?.length ?? 0} model_returned=${response.model ?? "?"} finish=${response.choices?.[0]?.finish_reason ?? "?"}`,
+      );
+    } catch (err: unknown) {
+      const errAny = err as { message?: string; status?: number; error?: unknown };
+      log.error(
+        `reviewer call THREW: status=${errAny.status ?? "?"} message=${errAny.message ?? String(err)} body_was=${JSON.stringify({ ...callBody, messages: "[...]" })}`,
+      );
+      throw err;
+    }
+
+    finishReason = response.choices[0]?.finish_reason;
+    rawOutput = response.choices[0]?.message?.content ?? "{}";
+    usageForTrace = {
+      input: response.usage?.prompt_tokens,
+      output: response.usage?.completion_tokens,
+    };
+
+    if (finishReason && finishReason !== "stop") {
+      log.warn(
+        `reviewer response ended with finish=${finishReason}; retrying internally with compact prompt`,
+      );
+      const compactTranscript = params.threadMessages
+        .slice(-60)
+        .map((m) => {
+          const tag = m.ts ? `@ ${new Date(Number(m.ts) * 1000).toISOString()}` : "";
+          return `[${m.role} ${tag}]: ${m.text.slice(0, 700)}`;
+        })
+        .join("\n\n");
+      const retryMessages: Array<{ role: "system" | "user"; content: string }> = [
+        {
+          role: "system",
+          content:
+            params.systemPrompt +
+            "\n\nYour previous JSON response was truncated. Return exactly one compact JSON object. If action=continue, message must be under 600 characters and contain only the next concrete correction. No analysis prose.",
+        },
+        {
+          role: "user",
+          content: `Compact retry for reviewer decision. Thread root: ${params.threadTs}. Use the last 60 messages below plus known rules.\n\n--- RECENT THREAD ---\n${compactTranscript}\n--- END ---\n\nReturn JSON only.`,
+        },
+      ];
+      try {
+        const retryResponse = await client.chat.completions.create({
+          model: openAIModel,
+          messages: retryMessages,
+          max_completion_tokens: 1200,
+          response_format: { type: "json_object" as const },
+        });
+        response = retryResponse;
+        finishReason = response.choices[0]?.finish_reason;
+        rawOutput = response.choices[0]?.message?.content ?? "{}";
+        usageForTrace = {
+          input: response.usage?.prompt_tokens,
+          output: response.usage?.completion_tokens,
+        };
+        log.info(`reviewer compact retry ok: finish=${finishReason ?? "?"}`);
+      } catch (err: unknown) {
+        log.error(`reviewer compact retry THREW: ${String(err)}`);
+      }
+    }
+  } else {
+    const { createRuntimeLlm } = await import("../../../plugins/runtime/runtime-llm.runtime.js");
+    const llm = createRuntimeLlm({
+      getConfig: () => params.cfg,
+      authority: {
+        caller: { kind: "host", id: "reviewer", name: "Reviewer Hook" },
+        allowComplete: true,
+        allowModelOverride: true,
+        allowedModels: [params.model],
+      },
+    });
+    log.info(`reviewer call: model=${params.model} via OpenClaw LLM runtime`);
+    const runtimeResult = await llm.complete({
+      model: params.model,
+      systemPrompt:
+        params.systemPrompt +
+        "\n\nReturn exactly one valid JSON object and no surrounding prose or markdown fences.",
+      messages: [{ role: "user", content: userContent }],
+      maxTokens: 4000,
+      purpose: "reviewer-quality-gate",
+    });
+    rawOutput = runtimeResult.text || "{}";
+    finishReason = "stop";
+    usageForTrace = {
+      input: runtimeResult.usage?.inputTokens,
+      output: runtimeResult.usage?.outputTokens,
+    };
+    log.info(
+      `reviewer response ok: provider=${runtimeResult.provider} model_returned=${runtimeResult.model}`,
+    );
+  }
+
   let result: ReviewResult;
-  try {
-    result = JSON.parse(rawOutput) as ReviewResult;
-  } catch {
-    result = { action: "approve", message: "", confidence: 1.0 };
+  if (finishReason && finishReason !== "stop") {
+    log.warn(
+      `reviewer compact retry still ended with finish=${finishReason}; forcing concise corrective continue`,
+    );
+    result = {
+      action: "continue",
+      message:
+        "Reviewer internal retry failed. Do a concise self-audit of the last turn against SOUL/reviewer rules, fix any concrete gap now, and do not ask A/B unless there is a hard blocker.",
+      confidence: 0,
+    };
+  } else {
+    try {
+      result = JSON.parse(extractJsonObjectText(rawOutput)) as ReviewResult;
+    } catch (err) {
+      log.warn(`reviewer JSON parse failed; forcing continue: ${String(err)}`);
+      result = {
+        action: "continue",
+        message:
+          "Reviewer output was not valid JSON. Do a concise self-audit of the last turn, fix any concrete gap now, and do not treat the prior turn as approved.",
+        confidence: 0,
+      };
+    }
   }
 
   // Fire-and-forget Langfuse trace
@@ -676,10 +832,7 @@ ${params.memories.map((m, i) => `${i + 1}. ${m}`).join("\n")}
       model: params.model,
       input: messages,
       output: rawOutput,
-      usage: {
-        input: response.usage?.prompt_tokens,
-        output: response.usage?.completion_tokens,
-      },
+      usage: usageForTrace,
       threadTs: params.threadTs,
       channelId: params.channelId,
       action: result.action,
@@ -694,13 +847,132 @@ ${params.memories.map((m, i) => `${i + 1}. ${m}`).join("\n")}
   return result;
 }
 
+// Did the agent answer the most recent reviewer continue?
+// Legacy/public mode uses the reviewer's visible Slack post as a clock-free marker. Private
+// mode edits the prior bot answer in place, so Slack's `edited.ts` must be newer than the
+// durable dispatch timestamp. A later human message does not un-answer either form.
+export async function reviewerContinueAnswered(params: {
+  token: string;
+  botUserId: string;
+  channelId: string;
+  threadTs: string;
+  dispatchedAtMs?: number;
+}): Promise<boolean> {
+  try {
+    const messages = await fetchSlackThread(
+      params.token,
+      params.channelId,
+      params.threadTs,
+      params.botUserId,
+    );
+    let latestReviewerTs = 0;
+    for (const m of messages) {
+      if (m.role === "Assistant" && isReviewerFeedbackText(m.text)) {
+        const ts = Number.parseFloat(m.ts ?? "0");
+        if (Number.isFinite(ts)) latestReviewerTs = Math.max(latestReviewerTs, ts);
+      }
+    }
+    if (latestReviewerTs > 0) {
+      return messages.some(
+        (m) =>
+          m.role === "Assistant" &&
+          !isReviewerFeedbackText(m.text) &&
+          m.ts !== undefined &&
+          Number.parseFloat(m.ts) > latestReviewerTs,
+      );
+    }
+    if (!params.dispatchedAtMs) {
+      return false;
+    }
+    const dispatchSlackTs = params.dispatchedAtMs / 1000;
+    return messages.some((m) => {
+      if (m.role !== "Assistant" || isReviewerFeedbackText(m.text) || !m.editedTs) {
+        return false;
+      }
+      const editedTs = Number.parseFloat(m.editedTs);
+      return Number.isFinite(editedTs) && editedTs >= dispatchSlackTs - 2;
+    });
+  } catch (err) {
+    log.warn(
+      `continue-answered probe failed for ${params.channelId}:${params.threadTs}: ${String(err)}`,
+    );
+    return false; // uncertain → NOT answered → re-engage / keep the row (no-loss bias)
+  }
+}
+
+// Has an "engage" row been answered? (A mention/review-start row, where the bot owes a
+// reply to the thread itself.) "Answered" = the bot's latest non-reviewer reply is newer
+// than the latest non-bot (actionable) message AND not older than the row opened (− skew) —
+// i.e. the bot has responded to the most recent human input. A trailing unanswered human
+// message keeps it open (re-engage). This is the original active-threads recovery semantics.
+// On any Slack error we return false (NOT answered → re-engage / keep). Never throws.
+export async function engageAnswered(params: {
+  token: string;
+  botUserId: string;
+  channelId: string;
+  threadTs: string;
+  openedAtMs: number;
+}): Promise<boolean> {
+  try {
+    const messages = await fetchSlackThread(
+      params.token,
+      params.channelId,
+      params.threadTs,
+      params.botUserId,
+    );
+    let latestAssistantTs = 0;
+    let latestActionableTs = 0;
+    for (const m of messages) {
+      const ts = Number.parseFloat(m.ts ?? "0");
+      if (!Number.isFinite(ts)) continue;
+      if (m.role === "Assistant" && !isReviewerFeedbackText(m.text)) {
+        latestAssistantTs = Math.max(latestAssistantTs, ts);
+      } else {
+        latestActionableTs = Math.max(latestActionableTs, ts);
+      }
+    }
+    const openedSlackTs = params.openedAtMs / 1000;
+    return latestAssistantTs > latestActionableTs && latestAssistantTs >= openedSlackTs - 60;
+  } catch (err) {
+    log.warn(
+      `engage-answered probe failed for ${params.channelId}:${params.threadTs}: ${String(err)}`,
+    );
+    return false; // uncertain → NOT answered → re-engage / keep the row (no-loss bias)
+  }
+}
+
+// Pick the kind-appropriate "answered?" probe for an in-flight row.
+async function inflightRowAnswered(
+  token: string,
+  botUserId: string,
+  channelId: string,
+  threadTs: string,
+  row: { kind: string; last_dispatch: number; opened_at: number },
+): Promise<boolean> {
+  return row.kind === "engage"
+    ? engageAnswered({ token, botUserId, channelId, threadTs, openedAtMs: row.opened_at })
+    : reviewerContinueAnswered({
+        token,
+        botUserId,
+        channelId,
+        threadTs,
+        dispatchedAtMs: row.last_dispatch,
+      });
+}
+
 async function fetchSlackThread(
   token: string,
   channelId: string,
   threadTs: string,
   botUserId?: string,
-): Promise<Array<{ role: string; text: string; ts?: string }>> {
-  const allMessages: Array<{ user?: string; text?: string; ts?: string }> = [];
+): Promise<Array<{ role: string; text: string; ts?: string; editedTs?: string }>> {
+  const allMessages: Array<{
+    user?: string;
+    bot_id?: string;
+    text?: string;
+    ts?: string;
+    edited?: { ts?: string };
+  }> = [];
   let cursor: string | undefined;
 
   // Paginate to get ALL messages (Slack returns oldest-first, max 200 per page)
@@ -715,14 +987,21 @@ async function fetchSlackThread(
     });
     const data = (await res.json()) as {
       ok?: boolean;
-      messages?: Array<{ user?: string; text?: string; ts?: string }>;
+      messages?: Array<{
+        user?: string;
+        bot_id?: string;
+        text?: string;
+        ts?: string;
+        edited?: { ts?: string };
+      }>;
       error?: string;
       has_more?: boolean;
       response_metadata?: { next_cursor?: string };
     };
     if (!data.ok) {
-      log.warn(`conversations.replies failed: ${data.error ?? "unknown"}`);
-      break;
+      const error = data.error ?? "unknown";
+      log.warn(`conversations.replies failed: ${error}`);
+      throw new Error(`Slack thread fetch failed for ${channelId}:${threadTs}: ${error}`);
     }
     allMessages.push(...(data.messages ?? []));
     cursor = data.has_more ? data.response_metadata?.next_cursor : undefined;
@@ -730,15 +1009,71 @@ async function fetchSlackThread(
 
   log.info(`fetchSlackThread: ${allMessages.length} messages fetched (paginated)`);
   return allMessages.map((m) => ({
-    role: m.user === botUserId ? "Assistant" : `User (${m.user ?? "unknown"})`,
+    role: classifySlackThreadMessageRole(m, botUserId),
     text: m.text ?? "(no text)",
     ts: m.ts,
+    editedTs: m.edited?.ts,
   }));
+}
+
+export function classifySlackThreadMessageRole(
+  message: { user?: string; bot_id?: string },
+  botUserId?: string,
+): string {
+  const isAssistant = Boolean(message.bot_id) || Boolean(botUserId && message.user === botUserId);
+  return isAssistant ? "Assistant" : `User (${message.user ?? "unknown"})`;
 }
 
 function isReviewerFeedbackText(text: string | undefined): boolean {
   const normalized = (text ?? "").trim();
   return normalized.startsWith("🔍 *Reviewer:*") || normalized.startsWith(":mag: *Reviewer:*");
+}
+
+function isUserVisibleAssistantAnswer(text: string | undefined): boolean {
+  const normalized = (text ?? "").trim();
+  if (!normalized || isReviewerFeedbackText(normalized)) {
+    return false;
+  }
+  return !/^(?:⚠️|:warning:)\s*(?:✉️|:email:)\s*Message failed\s*$/iu.test(normalized);
+}
+
+function latestAssistantText(threadMessages: Array<{ role: string; text?: string }>): string {
+  return (
+    threadMessages
+      .filter((m) => m.role === "Assistant" && isUserVisibleAssistantAnswer(m.text))
+      .pop()?.text ?? ""
+  );
+}
+
+export function forceContinueForFalseDecisionAsk(
+  threadMessages: Array<{ role: string; text?: string }>,
+): string | null {
+  const text = latestAssistantText(threadMessages);
+  if (!text) {
+    return null;
+  }
+  const asksHumanToChoose =
+    /\b(decision asked|your call|which (?:way|one|option)|pick (?:one|a|b|c)|should i|want me to|if you say go|on ["']?go["']?|green-?light|approve option|expand .*\bclose|close .*\bexpand)\b/i.test(
+      text,
+    );
+  if (!asksHumanToChoose) {
+    return null;
+  }
+  const saysWorkIsCheapOrRecommended =
+    /\b(cheap|reversible|trivial|in[- ]scope|already[- ]aligned|recommended|recommendation|my read|right call|should be run|same turn|no approval|pre[- ]authorized)\b/i.test(
+      text,
+    ) || /\$\s*(?:0(?:\.\d+)?|[1-9](?:\.\d+)?)(?:\b|\s|[-–—])/i.test(text);
+  if (!saysWorkIsCheapOrRecommended) {
+    return null;
+  }
+  const genuineHardGate =
+    /\b(human design review|credential|access credential|destructive|external side effect|legal|security|privacy|cannot proceed|hard block)\b/i.test(
+      text,
+    );
+  if (genuineHardGate) {
+    return null;
+  }
+  return "False decision-ask: the latest reply asks humans to choose even though its own text frames the recommended next step as cheap/reversible/in-scope. Execute the recommended branch now or name a genuine hard blocker; do not stop at `your call`/`go?`.";
 }
 
 async function slackReact(
@@ -772,6 +1107,25 @@ async function slackReact(
   }
 }
 
+// Judd's Slack user id. Per the HARD "never @-mention Judd" rule (Flavio, 2026-06-18),
+// the reviewer must be STRUCTURALLY incapable of emitting a live Judd ping — including
+// when it merely *quotes* a `<@U02AX1XQ1>` token while flagging a (real or hallucinated)
+// violation. The prompt-level rule is not enough: an LLM quoting the offending token will
+// reproduce it verbatim, and Slack renders `<@ID>` as a live ping regardless of code/quote
+// styling. So we defang at the post chokepoint. Reference incident: 2026-06-18 thread
+// 1780509725.395419 — reviewer falsely claimed a Judd ping and, while "quoting" it, pinged
+// Judd for real.
+const JUDD_USER_ID = "U02AX1XQ1";
+
+// Convert any live `<@U02AX1XQ1>` (with or without a `|label`) into an inert plain-text
+// reference that Slack will NOT turn into a notification.
+export function defangJuddMention(text: string): string {
+  if (!text) {
+    return text;
+  }
+  return text.replace(new RegExp(`<@${JUDD_USER_ID}(\\|[^>]*)?>`, "g"), "`@Judd`");
+}
+
 async function slackPost(
   token: string,
   channelId: string,
@@ -781,48 +1135,288 @@ async function slackPost(
   await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ channel: channelId, thread_ts: threadTs, text }),
+    body: JSON.stringify({
+      channel: channelId,
+      thread_ts: threadTs,
+      text: defangJuddMention(text),
+    }),
   });
+}
+
+function loadOpenClawConfigFromDisk(): OpenClawConfig | undefined {
+  try {
+    const stateDir =
+      process.env.OPENCLAW_STATE_DIR ?? path.join(require("node:os").homedir(), ".openclaw");
+    const cfgPath = path.join(stateDir, "openclaw.json");
+    return JSON.parse(fs.readFileSync(cfgPath, "utf-8")) as OpenClawConfig;
+  } catch {
+    return undefined;
+  }
+}
+
+function getSlackBotToken(cfg: OpenClawConfig | undefined): string | undefined {
+  const chCfg = (cfg as Record<string, unknown> | undefined)?.channels as
+    | Record<string, unknown>
+    | undefined;
+  const slkCfg = chCfg?.slack as Record<string, unknown> | undefined;
+  return slkCfg?.botToken as string | undefined;
+}
+
+function extractSessionChannelId(sessionKey: string | undefined): string | undefined {
+  const m = (sessionKey ?? "").match(/channel:(c[a-z0-9]+)/i);
+  return m?.[1]?.toUpperCase();
+}
+
+function extractSessionThreadTs(sessionKey: string | undefined): string | undefined {
+  return (sessionKey ?? "").match(/thread:(\d+\.\d+)/)?.[1];
+}
+
+async function resolveSlackBotUserId(token: string | undefined): Promise<string | undefined> {
+  if (!token) {
+    return undefined;
+  }
+  try {
+    const authRes = await fetch("https://slack.com/api/auth.test", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const authData = (await authRes.json()) as { ok?: boolean; user_id?: string };
+    return authData.ok && authData.user_id ? authData.user_id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// The bot user id is stable for the process lifetime; cache it so the agent:turn-complete
+// answer-check (which can fire often) doesn't auth.test on every call.
+let cachedBotUserId: string | undefined;
+async function resolveCachedBotUserId(token: string): Promise<string | undefined> {
+  if (cachedBotUserId) {
+    return cachedBotUserId;
+  }
+  cachedBotUserId = await resolveSlackBotUserId(token);
+  return cachedBotUserId;
+}
+
+async function probeCanonicalSlackThreadTs(
+  token: string,
+  channelId: string,
+  candidateTs: string,
+): Promise<string | undefined> {
+  if (!/^\d+\.\d+$/.test(candidateTs)) {
+    return undefined;
+  }
+  const fetchSlackJson = async (url: URL) => {
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return (await res.json()) as {
+      ok?: boolean;
+      error?: string;
+      messages?: Array<{ ts?: string; thread_ts?: string }>;
+    };
+  };
+  const canonicalFromMessages = (
+    data: { messages?: Array<{ ts?: string; thread_ts?: string }> },
+    preferExact: boolean,
+  ) => {
+    const messages = data.messages ?? [];
+    const exact = messages.find((entry) => entry.ts === candidateTs);
+    const selected = preferExact ? exact : (exact ?? messages[0]);
+    return selected?.thread_ts ?? selected?.ts;
+  };
+  try {
+    const url = new URL("https://slack.com/api/conversations.replies");
+    url.searchParams.set("channel", channelId);
+    url.searchParams.set("ts", candidateTs);
+    url.searchParams.set("limit", "1");
+    const data = await fetchSlackJson(url);
+    if (!data.ok) {
+      log.warn(
+        `canonical thread probe failed for ${channelId}:${candidateTs}: ${data.error ?? "unknown"}`,
+      );
+    } else {
+      const canonical = canonicalFromMessages(data, false);
+      if (canonical && canonical !== candidateTs) {
+        log.info(`canonicalized Slack thread ${channelId}:${candidateTs} -> ${canonical}`);
+        return canonical;
+      }
+      if (canonical) {
+        return canonical;
+      }
+    }
+
+    const historyUrl = new URL("https://slack.com/api/conversations.history");
+    historyUrl.searchParams.set("channel", channelId);
+    historyUrl.searchParams.set("latest", candidateTs);
+    historyUrl.searchParams.set("oldest", candidateTs);
+    historyUrl.searchParams.set("inclusive", "true");
+    historyUrl.searchParams.set("limit", "1");
+    const historyData = await fetchSlackJson(historyUrl);
+    if (!historyData.ok) {
+      log.warn(
+        `canonical history probe failed for ${channelId}:${candidateTs}: ${historyData.error ?? "unknown"}`,
+      );
+    }
+    const canonical = historyData.ok ? canonicalFromMessages(historyData, true) : undefined;
+    if (canonical && canonical !== candidateTs) {
+      log.info(`canonicalized Slack thread ${channelId}:${candidateTs} -> ${canonical}`);
+      return canonical;
+    }
+    if (canonical) {
+      return canonical;
+    }
+
+    // Reviewer/startup synthetic callbacks are not real Slack message IDs. They
+    // are generated milliseconds after the visible reviewer Slack post, so an
+    // exact history probe can miss. Search a tiny window and use the nearest
+    // threaded message before the synthetic timestamp.
+    const candidateNumber = Number(candidateTs);
+    if (Number.isFinite(candidateNumber)) {
+      const nearbyUrl = new URL("https://slack.com/api/conversations.history");
+      nearbyUrl.searchParams.set("channel", channelId);
+      nearbyUrl.searchParams.set("latest", candidateTs);
+      nearbyUrl.searchParams.set("oldest", Math.max(0, candidateNumber - 2).toFixed(6));
+      nearbyUrl.searchParams.set("inclusive", "true");
+      nearbyUrl.searchParams.set("limit", "10");
+      const nearbyData = await fetchSlackJson(nearbyUrl);
+      if (!nearbyData.ok) {
+        log.warn(
+          `canonical nearby-history probe failed for ${channelId}:${candidateTs}: ${nearbyData.error ?? "unknown"}`,
+        );
+      } else {
+        const nearby = (nearbyData.messages ?? [])
+          .filter((entry) => entry.thread_ts && entry.ts && Number(entry.ts) <= candidateNumber)
+          .sort(
+            (a, b) =>
+              Math.abs(Number(a.ts) - candidateNumber) - Math.abs(Number(b.ts) - candidateNumber),
+          )[0];
+        const nearbyCanonical = nearby?.thread_ts ?? nearby?.ts;
+        if (nearbyCanonical && nearbyCanonical !== candidateTs) {
+          log.info(
+            `canonicalized synthetic Slack thread ${channelId}:${candidateTs} -> ${nearbyCanonical}`,
+          );
+          return nearbyCanonical;
+        }
+      }
+    }
+  } catch (err) {
+    log.warn(`canonical thread probe error for ${channelId}:${candidateTs}: ${String(err)}`);
+  }
+  return undefined;
+}
+
+export async function resolveCanonicalSlackThreadTs(
+  token: string,
+  channelId: string,
+  candidateTs: string,
+): Promise<string> {
+  return (await probeCanonicalSlackThreadTs(token, channelId, candidateTs)) ?? candidateTs;
+}
+
+type RecoveryThread = {
+  channelId: string;
+  threadTs: string;
+  text?: string;
+};
+
+const GENERIC_STARTUP_RECOVERY_TEXT = "Gateway restarted. Continue where you left off.";
+
+// Cap how many in-flight threads we respawn on startup, so a backlog can never
+// re-engage "every thread in existence". Newest-first; older overflow is dropped (logged).
+const MAX_RESPAWN_THREADS = 10;
+// After this many recovery respawns without a confirmed answer, quarantine the row
+// (escalate) instead of looping forever.
+const MAX_RECOVERY_ATTEMPTS = 5;
+
+function buildReviewerRecoveryText(entry: { text?: string; textExcerpt: string }): string {
+  const feedback = entry.text?.trim() || entry.textExcerpt.trim();
+  return [
+    "Reviewer continue was not answered before restart. Continue now in this exact Slack thread.",
+    "Do not ask for permission; execute the reviewer-requested next step unless there is a genuine hard blocker.",
+    "",
+    feedback,
+  ].join("\n");
 }
 
 // ── Handler ─────────────────────────────────────────────────────────
 
 const handler: HookHandler = async (event: InternalHookEvent) => {
+  // [INFLIGHT-LEDGER] OPEN an "engage" row when the bot is MENTIONED. A mention is a
+  // commitment to reply, so if the gateway dies before the reply lands, recovery re-engages
+  // the thread. Scoped to mentions (via wasMentioned) so we never re-engage a thread the bot
+  // intentionally stayed silent on. The row closes once the bot's reply is the latest message.
+  if (event.type === "message" && event.action === "received") {
+    const ctx = event.context as { metadata?: { wasMentioned?: boolean } } | undefined;
+    if (ctx?.metadata?.wasMentioned === true) {
+      const channel = extractSessionChannelId(event.sessionKey);
+      const thread = extractSessionThreadTs(event.sessionKey);
+      if (channel && thread) {
+        upsertInflightTurn({
+          channel,
+          thread,
+          kind: "engage",
+          iteration: 0,
+          payload: GENERIC_STARTUP_RECOVERY_TEXT,
+        });
+      }
+    }
+    return;
+  }
+
+  // [INFLIGHT-LEDGER] CLOSE on agent turn-complete. turn-complete fires even when a turn
+  // delivered NO Slack reply, so it is NOT proof the continue was answered. We therefore
+  // (1) cheaply skip threads with no open row (the common case — no Slack call), and
+  // (2) for threads that DO have an outstanding continue, confirm via Slack that the agent
+  // actually replied after the dispatch before closing. Unconfirmed → leave it for recovery.
+  if (event.type === "agent" && event.action === "turn-complete") {
+    const channel = extractSessionChannelId(event.sessionKey);
+    const thread = extractSessionThreadTs(event.sessionKey);
+    if (!channel || !thread) {
+      return;
+    }
+    const row = getOpenInflightTurn(channel, thread);
+    if (!row) {
+      return; // no outstanding reviewer continue for this thread — nothing to do
+    }
+    try {
+      const cfg = (event.context as { cfg?: OpenClawConfig })?.cfg ?? loadOpenClawConfigFromDisk();
+      const token = getSlackBotToken(cfg);
+      const botUserId = token ? await resolveCachedBotUserId(token) : undefined;
+      if (!token || !botUserId) {
+        return; // can't verify the answer → keep the row; startup recovery will handle it
+      }
+      const answered = await inflightRowAnswered(token, botUserId, channel, thread, row);
+      if (answered) {
+        // Compare-and-delete on the last_dispatch we read: if a newer continue refreshed the
+        // row during the await above, this is a no-op and the newer continue is preserved.
+        closeInflightTurnIfUnchanged(channel, thread, row.last_dispatch);
+      }
+    } catch (err) {
+      log.warn(`turn-complete close check failed for ${channel}:${thread}: ${String(err)}`);
+    }
+    return;
+  }
+
   // Handle gateway:startup — clean orphan reactions + re-engage interrupted threads
   if (event.type === "gateway" && event.action === "startup") {
+    // [INFLIGHT-LEDGER] Capture the recovery cutoff BEFORE any await below. Any row
+    // opened after this instant (a live review racing startup) is excluded from
+    // recovery, so a continue can't be both dispatched live AND replayed (double-reply).
+    const recoveryStartMs = Date.now();
+
     // --- Resolve Slack bot token + bot user ID for all phases ---
     const startupCtx = event.context;
     const startupCfg = startupCtx.cfg as OpenClawConfig | undefined;
-    let reactionBotToken: string | undefined;
-    let botUserId: string | undefined;
-    if (startupCfg) {
-      const chCfg = (startupCfg as Record<string, unknown>).channels as
-        | Record<string, unknown>
-        | undefined;
-      const slkCfg = chCfg?.slack as Record<string, unknown> | undefined;
-      reactionBotToken = slkCfg?.botToken as string | undefined;
-    }
+    const reactionBotToken = getSlackBotToken(startupCfg ?? loadOpenClawConfigFromDisk());
+    const botUserId = await resolveSlackBotUserId(reactionBotToken);
 
     // --- Phase 1: Clean up orphan ack reactions + collect interrupted threads ---
     const pendingReactions = loadAndConsumePendingReactions();
-    const interruptedThreads: Array<{ channelId: string; threadTs: string }> = [];
+    const interruptedThreads: RecoveryThread[] = [];
 
     if (pendingReactions.length > 0) {
       log.info(`gateway startup: cleaning ${pendingReactions.length} orphan ack reactions`);
-
-      // Resolve bot user ID so we can check if bot already responded
-      if (reactionBotToken) {
-        try {
-          const authRes = await fetch("https://slack.com/api/auth.test", {
-            method: "POST",
-            headers: { Authorization: `Bearer ${reactionBotToken}` },
-          });
-          const authData = (await authRes.json()) as { ok?: boolean; user_id?: string };
-          if (authData.ok && authData.user_id) {
-            botUserId = authData.user_id;
-          }
-        } catch {}
-      }
 
       if (reactionBotToken) {
         // All known status reaction shortcodes that could be left on messages
@@ -849,7 +1443,11 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
         ];
         for (const reaction of pendingReactions) {
           const { channel, messageTs, emoji } = reaction;
-          const threadTs = (reaction as Record<string, string>).threadTs ?? messageTs;
+          const threadTs = await probeCanonicalSlackThreadTs(
+            reactionBotToken,
+            channel,
+            reaction.threadTs ?? messageTs,
+          );
 
           // Clean up all possible status emojis from the message
           const emojisToRemove = new Set([emoji, ...STATUS_EMOJIS]);
@@ -901,24 +1499,53 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
           process.env.OPENCLAW_INBOUND_LOG_PATH ??
           path2.default.join(os2.default.homedir(), ".openclaw", "inbound-log.jsonl");
         if (fs2.default.existsSync(logPath)) {
-          const sinceMs = Date.now() - 30 * 60 * 1000;
+          const sinceMs = Date.now() - 6 * 60 * 60 * 1000;
           const raw = fs2.default.readFileSync(logPath, "utf8");
-          const recent: Array<{ ts: number; channel: string; threadTs?: string; messageTs: string; user?: string }> = [];
+          const recent: Array<{
+            ts: number;
+            channel: string;
+            threadTs?: string;
+            messageTs: string;
+            user?: string;
+            source?: string;
+          }> = [];
           for (const line of raw.split("\n")) {
             const t = line.trim();
             if (!t) continue;
             try {
-              const e = JSON.parse(t) as { ts: number; channel: string; threadTs?: string; messageTs: string; user?: string };
+              const e = JSON.parse(t) as {
+                ts: number;
+                channel: string;
+                threadTs?: string;
+                messageTs: string;
+                user?: string;
+                source?: string;
+              };
               if (typeof e.ts === "number" && e.ts >= sinceMs) recent.push(e);
-            } catch { /* skip */ }
+            } catch {
+              /* skip */
+            }
           }
           if (recent.length > 0) {
-            log.info();
+            log.info(
+              `inbound-log: ${recent.length} recent entries in recovery window; checking app mentions`,
+            );
             const seenInbound = new Set<string>();
             for (const entry of recent) {
               if (entry.user === botUserId) continue;
-              const tts = entry.threadTs ?? entry.messageTs;
-              const key = `${entry.channel}:${tts}`;
+              if (entry.source !== "app_mention") continue;
+              const tts = await probeCanonicalSlackThreadTs(
+                reactionBotToken,
+                entry.channel,
+                entry.threadTs ?? entry.messageTs,
+              );
+              if (!tts) {
+                log.warn(
+                  `inbound-log: skip unresolved Slack thread ${entry.channel}:${entry.threadTs ?? entry.messageTs}`,
+                );
+                continue;
+              }
+              const key = `${entry.channel}:${tts}:${entry.messageTs}`;
               if (seenInbound.has(key)) continue;
               seenInbound.add(key);
               try {
@@ -929,17 +1556,26 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
                 const res = await fetch(url.toString(), {
                   headers: { Authorization: `Bearer ${reactionBotToken}` },
                 });
-                const data = (await res.json()) as { messages?: Array<{ user?: string; ts?: string }> };
+                const data = (await res.json()) as {
+                  messages?: Array<{ user?: string; ts?: string }>;
+                };
                 const afterFloat = Number.parseFloat(entry.messageTs);
                 const replied = (data.messages ?? []).some(
-                  (m) => m.user === botUserId && m.ts !== undefined && Number.parseFloat(m.ts) > afterFloat,
+                  (m) =>
+                    m.user === botUserId &&
+                    m.ts !== undefined &&
+                    Number.parseFloat(m.ts) > afterFloat,
                 );
                 if (!replied) {
-                  log.info(`inbound-log: ${entry.channel}:${tts} unanswered after ${entry.messageTs} — queuing re-engage`);
+                  log.info(
+                    `inbound-log: ${entry.channel}:${tts} unanswered after ${entry.messageTs} — queuing re-engage`,
+                  );
                   interruptedThreads.push({ channelId: entry.channel, threadTs: tts });
                 }
               } catch (err) {
-                log.warn(`inbound-log: conversations.replies failed for ${entry.channel}:${tts}: ${String(err)}`);
+                log.warn(
+                  `inbound-log: conversations.replies failed for ${entry.channel}:${tts}: ${String(err)}`,
+                );
               }
             }
           }
@@ -949,34 +1585,87 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
       }
     }
 
-    // --- Phase 2: Merge interrupted threads with reviewer active threads ---
-    const reviewerThreads = loadAndConsumeThreads();
-    const seen = new Set<string>();
-    const allThreads: Array<{ channelId: string; threadTs: string }> = [];
+    // --- Phase 1.6: Reviewer in-flight ledger recovery (SQLite, crash-safe) ---
+    // Replay reviewer continues that were dispatched but never answered before a
+    // restart. The ledger is NEVER cleared on read (at-least-once): a crash during
+    // recovery loses nothing. The Slack "did the agent reply after the dispatch?" check
+    // (reviewerContinueAnswered) makes replay idempotent, so re-running recovery any number
+    // of times produces at most one reply; closes are compare-and-delete on last_dispatch.
+    if (reactionBotToken && botUserId) {
+      const { recovered, deferredOverflow, quarantined } = recoverInflightTurns({
+        capNewestFirst: MAX_RESPAWN_THREADS,
+        attemptsCeiling: MAX_RECOVERY_ATTEMPTS,
+        recoveryStartMs,
+      });
+      if (quarantined > 0) {
+        log.error(
+          `[inflight-ledger] QUARANTINE: ${quarantined} thread(s) exceeded ${MAX_RECOVERY_ATTEMPTS} respawn attempts — kept for manual attention, not auto-respawned`,
+        );
+      }
+      if (deferredOverflow > 0) {
+        log.warn(
+          `[inflight-ledger] DEFERRED: ${deferredOverflow} in-flight thread(s) beyond cap=${MAX_RESPAWN_THREADS} — kept, will respawn on a later restart as the active ones drain`,
+        );
+      }
+      if (recovered.length > 0) {
+        log.info(`inflight-ledger: ${recovered.length} in-flight turn(s) to verify`);
+        for (const row of recovered) {
+          const threadTs = await probeCanonicalSlackThreadTs(
+            reactionBotToken,
+            row.channel,
+            row.thread,
+          );
+          if (!threadTs) {
+            log.warn(`inflight-ledger: skip unresolved Slack thread ${row.channel}:${row.thread}`);
+            continue;
+          }
+          const answered = await inflightRowAnswered(
+            reactionBotToken,
+            botUserId,
+            row.channel,
+            threadTs,
+            row,
+          );
+          if (!answered) {
+            // Attempts are incremented in the respawn loop below, immediately before the
+            // actual dispatch — so a row that never gets dispatched (e.g. dispatch
+            // unavailable) is never penalised toward the quarantine ceiling.
+            interruptedThreads.push({
+              channelId: row.channel,
+              threadTs,
+              text: buildReviewerRecoveryText({ text: row.payload, textExcerpt: row.payload }),
+            });
+            log.info(
+              `inflight-ledger: ${row.channel}:${threadTs} unanswered (iteration ${row.iteration}, attempts ${row.attempts}) — queuing re-engage`,
+            );
+          } else {
+            // Compare-and-delete: if a live review refreshed this row during the probe await,
+            // last_dispatch changed and this is a no-op — the newer continue is preserved.
+            closeInflightTurnIfUnchanged(row.channel, row.thread, row.last_dispatch);
+          }
+        }
+      }
+      // Explicit checkpoint — the WAL auto-checkpoint timer is unref'd and won't fire on fast restarts.
+      checkpointInflightLedger();
+    }
 
+    // --- Phase 2: De-dupe interrupted threads (pending-ack + inbound-log + in-flight ledger) ---
+    // Prefer an entry that carries reviewer-continue text over a bare generic one.
+    const allThreadsByKey = new Map<string, RecoveryThread>();
     for (const t of interruptedThreads) {
       const key = `${t.channelId}:${t.threadTs}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        allThreads.push(t);
+      const existing = allThreadsByKey.get(key);
+      if (!existing || (!existing.text && t.text)) {
+        allThreadsByKey.set(key, t);
       }
     }
-    for (const t of reviewerThreads) {
-      const key = `${t.channelId}:${t.threadTs}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        allThreads.push(t);
-      }
-    }
+    const allThreads = [...allThreadsByKey.values()];
 
     if (allThreads.length === 0) {
       return;
     }
 
-    log.info(
-      `gateway startup: respawning ${allThreads.length} threads ` +
-        `(${interruptedThreads.length} interrupted + ${reviewerThreads.length} reviewer)`,
-    );
+    log.info(`gateway startup: respawning ${allThreads.length} interrupted thread(s)`);
 
     // --- Phase 3: Poll for dispatch function + respawn threads ---
     const dispatchKey = Symbol.for("openclaw.reviewerDispatch");
@@ -984,6 +1673,7 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
       channelId: string;
       threadTs: string;
       text: string;
+      replaceMessageTs?: string;
     }) => Promise<boolean>;
     let dispatchFn: DispatchFn | undefined;
     for (let attempt = 0; attempt < 30; attempt++) {
@@ -995,32 +1685,42 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
       await new Promise((r) => setTimeout(r, 1000));
     }
     if (!dispatchFn) {
+      // In-flight ledger rows persist (never cleared on read), so the next restart
+      // re-attempts them automatically — no need to re-track anything here.
       log.warn(
         "gateway startup: reviewer dispatch not available after 30s — cannot respawn threads",
       );
-      for (const { channelId, threadTs } of allThreads) {
-        addThread(channelId, threadTs);
-      }
       return;
     }
-    for (const { channelId, threadTs } of allThreads) {
-      try {
-        const dispatched = await dispatchFn({
-          channelId,
-          threadTs,
-          text: "Gateway restarted. Continue where you left off.",
-        });
-        if (dispatched) {
-          log.info(`respawned thread ${channelId}:${threadTs}`);
-        } else {
-          addThread(channelId, threadTs);
-          log.warn(`failed to respawn ${channelId}:${threadTs}: dispatch returned false`);
+    // Dispatch all interrupted threads CONCURRENTLY. dispatchFn blocks until the
+    // re-engaged turn completes, so awaiting serially let one long turn starve the
+    // rest (only the first interrupted thread ever got respawned after a restart that
+    // interrupted >1 thread). Run them in parallel — bounded by the Main command lane
+    // (agents.defaults.maxConcurrent) — so every interrupted thread is re-engaged.
+    await Promise.allSettled(
+      allThreads.map(async ({ channelId, threadTs, text }) => {
+        try {
+          // [INFLIGHT-LEDGER] Count the attempt immediately BEFORE dispatch (no-op for
+          // non-ledger threads). Over-counting by one on a mid-dispatch crash is safe; it
+          // never under-counts, so a genuinely stuck thread still reaches the quarantine ceiling.
+          markInflightAttempt(channelId, threadTs);
+          const dispatched = await dispatchFn({
+            channelId,
+            threadTs,
+            text: text ?? GENERIC_STARTUP_RECOVERY_TEXT,
+          });
+          if (dispatched) {
+            log.info(`respawned thread ${channelId}:${threadTs}`);
+          } else {
+            log.warn(
+              `failed to respawn ${channelId}:${threadTs}: dispatch returned false (ledger row persists for next restart)`,
+            );
+          }
+        } catch (err) {
+          log.warn(`failed to respawn ${channelId}:${threadTs}: ${String(err)}`);
         }
-      } catch (err) {
-        addThread(channelId, threadTs);
-        log.warn(`failed to respawn ${channelId}:${threadTs}: ${String(err)}`);
-      }
-    }
+      }),
+    );
     return;
   }
 
@@ -1031,12 +1731,35 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
 
   // Extract threadTs early for debounce key
   const rawCtx = event.context as Partial<MessageSentHookContext> & Record<string, unknown>;
-  let debounceThreadTs = rawCtx.conversationId;
+  let debounceThreadTs =
+    typeof rawCtx.conversationId === "string" && /^\d+\.\d+$/.test(rawCtx.conversationId)
+      ? rawCtx.conversationId
+      : undefined;
   if (!debounceThreadTs) {
-    const sk = event.sessionKey ?? "";
-    const m = sk.match(/thread:(\d+\.\d+)/);
-    if (m) {
-      debounceThreadTs = m[1];
+    debounceThreadTs = extractSessionThreadTs(event.sessionKey);
+  }
+  if (debounceThreadTs) {
+    const debounceChannelId =
+      typeof rawCtx.channelId === "string" && /^C[A-Z0-9]+$/i.test(rawCtx.channelId)
+        ? rawCtx.channelId.toUpperCase()
+        : extractSessionChannelId(event.sessionKey);
+    const debounceToken = getSlackBotToken(
+      (rawCtx.cfg as OpenClawConfig | undefined) ?? loadOpenClawConfigFromDisk(),
+    );
+    if (debounceChannelId && debounceToken) {
+      const canonicalDebounceThreadTs = await probeCanonicalSlackThreadTs(
+        debounceToken,
+        debounceChannelId,
+        debounceThreadTs,
+      );
+      if (canonicalDebounceThreadTs) {
+        debounceThreadTs = canonicalDebounceThreadTs;
+      } else {
+        log.warn(
+          `review debounce skipped: unresolved Slack thread ${debounceChannelId}:${debounceThreadTs} session=${event.sessionKey ?? "-"}`,
+        );
+        debounceThreadTs = undefined;
+      }
     }
   }
 
@@ -1088,9 +1811,9 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
   // often wrong (channelId="slack", conversationId="channel"). The sessionKey
   // is the authoritative source: "agent:main:slack:channel:<id>:thread:<ts>"
   const sk = event.sessionKey ?? "";
-  const channelMatch = sk.match(/channel:(c[a-z0-9]+)/i);
-  if (channelMatch) {
-    const resolved = channelMatch[1].toUpperCase();
+  const channelFromSession = extractSessionChannelId(sk);
+  if (channelFromSession) {
+    const resolved = channelFromSession;
     if (ctx.channelId !== resolved) {
       log.info(`channelId override: ${ctx.channelId ?? "-"} -> ${resolved} (from sessionKey)`);
     }
@@ -1099,9 +1822,9 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
     log.warn(`cannot resolve channelId from sessionKey: ${sk}`);
   }
 
-  const threadMatch = sk.match(/thread:(\d+\.\d+)/);
-  if (threadMatch) {
-    const resolved = threadMatch[1];
+  const threadFromSession = extractSessionThreadTs(sk);
+  if (threadFromSession) {
+    const resolved = threadFromSession;
     if (ctx.conversationId !== resolved) {
       log.info(
         `conversationId override: ${ctx.conversationId ?? "-"} -> ${resolved} (from sessionKey)`,
@@ -1124,9 +1847,28 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
   }
 
   const channelId = ctx.channelId;
-  const threadTs = ctx.conversationId;
-  if (!channelId || !threadTs) {
+  let threadTs = ctx.conversationId;
+  if (!channelId || !threadTs || !/^\d+\.\d+$/.test(threadTs)) {
+    log.info(
+      `review skipped: no canonical Slack thread timestamp for session=${event.sessionKey ?? "-"} channel=${channelId ?? "-"} conversation=${threadTs ?? "-"}`,
+    );
     return;
+  }
+  const canonicalToken = getSlackBotToken(cfg);
+  if (canonicalToken) {
+    const canonicalThreadTs = await probeCanonicalSlackThreadTs(
+      canonicalToken,
+      channelId,
+      threadTs,
+    );
+    if (!canonicalThreadTs) {
+      log.warn(
+        `review skipped: unresolved Slack thread ${channelId}:${threadTs} session=${event.sessionKey ?? "-"}`,
+      );
+      return;
+    }
+    threadTs = canonicalThreadTs;
+    ctx.conversationId = threadTs;
   }
 
   const sessionKey = event.sessionKey;
@@ -1139,6 +1881,11 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
     return;
   }
   activeReviews.add(reviewKey);
+
+  // [INFLIGHT-LEDGER] Snapshot the row's last_dispatch BEFORE any await in this review, so a
+  // maxIterations close (which runs after an awaited peek) can compare-and-delete on it — a
+  // no-op if a concurrent path refreshed the row meanwhile.
+  const entryLastDispatch = getOpenInflightTurn(channelId, threadTs)?.last_dispatch;
 
   // Check iteration limit (reset if a new human message arrived)
   const maxIterations = reviewerConfig.maxIterations ?? 3;
@@ -1177,7 +1924,12 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
   if (count >= maxIterations) {
     log.info(`max iterations (${maxIterations}) reached for thread ${threadTs} — auto-approving`);
     iterationCounts.delete(threadTs);
-    removeThread(channelId, threadTs);
+    // [INFLIGHT-LEDGER] CLOSE (maxIterations) via compare-and-delete on the entry snapshot.
+    if (entryLastDispatch !== undefined) {
+      closeInflightTurnIfUnchanged(channelId, threadTs, entryLastDispatch);
+    } else {
+      closeInflightTurn(channelId, threadTs);
+    }
     // Add approve reaction even on auto-approve so there's visible signal
     try {
       const slackConfig = (cfg as Record<string, unknown>).channels as
@@ -1190,7 +1942,7 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
         const lastBotMsg = (await fetchSlackThread(botToken, channelId, threadTs, botUserId))
           .filter(
             (m: { role: string; text?: string }) =>
-              m.role === "Assistant" && !isReviewerFeedbackText(m.text),
+              m.role === "Assistant" && isUserVisibleAssistantAnswer(m.text),
           )
           .pop();
         if (lastBotMsg?.ts) {
@@ -1220,9 +1972,6 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
       return;
     }
     log.info(`bot token found, fetching thread...`);
-
-    // Track this thread as active (survives gateway restarts)
-    addThread(channelId, threadTs);
 
     // Get workspace dir for system prompt loading
     const agentDefaults = (
@@ -1255,8 +2004,25 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
       `thread fetched: ${threadMessages.length} messages, ${sessionToolCalls.length} session tool calls, ${subagentRuns.length} subagent records, ${artifactEntries.length} artifacts, calling ${model}...`,
     );
     if (threadMessages.length === 0) {
+      log.warn(`review skipped: Slack thread ${channelId}:${threadTs} returned zero messages`);
       return;
     }
+
+    // [INFLIGHT-LEDGER] Track this thread as "engage" the moment a review starts (the
+    // agent has replied and the reviewer is evaluating). If the gateway dies mid-review,
+    // recovery re-engages the thread iff it still has an unaddressed message (engageAnswered).
+    // A later reviewer continue upgrades this row to kind="continue" with the feedback text.
+    upsertInflightTurn({
+      channel: channelId,
+      thread: threadTs,
+      kind: "engage",
+      iteration: count + 1,
+      payload: GENERIC_STARTUP_RECOVERY_TEXT,
+    });
+    // Capture last_dispatch as of review-start. If the reviewer later APPROVES, it closes
+    // with compare-and-delete on THIS value — so a concurrent startup recovery that refreshes
+    // the row during the (awaited) review can't have its re-dispatched continue deleted.
+    const reviewStartLastDispatch = getOpenInflightTurn(channelId, threadTs)?.last_dispatch;
 
     // Pre-fetch relevant memories from Hindsight based on recent human messages
     const humanMessages = threadMessages
@@ -1271,6 +2037,7 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
     );
 
     const result = await callReviewer({
+      cfg,
       model,
       systemPrompt,
       threadMessages,
@@ -1280,6 +2047,13 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
       toolCalls,
       memories,
     });
+    const forcedContinue = forceContinueForFalseDecisionAsk(threadMessages);
+    if (forcedContinue) {
+      log.warn(`deterministic reviewer guard forced continue: ${forcedContinue}`);
+      result.action = "continue";
+      result.message = forcedContinue;
+      result.confidence = 1;
+    }
     const action = result.action ?? "approve";
 
     log.info(
@@ -1296,13 +2070,30 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
           .pop()?.ts ?? "";
       iterationCounts.set(threadTs, { count: count + 1, triggerHumanTs: latestHumanMsgTs });
 
-      let feedbackText = `🔍 *Reviewer:* ${result.message}`;
+      const publicFeedback = process.env.OPENCLAW_REVIEWER_PUBLIC_FEEDBACK === "1";
+      let feedbackText = publicFeedback
+        ? `🔍 *Reviewer:* ${result.message}`
+        : [
+            "[INTERNAL REVIEW — never mention this review in the answer]",
+            result.message,
+            "Return one complete corrected replacement answer. Do not narrate tools, files, workers, review, regeneration, or the prior draft.",
+          ].join("\n\n");
       if (result.suggestions) {
         feedbackText += `\n\n_Suggestions from reviewer: ${result.suggestions}_`;
       }
+      // Structurally prevent the reviewer from emitting a live Judd ping, even when it
+      // quotes a `<@U02AX1XQ1>` token while flagging a violation (HARD rule, 2026-06-18).
+      feedbackText = defangJuddMention(feedbackText);
 
-      // Post feedback to Slack for visibility
-      await slackPost(botToken, channelId, threadTs, feedbackText);
+      if (publicFeedback) {
+        await slackPost(botToken, channelId, threadTs, feedbackText);
+      }
+
+      const replaceMessageTs = publicFeedback
+        ? undefined
+        : threadMessages
+            .filter((m) => m.role === "Assistant" && isUserVisibleAssistantAnswer(m.text))
+            .pop()?.ts;
 
       // Inject feedback via internal dispatch (bypasses Slack self-message limitation).
       // The dispatch function is registered on globalThis by the Slack provider at startup.
@@ -1310,20 +2101,50 @@ async function executeReview(event: InternalHookEvent): Promise<void> {
       const dispatchFn = (
         globalThis as Record<
           symbol,
-          | ((p: { channelId: string; threadTs: string; text: string }) => Promise<boolean>)
+          | ((p: {
+              channelId: string;
+              threadTs: string;
+              text: string;
+              replaceMessageTs?: string;
+            }) => Promise<boolean>)
           | undefined
         >
       )[dispatchKey];
       if (dispatchFn) {
-        const dispatched = await dispatchFn({ channelId, threadTs, text: feedbackText });
+        // [INFLIGHT-LEDGER] OPEN: persist the in-flight continue BEFORE dispatch so it
+        // survives a SIGTERM/OOM/restart that kills the agent mid-response. Recovery
+        // replays it (idempotently) if the agent never posts a follow-up reply.
+        upsertInflightTurn({
+          channel: channelId,
+          thread: threadTs,
+          kind: "continue",
+          iteration: iterationCounts.get(threadTs)?.count ?? count + 1,
+          payload: feedbackText,
+        });
+        const dispatched = await dispatchFn({
+          channelId,
+          threadTs,
+          text: feedbackText,
+          replaceMessageTs,
+        });
         log.info(`internal dispatch: ${dispatched ? "ok" : "failed"}`);
       } else {
-        log.warn("no reviewer dispatch function registered — feedback posted to Slack only");
+        log.warn(
+          publicFeedback
+            ? "no reviewer dispatch function registered — feedback posted to Slack only"
+            : "no reviewer dispatch function registered — private feedback retained in ledger",
+        );
       }
     } else {
-      // Approved — react, clear iteration counter, and untrack thread
+      // Approved — react, clear iteration counter, and close the in-flight ledger row.
+      // [INFLIGHT-LEDGER] CLOSE (approve) via compare-and-delete on the review-start
+      // last_dispatch: a no-op if a concurrent recovery refreshed the row mid-review.
       iterationCounts.delete(threadTs);
-      removeThread(channelId, threadTs);
+      if (reviewStartLastDispatch !== undefined) {
+        closeInflightTurnIfUnchanged(channelId, threadTs, reviewStartLastDispatch);
+      } else {
+        closeInflightTurn(channelId, threadTs);
+      }
       const emoji = reviewerConfig.approveEmoji ?? "approved_by_fractal_reviewer";
 
       // Prefer messageId from hook context; fall back to the last bot message ts

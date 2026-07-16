@@ -464,6 +464,8 @@ export type ChannelThreadingToolContext = {
   currentChannelProvider?: ChannelId;
   currentThreadTs?: string;
   currentMessageId?: string | number;
+  /** Existing source message to replace instead of creating another reply. */
+  currentReplaceMessageTs?: string;
   replyToMode?: "off" | "first" | "all" | "batched";
   hasRepliedRef?: { value: boolean };
   /**

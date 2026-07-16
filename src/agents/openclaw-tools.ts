@@ -101,6 +101,8 @@ export function createOpenClawTools(
     currentThreadTs?: string;
     /** Current inbound message id for action fallbacks. */
     currentMessageId?: string | number;
+    /** Existing source message to replace instead of creating another reply. */
+    currentReplaceMessageTs?: string;
     /** Reply-to mode for auto-threading. */
     replyToMode?: "off" | "first" | "all" | "batched";
     /** Mutable ref to track if a reply was sent (for "first" mode). */
@@ -296,6 +298,7 @@ export function createOpenClawTools(
         currentThreadTs: options?.currentThreadTs,
         agentThreadId: options?.agentThreadId,
         currentMessageId: options?.currentMessageId,
+        currentReplaceMessageTs: options?.currentReplaceMessageTs,
         replyToMode: options?.replyToMode,
         hasRepliedRef: options?.hasRepliedRef,
         sandboxRoot: options?.sandboxRoot,
@@ -425,6 +428,8 @@ export function createOpenClawTools(
     createSessionsYieldTool({
       sessionId: options?.sessionId,
       onYield: options?.onYield,
+      sourceReplyDeliveryMode: options?.sourceReplyDeliveryMode,
+      hasRepliedRef: options?.hasRepliedRef,
     }),
     createSubagentsTool({
       agentSessionKey: options?.agentSessionKey,

@@ -18,6 +18,11 @@ type SlackActionInvoke = (
   toolContext?: ChannelMessageActionContext["toolContext"],
 ) => Promise<AgentToolResult<unknown>>;
 
+function isSlackChannelTarget(value: string | undefined): boolean {
+  const normalized = value?.trim().replace(/^channel:/i, "");
+  return Boolean(normalized && /^C[A-Z0-9]+$/i.test(normalized));
+}
+
 /** Translate generic channel action requests into Slack-specific tool invocations and payload shapes. */
 export async function handleSlackMessageAction(params: {
   providerId: string;
@@ -67,6 +72,31 @@ export async function handleSlackMessageAction(params: {
     const replyTo = readStringParam(actionParams, "replyTo");
     const topLevel =
       readBooleanParam(actionParams, "topLevel") === true || actionParams.threadId === null;
+    const ambientThreadTs =
+      topLevel || actionParams.replyTo === null ? undefined : ctx.toolContext?.currentThreadTs;
+    const finalThreadTs = topLevel
+      ? undefined
+      : (threadId ?? ambientThreadTs ?? replyTo ?? undefined);
+    if (
+      !topLevel &&
+      isSlackChannelTarget(to) &&
+      ctx.toolContext?.currentChannelId &&
+      !finalThreadTs
+    ) {
+      console.warn(
+        `[slack/message-action] send without threadTs to=${to} action=${action} currentThreadTs=${ctx.toolContext?.currentThreadTs ?? "-"} currentChannelId=${ctx.toolContext?.currentChannelId ?? "-"} replyToMode=${ctx.toolContext?.replyToMode ?? "-"} threadId=${threadId ?? "-"} replyTo=${replyTo ?? "-"}`,
+      );
+    } else if (
+      !topLevel &&
+      isSlackChannelTarget(to) &&
+      ctx.toolContext?.currentThreadTs &&
+      finalThreadTs &&
+      finalThreadTs !== ctx.toolContext.currentThreadTs
+    ) {
+      console.warn(
+        `[slack/message-action] send threadTs differs from ambient thread to=${to} finalThreadTs=${finalThreadTs} currentThreadTs=${ctx.toolContext.currentThreadTs} threadId=${threadId ?? "-"} replyTo=${replyTo ?? "-"}`,
+      );
+    }
     return await invoke(
       {
         action: "sendMessage",
@@ -74,7 +104,7 @@ export async function handleSlackMessageAction(params: {
         content: content ?? "",
         mediaUrl: mediaUrl ?? undefined,
         accountId,
-        threadTs: threadId ?? replyTo ?? undefined,
+        threadTs: finalThreadTs,
         ...(topLevel ? { topLevel: true } : {}),
         ...(replyBroadcast ? { replyBroadcast } : {}),
         ...(blocks ? { blocks } : {}),

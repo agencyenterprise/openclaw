@@ -127,6 +127,11 @@ export const DEFAULT_NOTIFY_TAIL_CHARS = 400;
 const DEFAULT_NOTIFY_SNIPPET_CHARS = 180;
 export const DEFAULT_APPROVAL_TIMEOUT_MS = DEFAULT_EXEC_APPROVAL_TIMEOUT_MS;
 export const DEFAULT_APPROVAL_REQUEST_TIMEOUT_MS = DEFAULT_APPROVAL_TIMEOUT_MS + 10_000;
+// Hard cap for a FOREGROUND (blocking) exec command that the model ran without an
+// explicit timeoutSec. Without this a hung command (e.g. `grep -r` blocked on a fifo
+// or scanning a huge dir at 0% CPU) freezes the whole turn indefinitely. Background/
+// yielding commands stay uncapped; the model can override with an explicit timeoutSec.
+export const DEFAULT_FOREGROUND_EXEC_TIMEOUT_MS = 300_000;
 const DEFAULT_APPROVAL_RUNNING_NOTICE_MS = 10_000;
 const APPROVAL_SLUG_LENGTH = 8;
 
@@ -722,7 +727,9 @@ export async function runExecProcess(opts: {
   const timeoutMs =
     typeof opts.timeoutSec === "number" && opts.timeoutSec > 0
       ? Math.floor(opts.timeoutSec * 1000)
-      : undefined;
+      : opts.notifyOnExit
+        ? undefined
+        : DEFAULT_FOREGROUND_EXEC_TIMEOUT_MS;
   let sandboxFinalizeToken: unknown;
 
   const spawnSpec:

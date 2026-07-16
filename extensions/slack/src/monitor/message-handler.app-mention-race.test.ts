@@ -112,6 +112,17 @@ async function sendMentionEvent(handler: ReturnType<typeof createTestHandler>, t
   });
 }
 
+async function sendSyntheticReviewerEvent(
+  handler: ReturnType<typeof createTestHandler>,
+  ts: string,
+) {
+  await handler(createSlackEvent({ type: "message", ts, text: "Reviewer feedback" }), {
+    source: "message",
+    wasMentioned: true,
+    bypassSeen: true,
+  });
+}
+
 async function createInFlightMessageScenario(ts: string) {
   let resolveMessagePrepare: ((value: unknown) => void) | undefined;
   const messagePrepare = new Promise<unknown>((resolve) => {
@@ -200,6 +211,18 @@ describe("createSlackMessageHandler app_mention race handling", () => {
 
     expect(prepareSlackMessageMock).toHaveBeenCalledTimes(1);
     expect(dispatchPreparedSlackMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets synthetic reviewer dispatch reuse a thread-root ts", async () => {
+    prepareSlackMessageMock.mockResolvedValue({ ctxPayload: {} });
+
+    const handler = createTestHandler();
+
+    await sendSyntheticReviewerEvent(handler, "1700000000.000400");
+    await sendSyntheticReviewerEvent(handler, "1700000000.000400");
+
+    expect(prepareSlackMessageMock).toHaveBeenCalledTimes(2);
+    expect(dispatchPreparedSlackMessageMock).toHaveBeenCalledTimes(2);
   });
 
   it("retries message replay after an explicit retryable dispatch failure", async () => {

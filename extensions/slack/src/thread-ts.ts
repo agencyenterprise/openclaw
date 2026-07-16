@@ -17,7 +17,7 @@ export function resolveSlackThreadTsValue(params: {
   threadId?: string | number | null;
 }): string | undefined {
   return (
-    normalizeSlackThreadTsCandidate(params.replyToId) ??
-    normalizeSlackThreadTsCandidate(params.threadId)
+    normalizeSlackThreadTsCandidate(params.threadId) ??
+    normalizeSlackThreadTsCandidate(params.replyToId)
   );
 }

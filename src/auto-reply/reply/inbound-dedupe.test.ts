@@ -67,6 +67,25 @@ describe("inbound dedupe", () => {
     );
   });
 
+  it("uses an explicit dedupe id without replacing the provider message id", () => {
+    const reviewerOne = {
+      ...sharedInboundContext,
+      MessageSid: "root-message",
+      DedupeMessageSid: "reviewer:root-message:one",
+    };
+    const reviewerTwo = {
+      ...sharedInboundContext,
+      MessageSid: "root-message",
+      DedupeMessageSid: "reviewer:root-message:two",
+    };
+
+    expect(buildInboundDedupeKey(reviewerOne)).not.toBe(
+      buildInboundDedupeKey({ ...reviewerOne, DedupeMessageSid: undefined }),
+    );
+    expect(buildInboundDedupeKey(reviewerOne)).not.toBe(buildInboundDedupeKey(reviewerTwo));
+    expect(buildInboundDedupeKey(reviewerOne)).toContain("reviewer:root-message:one");
+  });
+
   it("shares claim/release state across distinct module instances", async () => {
     const expectedKey = buildInboundDedupeKey(sharedInboundContext);
     if (!expectedKey) {
