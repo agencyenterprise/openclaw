@@ -1306,7 +1306,8 @@ describe("Slack App Home command presentation", () => {
       mode: "single",
       name: "acme",
     });
-    expect(harness.commands.size).toBe(1);
+    expect(harness.commands.size).toBe(2);
+    expect(harness.commands.has("/foundry")).toBe(true);
   });
 
   it("omits the single command when slash commands are disabled", async () => {
@@ -1315,7 +1316,36 @@ describe("Slack App Home command presentation", () => {
     await expect(registerCommands(harness.ctx, harness.account)).resolves.toEqual({
       mode: "disabled",
     });
-    expect(harness.commands.size).toBe(0);
+    expect(harness.commands.size).toBe(1);
+    expect(harness.commands.has("/foundry")).toBe(true);
+  });
+
+  it("registers `/foundry` and returns a compact ephemeral portfolio report", async () => {
+    const harness = createArgMenusHarness();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        n: 3,
+        counts: { running: 2, complete: 1 },
+        report: "Two experiments are running; one is complete.",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await registerCommands(harness.ctx, harness.account);
+      const handler = requireHandler(harness.commands, "/foundry", "Foundry command");
+      const { ack, respond } = await runCommandHandler(handler);
+
+      expect(ack).toHaveBeenCalledOnce();
+      expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8788/api/status_report");
+      expect(respond).toHaveBeenCalledWith({
+        response_type: "ephemeral",
+        text: expect.stringContaining("*Foundry — portfolio status* · 3 experiments"),
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("omits the single command when native commands take precedence", async () => {

@@ -711,10 +711,10 @@ describe("tool descriptions", () => {
     expect(processWithCron.description).toContain("completion without auto-wake");
     expect(processWithCron.description).toContain("write, send-keys, submit, paste, kill");
     expect(execWithCron.description).toContain(
-      "No sleep/delay loops for reminders/follow-ups; use cron.",
+      "No sleep/delay loops for reminders, deferred follow-ups, or visible update cadence; use cron.",
     );
     expect(processWithCron.description).toContain(
-      "No polling as timer/reminder; scheduled follow-up uses cron.",
+      "No polling as a timer, reminder, or visible update cadence; use cron for scheduled follow-ups and recurring update monitors.",
     );
     expect(execTool.description).not.toContain("use cron instead");
     expect(processTool.description).not.toContain("scheduled follow-ups");

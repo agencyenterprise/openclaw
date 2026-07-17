@@ -38,6 +38,9 @@ type InboundDedupeClaimResult =
 const resolveInboundPeerId = (ctx: MsgContext) =>
   ctx.OriginatingTo ?? ctx.To ?? ctx.From ?? ctx.SessionKey;
 
+const resolveInboundDedupeMessageId = (ctx: MsgContext) =>
+  normalizeOptionalString(ctx.DedupeMessageSid) ?? normalizeOptionalString(ctx.MessageSid);
+
 function resolveInboundDedupeSessionScope(ctx: MsgContext): string {
   const sessionKey =
     resolveCommandTurnTargetSessionKey(ctx) || normalizeOptionalString(ctx.SessionKey) || "";
@@ -56,7 +59,7 @@ function resolveInboundDedupeSessionScope(ctx: MsgContext): string {
 function buildInboundDedupeKey(ctx: MsgContext): string | null {
   const provider =
     normalizeOptionalLowercaseString(ctx.OriginatingChannel ?? ctx.Provider ?? ctx.Surface) || "";
-  const messageId = normalizeOptionalString(ctx.MessageSid);
+  const messageId = resolveInboundDedupeMessageId(ctx);
   if (!provider || !messageId) {
     return null;
   }

@@ -24,7 +24,9 @@ export function describeExecTool(params?: { agentId?: string; hasCronTool?: bool
     "Run shell now; background continuation supported.",
     "Use yieldMs/background, then process for logs/status/input/intervention.",
     "Long run: automatic completion wake when enabled and output/failure occurs; otherwise process confirms completion.",
-    params?.hasCronTool ? "No sleep/delay loops for reminders/follow-ups; use cron." : undefined,
+    params?.hasCronTool
+      ? "No sleep/delay loops for reminders, deferred follow-ups, or visible update cadence; use cron."
+      : undefined,
     "TTY CLI/UI/coding agent: pty=true.",
   ]
     .filter(Boolean)
@@ -73,7 +75,7 @@ export function describeProcessTool(params?: { hasCronTool?: boolean }): string 
     "Control existing exec: list, poll, log, write, send-keys, submit, paste, kill.",
     "poll/log: status, output, quiet success, completion without auto-wake, input hints. Others: input/intervention.",
     params?.hasCronTool
-      ? "No polling as timer/reminder; scheduled follow-up uses cron."
+      ? "No polling as a timer, reminder, or visible update cadence; use cron for scheduled follow-ups and recurring update monitors."
       : undefined,
   ]
     .filter(Boolean)

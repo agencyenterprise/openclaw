@@ -16,6 +16,7 @@ import type { SlackAppMentionEvent, SlackMessageEvent } from "../../types.js";
 import { normalizeSlackChannelType } from "../channel-type.js";
 import type { SlackMonitorContext } from "../context.js";
 import { resolveSlackEventScope, type SlackEventScope } from "../event-scope.js";
+import { appendSlackInboundRecoveryLog } from "../inbound-recovery-log.js";
 import type { SlackMessageHandler } from "../message-handler.js";
 import type { SlackMessageChangedEvent } from "../types.js";
 import { resolveSlackMessageSubtypeHandler } from "./message-subtype-handlers.js";
@@ -308,6 +309,21 @@ export function registerSlackMessageEvents(params: {
         const channelType = normalizeSlackChannelType(mention.channel_type, mention.channel);
         if (channelType === "im" || channelType === "mpim") {
           return;
+        }
+
+        const mentionTs = asString(mention.ts);
+        if (
+          mentionTs &&
+          !appendSlackInboundRecoveryLog({
+            channel: mention.channel,
+            threadTs: asString(mention.thread_ts),
+            messageTs: mentionTs,
+            user: asString(mention.user),
+            textLen: asString(mention.text)?.length ?? 0,
+            source: "app_mention",
+          })
+        ) {
+          slackInboundLog.warn("failed to append Slack inbound recovery record");
         }
 
         // Emit a per-inbound receipt before dispatch so a silently-dropped mention

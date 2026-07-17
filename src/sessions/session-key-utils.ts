@@ -35,6 +35,18 @@ export type RawSessionConversationRef = {
   prefix: string;
 };
 
+const REVIEWER_SYNTHETIC_THREAD_ID_RE = /^reviewer:[^:]+:(\d+\.\d+)(?::|$)/i;
+
+function canonicalizeThreadSessionId(threadId: string | undefined): string | undefined {
+  if (!threadId) {
+    return undefined;
+  }
+  // Reviewer continuations use synthetic message ids for inbound dedupe; if one
+  // escapes into a session suffix, preserve the real Slack thread root inside it.
+  const reviewerSyntheticThreadId = threadId.match(REVIEWER_SYNTHETIC_THREAD_ID_RE)?.[1];
+  return reviewerSyntheticThreadId ?? threadId;
+}
+
 /**
  * Generic, opt-in case-preservation policy for session-key peer IDs.
  *
@@ -381,7 +393,7 @@ export function parseThreadSessionSuffix(
 
   const baseSessionKey = markerIndex === -1 ? raw : raw.slice(0, markerIndex);
   const threadIdRaw = markerIndex === -1 ? undefined : raw.slice(markerIndex + marker.length);
-  const threadId = normalizeOptionalString(threadIdRaw);
+  const threadId = canonicalizeThreadSessionId(normalizeOptionalString(threadIdRaw));
 
   return { baseSessionKey, threadId };
 }

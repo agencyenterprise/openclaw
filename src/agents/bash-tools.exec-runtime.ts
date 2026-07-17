@@ -61,9 +61,14 @@ export { execSchema } from "./bash-tools.schemas.js";
 const SMKX = "\x1b[?1h";
 const RMKX = "\x1b[?1l";
 
-function resolveExecTimeoutMs(timeoutSec: number | null | undefined): number | undefined {
+export const DEFAULT_FOREGROUND_EXEC_TIMEOUT_MS = 300_000;
+
+export function resolveExecTimeoutMs(
+  timeoutSec: number | null | undefined,
+  notifyOnExit = false,
+): number | undefined {
   if (typeof timeoutSec !== "number" || !Number.isFinite(timeoutSec) || timeoutSec <= 0) {
-    return undefined;
+    return notifyOnExit ? undefined : DEFAULT_FOREGROUND_EXEC_TIMEOUT_MS;
   }
   return resolveSafeTimeoutDelayMs(timeoutSec * 1000);
 }
@@ -709,7 +714,7 @@ export async function runExecProcess(opts: {
     }
   };
 
-  const timeoutMs = resolveExecTimeoutMs(opts.timeoutSec);
+  const timeoutMs = resolveExecTimeoutMs(opts.timeoutSec, opts.notifyOnExit);
   let sandboxFinalizeToken: unknown;
   let sandboxFinalized = false;
   const finalizeSandboxExec = async (params: {

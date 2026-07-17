@@ -140,6 +140,8 @@ export function createOpenClawTools(
     currentThreadTs?: string;
     /** Current inbound message id for action fallbacks. */
     currentMessageId?: string | number;
+    /** Existing source Slack message to replace instead of adding another reply. */
+    currentReplaceMessageTs?: string;
     /** True when the current inbound turn carried audio media. */
     currentInboundAudio?: boolean;
     /** Dynamic audio state for runs that can accept steered input after tool creation. */
@@ -388,6 +390,7 @@ export function createOpenClawTools(
         hasCurrentInboundAudio: options?.hasCurrentInboundAudio,
         agentThreadId: options?.agentThreadId,
         currentMessageId: options?.currentMessageId,
+        currentReplaceMessageTs: options?.currentReplaceMessageTs,
         replyToMode: options?.replyToMode,
         hasRepliedRef: options?.hasRepliedRef,
         sameChannelThreadRequired: options?.sameChannelThreadRequired,
@@ -613,6 +616,8 @@ export function createOpenClawTools(
     createSessionsYieldTool({
       sessionId: options?.sessionId,
       onYield: options?.onYield,
+      sourceReplyDeliveryMode: options?.sourceReplyDeliveryMode,
+      hasRepliedRef: options?.hasRepliedRef,
     }),
     createSubagentsTool({
       agentSessionKey: options?.agentSessionKey,

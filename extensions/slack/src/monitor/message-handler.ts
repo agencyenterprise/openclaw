@@ -40,6 +40,8 @@ export type SlackMessageHandler = (
     eventScope?: SlackEventScope;
     /** Wait until any inbound debounce flush and dispatch has completed. */
     awaitDispatch?: boolean;
+    /** Trusted in-process reviewer continuation; bypasses only Slack ingress replay/debounce. */
+    reviewerSynthetic?: boolean;
   },
 ) => Promise<void>;
 
@@ -405,7 +407,10 @@ export function createSlackMessageHandler(params: {
       message.ts,
       opts.eventScope?.teamId,
     );
+    const reviewerSynthetic =
+      opts.reviewerSynthetic === true && Boolean(message.openclaw_synthetic_message_id);
     if (
+      !reviewerSynthetic &&
       seenMessageKey &&
       (await hasSlackInboundMessageDelivery({
         accountId: ctx.accountId,
@@ -416,15 +421,16 @@ export function createSlackMessageHandler(params: {
     ) {
       return undefined;
     }
-    const wasSeen = seenMessageKey
-      ? ctx.markMessageSeen(message.channel, message.ts, opts.eventScope)
-      : false;
-    if (seenMessageKey && opts.source === "message" && !wasSeen) {
+    const wasSeen =
+      !reviewerSynthetic && seenMessageKey
+        ? ctx.markMessageSeen(message.channel, message.ts, opts.eventScope)
+        : false;
+    if (!reviewerSynthetic && seenMessageKey && opts.source === "message" && !wasSeen) {
       // Prime exactly one fallback app_mention allowance immediately so a near-simultaneous
       // app_mention is not dropped while message handling is still in-flight.
       rememberAppMentionRetryKey(seenMessageKey);
     }
-    if (seenMessageKey && wasSeen) {
+    if (!reviewerSynthetic && seenMessageKey && wasSeen) {
       // Allow exactly one app_mention retry if the same ts was previously dropped
       // from the message stream before it reached dispatch.
       if (opts.source !== "app_mention" || !consumeAppMentionRetryKey(seenMessageKey)) {
@@ -445,7 +451,10 @@ export function createSlackMessageHandler(params: {
       teamId,
     );
     const canDebounce =
-      !opts.eventScope && debounceMs > 0 && shouldDebounceSlackMessage(resolvedMessage, ctx.cfg);
+      !reviewerSynthetic &&
+      !opts.eventScope &&
+      debounceMs > 0 &&
+      shouldDebounceSlackMessage(resolvedMessage, ctx.cfg);
     if (!canDebounce && conversationKey) {
       const pendingKeys = pendingTopLevelDebounceKeys.get(conversationKey);
       if (pendingKeys && pendingKeys.size > 0) {

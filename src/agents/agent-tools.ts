@@ -365,6 +365,8 @@ type OpenClawCodingToolsOptions = {
   channelContext?: PluginHookChannelContext;
   /** Current thread timestamp for auto-threading (Slack). */
   currentThreadTs?: string;
+  /** Existing Slack message to replace during a private reviewer correction. */
+  currentReplaceMessageTs?: string;
   /** Current inbound message id for action fallbacks (e.g. Telegram react). */
   currentMessageId?: string | number;
   /** True when the current inbound turn carried audio media. */
@@ -972,6 +974,7 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
             currentMessagingTarget: options?.currentMessagingTarget,
             currentThreadTs: options?.currentThreadTs,
             currentMessageId: options?.currentMessageId,
+            currentReplaceMessageTs: options?.currentReplaceMessageTs,
             currentInboundAudio: options?.currentInboundAudio,
             hasCurrentInboundAudio: options?.hasCurrentInboundAudio,
             modelProvider: options?.modelProvider,

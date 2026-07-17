@@ -911,6 +911,39 @@ export async function registerSlackMonitorSlashCommands(params: {
     logVerbose("slack: slash commands disabled");
   }
 
+  // Fractal Foundry: keep the lightweight portfolio status command alongside
+  // whichever OpenClaw command mode is active. Register it after OpenClaw's
+  // primary handlers so generic dispatch harnesses retain the primary command.
+  ctx.app.command("/foundry", async ({ ack, respond }: SlackCommandMiddlewareArgs) => {
+    await ack("🔎 Reading every experiment fresh from the board — status in ~30–60s…");
+    try {
+      const response = await fetch("http://127.0.0.1:8788/api/status_report");
+      if (!response.ok) {
+        throw new Error(`Foundry HTTP ${response.status}`);
+      }
+      const data = (await response.json()) as {
+        n?: number;
+        counts?: Record<string, number>;
+        report?: string;
+      };
+      const counts = data.counts
+        ? Object.entries(data.counts)
+            .toSorted((a, b) => b[1] - a[1])
+            .map(([label, count]) => `${count} ${label}`)
+            .join(" · ")
+        : "";
+      const header = `*Foundry — portfolio status* · ${data.n ?? "?"} experiments${counts ? ` · ${counts}` : ""}`;
+      const rawReport = (data.report ?? "(no report)").trim();
+      const report = rawReport.length > 3600 ? `${rawReport.slice(0, 3600)}…` : rawReport;
+      await respond({ response_type: "ephemeral", text: `${header}\n\n${report}` });
+    } catch (err) {
+      await respond({
+        response_type: "ephemeral",
+        text: `⚠️ Couldn't reach Foundry: ${formatErrorMessage(err)}`,
+      });
+    }
+  });
+
   const registration: SlackCommandRegistration =
     nativeCommands.length > 0
       ? { mode: "native" }

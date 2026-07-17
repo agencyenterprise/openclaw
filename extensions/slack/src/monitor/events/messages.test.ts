@@ -7,10 +7,11 @@ import {
   type SlackSystemEventTestOverrides,
 } from "./system-event-test-harness.js";
 
-const { messageQueueMock, messageAllowMock, inboundInfoSpy } = vi.hoisted(() => ({
+const { messageQueueMock, messageAllowMock, inboundInfoSpy, recoveryLogMock } = vi.hoisted(() => ({
   messageQueueMock: vi.fn(),
   messageAllowMock: vi.fn(),
   inboundInfoSpy: vi.fn(),
+  recoveryLogMock: vi.fn(() => true),
 }));
 
 vi.mock("openclaw/plugin-sdk/runtime-env", async (importOriginal) => {
@@ -38,6 +39,9 @@ vi.mock("openclaw/plugin-sdk/system-event-runtime", () => ({
 }));
 vi.mock("openclaw/plugin-sdk/system-event-runtime.js", () => ({
   enqueueSystemEvent: (...args: unknown[]) => messageQueueMock(...args),
+}));
+vi.mock("../inbound-recovery-log.js", () => ({
+  appendSlackInboundRecoveryLog: (...args: unknown[]) => recoveryLogMock(...args),
 }));
 vi.mock("openclaw/plugin-sdk/conversation-runtime", async (importOriginal) => {
   const actual = await importOriginal<typeof import("openclaw/plugin-sdk/conversation-runtime")>();
@@ -124,6 +128,7 @@ beforeAll(async () => {
 beforeEach(() => {
   resetMessageMocks();
   inboundInfoSpy.mockClear();
+  recoveryLogMock.mockClear();
 });
 
 function makeChangedEvent(overrides?: { channel?: string; user?: string }) {
@@ -683,6 +688,14 @@ describe("registerSlackMessageEvents", () => {
     });
 
     expect(handleSlackMessage).toHaveBeenCalledTimes(1);
+    expect(recoveryLogMock).toHaveBeenCalledWith({
+      channel: "C123",
+      threadTs: undefined,
+      messageTs: "123.789",
+      user: "U1",
+      textLen: 14,
+      source: "app_mention",
+    });
     expect(inboundLogLines()).toEqual([
       "Inbound app_mention slack:T_TEST:channel:C123:user:U1 -> bot:U_BOT (channel, 14 chars)",
     ]);

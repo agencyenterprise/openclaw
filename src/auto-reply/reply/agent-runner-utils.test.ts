@@ -455,6 +455,7 @@ describe("agent-runner-utils", () => {
         OriginatingTo: "telegram:-1003841603622",
         MessageThreadId: 928,
         MessageSid: "2284",
+        ReplaceMessageTs: "2290",
       },
       config: { channels: { telegram: { allowFrom: ["*"] } } },
       hasRepliedRef: undefined,
@@ -463,6 +464,7 @@ describe("agent-runner-utils", () => {
     expect(context.currentChannelId).toBe("telegram:-1003841603622");
     expect(context.currentThreadTs).toBe("928");
     expect(context.currentMessageId).toBe("2284");
+    expect(context.currentReplaceMessageTs).toBe("2290");
   });
 
   it("uses OriginatingTo for threading tool context on discord native commands", () => {

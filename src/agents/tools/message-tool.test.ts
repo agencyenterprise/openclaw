@@ -134,6 +134,7 @@ vi.mock("../../channels/plugins/bundled.js", async () => {
 });
 
 type RunMessageActionInput = {
+  action?: string;
   agentId?: string;
   cfg?: unknown;
   conversationReadOrigin?: "delegated" | "direct-operator";
@@ -1737,6 +1738,246 @@ describe("message tool agent routing", () => {
       action: "send",
       channel: "slack",
       message: "stay in thread",
+    });
+
+    const call = firstRunMessageActionInput();
+    expect(call?.toolContext?.currentThreadTs).toBe("111.222");
+    expect(call?.toolContext?.replyToMode).toBe("all");
+  });
+
+  it("derives the ambient Slack thread from the session key when agentThreadId is absent", async () => {
+    mockSendResult({ channel: "slack", to: "channel:C123" });
+
+    const tool = createMessageTool({
+      agentSessionKey: "agent:main:slack:channel:c123:thread:111.222",
+      config: {} as never,
+      currentChannelProvider: "slack",
+      currentChannelId: "channel:C123",
+      currentMessageId: "999.000",
+      runMessageAction: mocks.runMessageAction as never,
+    });
+
+    await tool.execute("1", {
+      action: "send",
+      channel: "slack",
+      message: "route from session suffix",
+    });
+
+    const call = firstRunMessageActionInput();
+    expect(call?.toolContext?.currentThreadTs).toBe("111.222");
+    expect(call?.toolContext?.replyToMode).toBe("all");
+  });
+
+  it("injects the Slack session thread into current-source sends", async () => {
+    mockSendResult({ channel: "slack", to: "channel:C123" });
+
+    const tool = createMessageTool({
+      agentSessionKey: "agent:main:slack:channel:c123:thread:111.222",
+      config: {} as never,
+      currentChannelProvider: "slack",
+      currentChannelId: "channel:C123",
+      currentMessageId: "999.000",
+      runMessageAction: mocks.runMessageAction as never,
+    });
+
+    await tool.execute("1", {
+      action: "send",
+      channel: "slack",
+      message: "bind this to the source thread",
+    });
+
+    const call = firstRunMessageActionInput();
+    expect(call?.params?.threadId).toBe("111.222");
+  });
+
+  it("does not inject the Slack session thread for explicit top-level sends", async () => {
+    mockSendResult({ channel: "slack", to: "channel:C123" });
+
+    const tool = createMessageTool({
+      agentSessionKey: "agent:main:slack:channel:c123:thread:111.222",
+      config: {} as never,
+      currentChannelProvider: "slack",
+      currentChannelId: "channel:C123",
+      runMessageAction: mocks.runMessageAction as never,
+    });
+
+    await tool.execute("1", {
+      action: "send",
+      channel: "slack",
+      message: "new top-level post",
+      topLevel: true,
+    });
+
+    const call = firstRunMessageActionInput();
+    expect(call?.params?.threadId).toBeUndefined();
+  });
+
+  it("does not override an explicit Slack thread target", async () => {
+    mockSendResult({ channel: "slack", to: "channel:C999" });
+
+    const tool = createMessageTool({
+      agentSessionKey: "agent:main:slack:channel:c123:thread:111.222",
+      config: {} as never,
+      currentChannelProvider: "slack",
+      currentChannelId: "channel:C123",
+      runMessageAction: mocks.runMessageAction as never,
+    });
+
+    await tool.execute("1", {
+      action: "send",
+      channel: "slack",
+      target: "channel:C999",
+      threadId: "222.333",
+      message: "explicit cross-thread send",
+    });
+
+    const call = firstRunMessageActionInput();
+    expect(call?.params?.threadId).toBe("222.333");
+  });
+
+  it("marks message-tool-only source sends as visible before yielding", async () => {
+    mockSendResult({ channel: "slack", to: "channel:C123" });
+    const hasRepliedRef = { value: false };
+
+    const tool = createMessageTool({
+      agentSessionKey: "agent:main:slack:channel:c123:thread:111.222",
+      config: {} as never,
+      currentChannelProvider: "slack",
+      currentChannelId: "channel:C123",
+      sourceReplyDeliveryMode: "message_tool_only",
+      hasRepliedRef,
+      runMessageAction: mocks.runMessageAction as never,
+    });
+
+    await tool.execute("1", {
+      action: "send",
+      channel: "slack",
+      message: "visible status",
+    });
+
+    expect(hasRepliedRef.value).toBe(true);
+  });
+
+  it("replaces the current Slack reply instead of sending a reviewer correction twice", async () => {
+    mockSendResult({ channel: "slack", to: "channel:C123" });
+    const hasRepliedRef = { value: false };
+
+    const tool = createMessageTool({
+      agentSessionKey: "agent:main:slack:channel:c123:thread:111.222",
+      config: {} as never,
+      currentChannelProvider: "slack",
+      currentChannelId: "C123",
+      currentReplaceMessageTs: "333.444",
+      sourceReplyDeliveryMode: "message_tool_only",
+      hasRepliedRef,
+      runMessageAction: mocks.runMessageAction as never,
+    });
+
+    await tool.execute("1", {
+      action: "send",
+      channel: "slack",
+      message: "Corrected answer",
+    });
+
+    const call = firstRunMessageActionInput();
+    expect(call?.action).toBe("edit");
+    expect(call?.params?.action).toBe("edit");
+    expect(call?.params?.messageId).toBe("333.444");
+    expect(call?.params?.channelId).toBe("C123");
+    expect(call?.params?.threadId).toBeUndefined();
+    expect(hasRepliedRef.value).toBe(true);
+  });
+
+  it("does not replace a message when the reviewer turn explicitly targets another channel", async () => {
+    mockSendResult({ channel: "slack", to: "channel:C999" });
+
+    const tool = createMessageTool({
+      agentSessionKey: "agent:main:slack:channel:c123:thread:111.222",
+      config: {} as never,
+      currentChannelProvider: "slack",
+      currentChannelId: "C123",
+      currentReplaceMessageTs: "333.444",
+      runMessageAction: mocks.runMessageAction as never,
+    });
+
+    await tool.execute("1", {
+      action: "send",
+      channel: "slack",
+      target: "channel:C999",
+      message: "Separate destination",
+    });
+
+    const call = firstRunMessageActionInput();
+    expect(call?.action).toBe("send");
+    expect(call?.params?.action).toBe("send");
+    expect(call?.params?.messageId).toBeUndefined();
+    expect(call?.params?.threadId).toBeUndefined();
+  });
+
+  it("prefers the Slack session thread over synthetic currentThreadTs", async () => {
+    mockSendResult({ channel: "slack", to: "channel:C123" });
+
+    const tool = createMessageTool({
+      agentSessionKey: "agent:main:slack:channel:c123:thread:111.222",
+      config: {} as never,
+      currentChannelProvider: "slack",
+      currentChannelId: "channel:C123",
+      currentThreadTs: "999.000",
+      agentThreadId: "111.222",
+      runMessageAction: mocks.runMessageAction as never,
+    });
+
+    await tool.execute("1", {
+      action: "send",
+      channel: "slack",
+      message: "stay in canonical thread",
+    });
+
+    const call = firstRunMessageActionInput();
+    expect(call?.toolContext?.currentThreadTs).toBe("111.222");
+    expect(call?.toolContext?.replyToMode).toBe("all");
+  });
+
+  it("prefers the Slack session thread over synthetic agentThreadId", async () => {
+    mockSendResult({ channel: "slack", to: "channel:C123" });
+
+    const tool = createMessageTool({
+      agentSessionKey: "agent:main:slack:channel:c123:thread:111.222",
+      config: {} as never,
+      currentChannelProvider: "slack",
+      currentChannelId: "channel:C123",
+      currentThreadTs: "999.000",
+      agentThreadId: "999.000",
+      runMessageAction: mocks.runMessageAction as never,
+    });
+
+    await tool.execute("1", {
+      action: "send",
+      channel: "slack",
+      message: "route reviewer synthetic callback to the real root",
+    });
+
+    const call = firstRunMessageActionInput();
+    expect(call?.toolContext?.currentThreadTs).toBe("111.222");
+    expect(call?.toolContext?.replyToMode).toBe("all");
+  });
+
+  it("prefers the Slack session thread when currentChannelProvider is missing", async () => {
+    mockSendResult({ channel: "slack", to: "channel:C123" });
+
+    const tool = createMessageTool({
+      agentSessionKey: "agent:main:slack:channel:c123:thread:111.222",
+      config: {} as never,
+      currentChannelId: "channel:C123",
+      currentThreadTs: "999.000",
+      currentMessageId: "999.000",
+      runMessageAction: mocks.runMessageAction as never,
+    });
+
+    await tool.execute("1", {
+      action: "send",
+      channel: "slack",
+      message: "route synthetic continue to canonical thread",
     });
 
     const call = firstRunMessageActionInput();

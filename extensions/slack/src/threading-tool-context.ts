@@ -26,7 +26,9 @@ export function buildSlackThreadingToolContext(params: {
   const replyToThreadTs = normalizeSlackThreadTsCandidate(params.context.ReplyToId);
   const currentMessageTs = normalizeSlackThreadTsCandidate(params.context.CurrentMessageId);
   const currentThreadTs =
-    messageThreadTs ?? transportThreadTs ?? replyToThreadTs ?? currentMessageTs;
+    messageThreadTs && replyToThreadTs && messageThreadTs !== replyToThreadTs
+      ? replyToThreadTs
+      : (messageThreadTs ?? transportThreadTs ?? replyToThreadTs ?? currentMessageTs);
   const hasExplicitThreadTarget =
     messageThreadTs != null ||
     transportThreadTs != null ||

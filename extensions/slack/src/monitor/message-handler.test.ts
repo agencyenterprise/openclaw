@@ -165,6 +165,34 @@ describe("createSlackMessageHandler", () => {
     expect(enqueueMock).toHaveBeenCalledTimes(1);
   });
 
+  it("admits trusted reviewer continuations despite the real thread root already being seen", async () => {
+    hasSlackInboundMessageDeliveryMock.mockResolvedValue(true);
+    const markMessageSeen = vi.fn(() => true);
+    const { handler, trackEvent } = createHandlerWithTracker({ markMessageSeen });
+
+    await handler(
+      {
+        type: "message",
+        channel: "C111",
+        ts: "1709000000.000100",
+        thread_ts: "1709000000.000100",
+        parent_user_id: "U_BOT",
+        user: "U_BOT",
+        text: "private reviewer correction",
+        openclaw_synthetic_message_id: "reviewer:C111:1709000000.000100:iteration-1",
+      } as never,
+      { source: "message", wasMentioned: true, reviewerSynthetic: true },
+    );
+
+    expect(hasSlackInboundMessageDeliveryMock).not.toHaveBeenCalled();
+    expect(markMessageSeen).not.toHaveBeenCalled();
+    expect(trackEvent).toHaveBeenCalledOnce();
+    expect(enqueueMock).toHaveBeenCalledOnce();
+    expect(enqueueMock.mock.calls[0]?.[0]).toMatchObject({
+      opts: { reviewerSynthetic: true, wasMentioned: true },
+    });
+  });
+
   it("records explicit channel type before the first delivery-state await", async () => {
     let settleDeliveryLookup: ((delivered: boolean) => void) | undefined;
     hasSlackInboundMessageDeliveryMock.mockImplementationOnce(

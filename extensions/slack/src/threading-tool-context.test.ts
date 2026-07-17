@@ -105,6 +105,22 @@ describe("buildSlackThreadingToolContext", () => {
     ).toBe("all");
   });
 
+  it("prefers ReplyToId when a synthetic MessageThreadId disagrees with the Slack root", () => {
+    const result = buildSlackThreadingToolContext({
+      cfg: emptyCfg,
+      accountId: null,
+      context: {
+        ChatType: "channel",
+        To: "channel:C1234ABC",
+        MessageThreadId: "1779813240.507000",
+        ReplyToId: "1779173088.161849",
+      },
+    });
+
+    expect(result.currentThreadTs).toBe("1779173088.161849");
+    expect(result.replyToMode).toBe("all");
+  });
+
   it("does not force all mode from ThreadLabel alone", () => {
     expect(
       resolveReplyToModeWithConfig({

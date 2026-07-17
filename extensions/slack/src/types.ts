@@ -50,6 +50,13 @@ export type SlackMessageEvent = {
   attachments?: SlackAttachment[];
   assistant_thread?: Record<string, unknown>;
   /**
+   * Internal OpenClaw id for synthetic events that must keep Slack's real ts
+   * for routing while using a distinct inbound id for dedupe.
+   */
+  openclaw_synthetic_message_id?: string;
+  /** Internal-only target used to replace a reviewed bot answer in place. */
+  openclaw_replace_message_ts?: string;
+  /**
    * Set by the thread_ts resolver when Slack supplied parent_user_id but the
    * parent thread timestamp could not be recovered.
    */

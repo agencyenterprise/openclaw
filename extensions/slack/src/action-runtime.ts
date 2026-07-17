@@ -10,6 +10,7 @@ import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coe
 import type { ResolvedSlackAccount } from "./accounts.js";
 import { parseSlackBlocksInput } from "./blocks-input.js";
 import type { SlackConversationInfo } from "./channel-type.js";
+import { normalizeSlackOutboundText } from "./format.js";
 import { SLACK_TEXT_LIMIT } from "./limits.js";
 import { resolveSlackChannelConfig } from "./monitor/channel-config.js";
 import { isSlackChannelAllowedByPolicy } from "./monitor/policy.js";
@@ -164,6 +165,23 @@ function resolveThreadTsFromContext(
     return context.currentThreadTs;
   }
   return undefined;
+}
+
+function readExplicitMessageThreadTs(params: Record<string, unknown>): string | undefined {
+  return (
+    readStringParam(params, "threadTs") ??
+    readStringParam(params, "threadId") ??
+    readStringParam(params, "replyTo")
+  );
+}
+
+function suppressesImplicitMessageThreading(params: Record<string, unknown>): boolean {
+  return (
+    params.topLevel === true ||
+    params.threadTs === null ||
+    params.threadId === null ||
+    params.replyTo === null
+  );
 }
 
 function readSlackBlocksParam(params: Record<string, unknown>) {
@@ -604,12 +622,10 @@ export async function handleSlackAction(
           );
         }
         const threadTs = resolveThreadTsFromContext(
-          readStringParam(params, "threadTs"),
+          readExplicitMessageThreadTs(params),
           to,
           context,
-          {
-            suppressImplicitThread: params.topLevel === true || params.threadTs === null,
-          },
+          { suppressImplicitThread: suppressesImplicitMessageThreading(params) },
         );
         const baseSendOpts = {
           ...writeOpts,
@@ -716,12 +732,10 @@ export async function handleSlackAction(
           );
         }
         const threadTs = resolveThreadTsFromContext(
-          readStringParam(params, "threadTs"),
+          readExplicitMessageThreadTs(params),
           to,
           context,
-          {
-            suppressImplicitThread: params.topLevel === true || params.threadTs === null,
-          },
+          { suppressImplicitThread: suppressesImplicitMessageThreading(params) },
         );
         const result = await slackActionRuntime.sendSlackMessage(to, initialComment ?? "", {
           ...writeOpts,
@@ -751,14 +765,15 @@ export async function handleSlackAction(
         if (!content && !blocks) {
           throw new Error("Slack editMessage requires content or blocks.");
         }
+        const normalizedContent = normalizeSlackOutboundText(content ?? "");
         await assertReadTargetAllowed(channelId);
         if (writeOpts) {
-          await slackActionRuntime.editSlackMessage(channelId, messageId, content ?? "", {
+          await slackActionRuntime.editSlackMessage(channelId, messageId, normalizedContent, {
             ...writeOpts,
             blocks,
           });
         } else {
-          await slackActionRuntime.editSlackMessage(channelId, messageId, content ?? "", {
+          await slackActionRuntime.editSlackMessage(channelId, messageId, normalizedContent, {
             blocks,
           });
         }

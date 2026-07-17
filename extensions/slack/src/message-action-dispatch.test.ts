@@ -671,6 +671,59 @@ describe("handleSlackMessageAction", () => {
     expectNoForwardedToolContext(invoke);
   });
 
+  it("uses the ambient Slack thread before synthetic replyTo fallback", async () => {
+    const invoke = createInvokeSpy();
+    const cfg = slackConfig();
+
+    await handleSlackMessageAction({
+      providerId: "slack",
+      ctx: {
+        action: "send",
+        cfg,
+        params: {
+          to: "channel:C1",
+          message: "Still running",
+          replyTo: "1779813240.507000",
+        },
+        toolContext: {
+          currentThreadTs: "1779173088.161849",
+        },
+      } as never,
+      invoke: invoke as never,
+    });
+
+    const action = firstAction(invoke);
+    expect(action.action).toBe("sendMessage");
+    expect(action.threadTs).toBe("1779173088.161849");
+    expectForwardedCfg(invoke, cfg);
+  });
+
+  it("keeps explicit Slack threadId ahead of ambient thread context", async () => {
+    const invoke = createInvokeSpy();
+    const cfg = slackConfig();
+
+    await handleSlackMessageAction({
+      providerId: "slack",
+      ctx: {
+        action: "send",
+        cfg,
+        params: {
+          to: "channel:C1",
+          message: "Explicit wins",
+          threadId: "1779000000.000001",
+          replyTo: "1779813240.507000",
+        },
+        toolContext: {
+          currentThreadTs: "1779173088.161849",
+        },
+      } as never,
+      invoke: invoke as never,
+    });
+
+    const action = firstAction(invoke);
+    expect(action.threadTs).toBe("1779000000.000001");
+  });
+
   it("passes topLevel through so same-channel Slack sends can suppress thread inheritance", async () => {
     const invoke = createInvokeSpy();
     const cfg = slackConfig();

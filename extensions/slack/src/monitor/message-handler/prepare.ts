@@ -98,6 +98,14 @@ const SLACK_HISTORY_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
 const SLACK_HISTORY_MEDIA_IDLE_TIMEOUT_MS = 1_000;
 const SLACK_HISTORY_MEDIA_TOTAL_TIMEOUT_MS = 3_000;
 
+function resolveSlackSyntheticDedupeMessageId(message: SlackMessageEvent): string | undefined {
+  const syntheticMessageId = normalizeOptionalString(message.openclaw_synthetic_message_id);
+  const providerMessageId = normalizeOptionalString(message.ts);
+  return syntheticMessageId && syntheticMessageId !== providerMessageId
+    ? syntheticMessageId
+    : undefined;
+}
+
 function recordString(
   record: Record<string, unknown> | undefined,
   key: string,
@@ -733,6 +741,11 @@ export async function prepareSlackMessage(params: {
       source: opts.source,
       eventScope: opts.eventScope,
     });
+  const explicitlyMentionsOnlyOthers =
+    hasAnyMention &&
+    !explicitlyMentionedBotUser &&
+    !explicitlyMentionedBotSubteam &&
+    opts.source !== "app_mention";
   // Channels with `requireMention: false` and a non-`off` reply mode produce
   // a Slack-side thread on every top-level bot reply (because `replyToMode`
   // creates one). Seed thread routing for the root turn too, so the inbound
@@ -871,7 +884,8 @@ export async function prepareSlackMessage(params: {
     ctx.botUserId &&
     message.thread_ts &&
     !ctx.threadRequireExplicitMention &&
-    !wasMentioned
+    !wasMentioned &&
+    !explicitlyMentionsOnlyOthers
   ) {
     const replyToBotKinds = implicitMentionKindWhen(
       "reply_to_bot",
@@ -1045,10 +1059,18 @@ export async function prepareSlackMessage(params: {
     logVerbose(`Blocked unauthorized slack sender ${senderId} (not in sender allowlist)`);
     return null;
   }
+  const isExplicitHumanAttributedBotMention =
+    isRoom &&
+    isBotMessage &&
+    typeof message.user === "string" &&
+    /^U[A-Z0-9]+$/.test(message.user) &&
+    message.user !== ctx.botUserId &&
+    (wasMentioned || opts.source === "app_mention");
   if (
     isRoom &&
     isBotMessage &&
     allowBotsMode !== "off" &&
+    !isExplicitHumanAttributedBotMention &&
     !(await authorizeSlackBotRoomMessage({
       ctx,
       channelId: message.channel,
@@ -1489,6 +1511,7 @@ export async function prepareSlackMessage(params: {
     directThreadRoutedToDmSession && !threadHistoryBody ? threadStarterBody : threadHistoryBody;
   const effectiveMessageThreadId =
     assistantThreadContext?.threadTs ?? threadContext.messageThreadId;
+  const dedupeMessageId = resolveSlackSyntheticDedupeMessageId(message);
 
   const ctxPayload = buildChannelInboundEventContext({
     channel: "slack",
@@ -1559,6 +1582,8 @@ export async function prepareSlackMessage(params: {
       groupSystemPrompt,
     },
     extra: {
+      DedupeMessageSid: dedupeMessageId,
+      ReplaceMessageTs: normalizeOptionalString(message.openclaw_replace_message_ts),
       GroupSubject: isRoomish ? roomLabel : undefined,
       UntrustedContext: untrustedChannelMetadata ? [untrustedChannelMetadata] : undefined,
       TransportThreadId: directThreadRoutedToDmSession ? threadContext.messageThreadId : undefined,

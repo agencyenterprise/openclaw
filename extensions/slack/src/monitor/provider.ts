@@ -84,6 +84,7 @@ import {
   registerSlackSocketModeConnectionDiagnostics,
   SLACK_SOCKET_RECONNECT_POLICY,
 } from "./reconnect-policy.js";
+import { registerSlackReviewerMessageHandler } from "./reviewer-dispatch.js";
 import { setSlackDefaultSendIdentity } from "./send.runtime.js";
 import { registerSlackMonitorSlashCommands } from "./slash.js";
 import type { MonitorSlackOpts } from "./types.js";
@@ -507,6 +508,11 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     account,
     trackEvent,
     onPrepared: presenceMonitor?.observe,
+  });
+  registerSlackReviewerMessageHandler({
+    handleSlackMessage,
+    botUserId: ctx.botUserId,
+    onError: (err) => runtime.error?.(`reviewer dispatch failed: ${formatUnknownError(err)}`),
   });
   if (
     installationIdentity.kind !== "enterprise" &&

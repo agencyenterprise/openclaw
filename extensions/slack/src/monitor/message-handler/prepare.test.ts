@@ -3157,7 +3157,7 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
     expect(new Set([root.ctxPayload.SessionKey, followUp.ctxPayload.SessionKey]).size).toBe(1);
   });
 
-  it("preserves explicit Slack mention targets when an implicit thread wake mentions someone else", async () => {
+  it("does not implicitly wake a bot thread when the message explicitly mentions only someone else", async () => {
     const { storePath } = storeFixture.makeTmpStorePath();
     const slackCtx = createInboundSlackCtx({
       cfg: {
@@ -3186,14 +3186,7 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
       opts: { source: "message" },
     });
 
-    if (!prepared) {
-      throw new Error("expected prepared Slack message");
-    }
-    expect(prepared.ctxPayload.WasMentioned).toBe(true);
-    expect(prepared.ctxPayload.ExplicitlyMentionedBot).toBe(false);
-    expect(prepared.ctxPayload.MentionedUserIds).toEqual(["UOTHER"]);
-    expect(prepared.ctxPayload.ImplicitMentionKinds).toEqual(["reply_to_bot"]);
-    expect(prepared.ctxPayload.MentionSource).toBe("implicit_thread");
+    expect(prepared).toBeNull();
   });
 
   it("flags an explicit <@bot> mention as explicit_bot when botUserId is set", async () => {
@@ -4268,6 +4261,84 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
       expect(prepared.ctxPayload.MessageThreadId).toBeUndefined();
       expect(prepared.ctxPayload.ReplyToId).toBeUndefined();
     }
+  });
+
+  it("allows a human-attributed bot app mention without requiring channel-owner presence", async () => {
+    const members = vi.fn();
+    const slackCtx = createInboundSlackCtx({
+      cfg: {
+        channels: { slack: { enabled: true, allowBots: "mentions" } },
+      } as OpenClawConfig,
+      appClient: { conversations: { members } } as unknown as App["client"],
+      defaultRequireMention: true,
+    });
+    slackCtx.resolveChannelName = async () => ({ name: "general", type: "channel" });
+    slackCtx.resolveUserName = async () => ({ name: "Flavio" });
+    slackCtx.allowFrom = ["UOWNER"];
+
+    const prepared = await prepareSlackMessage({
+      ctx: slackCtx,
+      account: createSlackAccount({ allowBots: "mentions" }),
+      message: createSlackMessage({
+        channel: "C123",
+        channel_type: "channel",
+        user: "U02AX1XQ1",
+        bot_id: "B07SPAXNU5U",
+        text: "<@B1> inspect this link",
+        ts: "1779898010.000001",
+      }),
+      opts: { source: "app_mention", wasMentioned: true },
+    });
+
+    assertPrepared(prepared);
+    expect(members).not.toHaveBeenCalled();
+  });
+
+  it("uses a synthetic reviewer id for dedupe while preserving the real Slack message id", async () => {
+    const { storePath } = storeFixture.makeTmpStorePath();
+    const rootTs = "1779898076.795559";
+    const syntheticMessageId = `reviewer:C0AHSKBNDB6:${rootTs}:test`;
+    const replaceMessageTs = "1779898090.123456";
+    const replies = vi.fn().mockResolvedValue({
+      messages: [{ text: "Original root", user: "U1", ts: rootTs }],
+      response_metadata: { next_cursor: "" },
+    });
+    const slackCtx = createInboundSlackCtx({
+      cfg: {
+        session: { store: storePath },
+        channels: { slack: { enabled: true, replyToMode: "all", groupPolicy: "open" } },
+      } as OpenClawConfig,
+      appClient: { conversations: { replies } } as unknown as App["client"],
+      defaultRequireMention: true,
+      replyToMode: "all",
+    });
+    slackCtx.resolveChannelName = async () => ({ name: "proj-openclaw", type: "group" });
+    slackCtx.resolveUserName = async () => ({ name: "Reviewer" });
+
+    const prepared = await prepareSlackMessage({
+      ctx: slackCtx,
+      account: createSlackAccount({ replyToMode: "all" }),
+      message: {
+        type: "message",
+        channel: "C0AHSKBNDB6",
+        channel_type: "group",
+        user: "U1",
+        text: "private reviewer correction",
+        ts: rootTs,
+        event_ts: rootTs,
+        thread_ts: rootTs,
+        parent_user_id: "B1",
+        openclaw_synthetic_message_id: syntheticMessageId,
+        openclaw_replace_message_ts: replaceMessageTs,
+      } as SlackMessageEvent,
+      opts: { source: "message", wasMentioned: true },
+    });
+
+    assertPrepared(prepared);
+    expect(prepared.ctxPayload.MessageSid).toBe(rootTs);
+    expect(prepared.ctxPayload.DedupeMessageSid).toBe(syntheticMessageId);
+    expect(prepared.ctxPayload.ReplaceMessageTs).toBe(replaceMessageTs);
+    expect(prepared.ctxPayload.MessageThreadId).toBe(rootTs);
   });
 });
 

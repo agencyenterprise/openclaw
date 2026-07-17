@@ -117,6 +117,11 @@ export async function handleSlackMessageAction(params: {
     const replyTo = readStringParam(actionParams, "replyTo");
     const topLevel =
       readBooleanParam(actionParams, "topLevel") === true || actionParams.threadId === null;
+    const ambientThreadTs =
+      topLevel || actionParams.replyTo === null ? undefined : ctx.toolContext?.currentThreadTs;
+    const finalThreadTs = topLevel
+      ? undefined
+      : (threadId ?? ambientThreadTs ?? replyTo ?? undefined);
     const toolContext =
       preparedMessages.length > 0
         ? {
@@ -131,7 +136,7 @@ export async function handleSlackMessageAction(params: {
         content: content ?? "",
         mediaUrl: mediaUrl ?? undefined,
         accountId,
-        threadTs: threadId ?? replyTo ?? undefined,
+        threadTs: finalThreadTs,
         ...(topLevel ? { topLevel: true } : {}),
         ...(replyBroadcast ? { replyBroadcast } : {}),
       },

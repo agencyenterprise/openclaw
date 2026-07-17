@@ -121,6 +121,7 @@ export function buildThreadingToolContext(params: {
   const currentMessageId = isRestartSentinelContinuation
     ? sessionCtx.ReplyToId
     : (sessionCtx.MessageSidFull ?? sessionCtx.MessageSid);
+  const currentReplaceMessageTs = normalizeOptionalString(sessionCtx.ReplaceMessageTs);
   const currentSourceTurnId = readChannelSourceTurnId(sessionCtx);
   const originProvider = resolveOriginMessageProvider({
     originatingChannel: sessionCtx.OriginatingChannel,
@@ -133,6 +134,7 @@ export function buildThreadingToolContext(params: {
   if (!config) {
     return {
       currentMessageId,
+      currentReplaceMessageTs,
       currentSourceTurnId,
     };
   }
@@ -140,6 +142,7 @@ export function buildThreadingToolContext(params: {
   if (!rawProvider) {
     return {
       currentMessageId,
+      currentReplaceMessageTs,
       currentSourceTurnId,
     };
   }
@@ -151,6 +154,7 @@ export function buildThreadingToolContext(params: {
       currentChannelId: normalizeOptionalString(originTo),
       currentChannelProvider: provider ?? (rawProvider as ChannelId),
       currentMessageId,
+      currentReplaceMessageTs,
       currentSourceTurnId,
       hasRepliedRef,
     };
@@ -182,6 +186,7 @@ export function buildThreadingToolContext(params: {
     // Some providers expose only thread resources as reply targets; explicit
     // `undefined` means the adapter rejected the generic message-id fallback.
     currentMessageId: hasAdapterCurrentMessageId ? context.currentMessageId : currentMessageId,
+    currentReplaceMessageTs,
     currentSourceTurnId,
   };
 }

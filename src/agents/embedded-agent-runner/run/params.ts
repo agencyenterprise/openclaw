@@ -127,6 +127,8 @@ export type RunEmbeddedAgentParams = {
   currentThreadTs?: string;
   /** Current inbound message id for action fallbacks (e.g. Telegram react). */
   currentMessageId?: string | number;
+  /** Existing Slack message to replace during a private reviewer correction. */
+  currentReplaceMessageTs?: string;
   /** True when the current inbound turn carried audio media. */
   currentInboundAudio?: boolean;
   /** Reply-to mode for Slack auto-threading. */
