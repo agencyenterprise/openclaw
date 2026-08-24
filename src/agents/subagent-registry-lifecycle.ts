@@ -1384,6 +1384,10 @@ export function createSubagentRegistryLifecycleController(params: {
       spawnMode: pendingPayload.spawnMode,
       expectsCompletionMessage: pendingPayload.expectsCompletionMessage,
       wakeOnDescendantSettle: pendingPayload.wakeOnDescendantSettle === true,
+      forceAnnounceDespitePendingDescendants:
+        pendingPayload.expectsCompletionMessage === true &&
+        typeof entry.endedAt === "number" &&
+        Date.now() - entry.endedAt > ANNOUNCE_COMPLETION_HARD_EXPIRY_MS,
       onBeforeDeleteChildSession:
         cleanup === "delete"
           ? () => {

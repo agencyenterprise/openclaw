@@ -36,6 +36,8 @@ export type SlackMessageEvent = {
   type: "message";
   user?: string;
   bot_id?: string;
+  /** Slack app ID stamped on messages an app sends on a user's behalf. */
+  app_id?: string;
   subtype?: string;
   username?: string;
   text?: string;

@@ -339,6 +339,74 @@ function getExecApprovalsProcessStartTime(): number | null {
 const EXEC_APPROVALS_SYNC_LOCK_RETRIES = 10;
 const EXEC_APPROVALS_SYNC_LOCK_RETRY_MS = 20;
 
+// Skip persisting lastUsedAt/lastUsedCommand refreshes for allowlist entries
+// stamped within this window. Every skipped refresh is one less exclusive-lock
+// writer in the exec hot path; the policy content itself is unaffected.
+const EXEC_ALLOWLIST_METADATA_REFRESH_MS = 60_000;
+
+type ExecApprovalsReadCache = {
+  path: string;
+  ino: number;
+  mtimeMs: number;
+  size: number;
+  raw: string;
+};
+
+let execApprovalsReadCache: ExecApprovalsReadCache | null = null;
+
+function statExecApprovalsTarget(filePath: string): fs.Stats | null {
+  try {
+    return fs.statSync(filePath);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Lock-free fast path for repeat reads. Writers replace the approvals file
+ * atomically (temp + rename) while holding the sidecar lock, so a target whose
+ * (path, inode, mtime, size) still matches a version this process fully read
+ * under the lock is byte-identical to it. Re-parse the cached raw text so each
+ * caller gets a private object.
+ */
+function readExecApprovalsFromCache(filePath: string): ExecApprovalsFile | null {
+  const cache = execApprovalsReadCache;
+  if (!cache || cache.path !== filePath) {
+    return null;
+  }
+  const stat = statExecApprovalsTarget(filePath);
+  if (
+    !stat ||
+    stat.ino !== cache.ino ||
+    stat.mtimeMs !== cache.mtimeMs ||
+    stat.size !== cache.size
+  ) {
+    return null;
+  }
+  return parsePersistedExecApprovals(cache.raw);
+}
+
+/**
+ * Read the approvals file and refresh the read cache. Must be called with the
+ * approvals lock held: the lock keeps every writer out, so the stat taken here
+ * describes exactly the bytes the snapshot read.
+ */
+function loadExecApprovalsUnlockedWithCache(filePath: string): ExecApprovalsFile {
+  const stat = statExecApprovalsTarget(filePath);
+  const snapshot = readExecApprovalsSnapshotFromPath(filePath);
+  execApprovalsReadCache =
+    stat && snapshot.exists && snapshot.raw !== null
+      ? {
+          path: filePath,
+          ino: stat.ino,
+          mtimeMs: stat.mtimeMs,
+          size: stat.size,
+          raw: snapshot.raw,
+        }
+      : null;
+  return snapshot.file;
+}
+
 function hashExecApprovalsRaw(raw: string | null): string {
   // Preserve existing hashes for present files so mixed-version native/CLI
   // clients can still compare snapshots; only missing needs its own domain.
@@ -1049,18 +1117,16 @@ export function readExecApprovalsSnapshot(): ExecApprovalsSnapshot {
   );
 }
 
-function loadExecApprovalsUnlocked(): ExecApprovalsFile {
+export function loadExecApprovals(): ExecApprovalsFile {
   const filePath = resolveExecApprovalsPath();
   try {
-    return readExecApprovalsSnapshotFromPath(filePath).file;
-  } catch {
-    return createFailClosedExecApprovalsFallback();
-  }
-}
-
-export function loadExecApprovals(): ExecApprovalsFile {
-  try {
-    return withExecApprovalsReadLockSync(resolveExecApprovalsPath(), loadExecApprovalsUnlocked);
+    const cached = readExecApprovalsFromCache(filePath);
+    if (cached) {
+      return cached;
+    }
+    return withExecApprovalsReadLockSync(filePath, () =>
+      loadExecApprovalsUnlockedWithCache(filePath),
+    );
   } catch {
     // A busy, malformed, or unreadable approvals store must never restore the
     // permissive defaults while another process is revoking access.
@@ -1068,10 +1134,58 @@ export function loadExecApprovals(): ExecApprovalsFile {
   }
 }
 
+/**
+ * The approvals store being briefly locked by another process is a transient
+ * condition, not a policy decision. Callers that report errors to an agent
+ * should surface this instead of a fail-closed "security=deny", which reads
+ * as a deliberate lockdown and makes agents stand down instead of retrying.
+ */
+export class ExecApprovalsBusyError extends Error {
+  readonly code = "exec_approvals_busy";
+  constructor(lockPath: string) {
+    super(
+      `exec approvals store is busy (another process holds ${lockPath}); ` +
+        "this is transient - retry the command",
+    );
+    this.name = "ExecApprovalsBusyError";
+  }
+}
+
+/**
+ * Load approvals for an exec decision. Identical to loadExecApprovals except
+ * that lock contention raises ExecApprovalsBusyError instead of silently
+ * failing closed; malformed or unreadable state still fails closed.
+ */
+export function loadExecApprovalsForExec(): ExecApprovalsFile {
+  const filePath = resolveExecApprovalsPath();
+  try {
+    const cached = readExecApprovalsFromCache(filePath);
+    if (cached) {
+      return cached;
+    }
+    return withExecApprovalsReadLockSync(filePath, () =>
+      loadExecApprovalsUnlockedWithCache(filePath),
+    );
+  } catch (err) {
+    const code = (err as { code?: unknown }).code;
+    if (code === "file_lock_timeout" || code === "file_lock_stale") {
+      throw new ExecApprovalsBusyError(
+        String((err as { lockPath?: unknown }).lockPath ?? `${filePath}.lock`),
+      );
+    }
+    return createFailClosedExecApprovalsFallback();
+  }
+}
+
 export async function loadExecApprovalsAsync(): Promise<ExecApprovalsFile> {
   try {
-    return await withExecApprovalsReadLock(resolveExecApprovalsPath(), async () =>
-      loadExecApprovalsUnlocked(),
+    const filePath = resolveExecApprovalsPath();
+    const cached = readExecApprovalsFromCache(filePath);
+    if (cached) {
+      return cached;
+    }
+    return await withExecApprovalsReadLock(filePath, async () =>
+      loadExecApprovalsUnlockedWithCache(filePath),
     );
   } catch {
     // Match the synchronous reader's fail-closed contract while allowing
@@ -1160,6 +1274,7 @@ function acquireExecApprovalsLockSync(filePath: string): ExecApprovalsSyncLock {
     payload.starttime = starttime;
   }
   const raw = `${JSON.stringify(payload, null, 2)}\n`;
+  let brokeStaleLock = false;
   for (let attempt = 0; attempt <= EXEC_APPROVALS_SYNC_LOCK_RETRIES; attempt += 1) {
     let descriptor: number;
     try {
@@ -1170,6 +1285,23 @@ function acquireExecApprovalsLockSync(filePath: string): ExecApprovalsSyncLock {
       }
       const state = readExecApprovalsLockState(lockPath);
       if (state.definitelyStale) {
+        // The recorded owner is provably dead (its pid+starttime no longer
+        // name a live process), and a dead owner never releases its lock:
+        // without recovery every future exec fails closed until a human
+        // deletes the file. Break the lock once and retry. The unlink can in
+        // principle race a fresh owner that replaced the stale file in the
+        // same instant; the worst case of that race is two writers doing
+        // atomic temp+rename saves, which resolves to last-writer-wins on
+        // metadata and can never tear or corrupt the policy itself.
+        if (!brokeStaleLock) {
+          brokeStaleLock = true;
+          try {
+            fs.rmSync(lockPath, { force: true });
+            continue;
+          } catch {
+            // Fall through to the stale error below.
+          }
+        }
         throw Object.assign(new Error(`Exec approvals lock has a stale owner: ${lockPath}`), {
           code: "file_lock_stale",
           lockPath,
@@ -2188,6 +2320,20 @@ export function recordAllowlistMatchesUse(params: {
   if (params.matches.length === 0 && !params.authorization) {
     return;
   }
+  if (
+    !params.authorization &&
+    params.matches.every(
+      (entry) =>
+        entry.id &&
+        typeof entry.lastUsedAt === "number" &&
+        Date.now() - entry.lastUsedAt < EXEC_ALLOWLIST_METADATA_REFRESH_MS,
+    )
+  ) {
+    // Every matched entry was stamped moments ago; skip the locked rewrite
+    // entirely. This keeps lastUsedAt bookkeeping out of the exec hot path,
+    // where it was the main source of contention on the approvals lock.
+    return;
+  }
   const snapshot = updateExecApprovalsSync({
     update: (file) => applyRecordedAllowlistUse({ ...params, file }),
   });
@@ -2244,6 +2390,15 @@ function applyRecordedAllowlistMetadata(params: {
     let entryChanged = false;
     const nextAllowlist = existing.allowlist.map((entry) => {
       if (!keys.has(buildAllowlistEntryMatchKey(entry))) {
+        return entry;
+      }
+      if (
+        entry.id &&
+        typeof entry.lastUsedAt === "number" &&
+        Date.now() - entry.lastUsedAt < EXEC_ALLOWLIST_METADATA_REFRESH_MS
+      ) {
+        // Freshly stamped on disk; skip the metadata refresh (see
+        // EXEC_ALLOWLIST_METADATA_REFRESH_MS).
         return entry;
       }
       changed = true;

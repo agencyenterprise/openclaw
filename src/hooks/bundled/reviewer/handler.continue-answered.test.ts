@@ -138,7 +138,6 @@ const engage = () =>
     botUserId: BOT,
     channelId: "C0AHSKBNDB6",
     threadTs: "1779000000.000000",
-    openedAtMs: DISPATCH_MS,
   });
 
 describe("engageAnswered (engage-row recovery check — reply must be the latest)", () => {
@@ -146,6 +145,14 @@ describe("engageAnswered (engage-row recovery check — reply must be the latest
 
   it("true when the bot's reply is the latest substantive message", async () => {
     stubThread([{ user: BOT, text: "handled it", ts: "1779000005.000000" }]);
+    await expect(engage()).resolves.toBe(true);
+  });
+
+  it("true when an engage row was recreated after the latest bot reply", async () => {
+    stubThread([
+      { user: "UHUMAN", text: "@bot please help", ts: "1778999900.000000" },
+      { user: BOT, text: "handled it", ts: "1778999905.000000" },
+    ]);
     await expect(engage()).resolves.toBe(true);
   });
 

@@ -258,6 +258,7 @@ export async function runSubagentAnnounceFlow(params: {
   expectsCompletionMessage?: boolean;
   spawnMode?: SpawnSubagentMode;
   wakeOnDescendantSettle?: boolean;
+  forceAnnounceDespitePendingDescendants?: boolean;
   signal?: AbortSignal;
   bestEffortDeliver?: boolean;
   onDeliveryResult?: (delivery: SubagentAnnounceDeliveryResult) => void;
@@ -335,7 +336,11 @@ export async function runSubagentAnnounceFlow(params: {
         0,
         subagentRegistryRuntime.countPendingDescendantRuns(params.childSessionKey),
       );
-      if (pendingChildDescendantRuns > 0 && announceType !== "cron job") {
+      if (
+        pendingChildDescendantRuns > 0 &&
+        announceType !== "cron job" &&
+        params.forceAnnounceDespitePendingDescendants !== true
+      ) {
         shouldDeleteChildSession = false;
         return false;
       }

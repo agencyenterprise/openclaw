@@ -40,6 +40,7 @@ import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { resolveSlackReplyToMode } from "../../account-reply-mode.js";
 import type { ResolvedSlackAccount } from "../../accounts.js";
 import { reactSlackMessage } from "../../actions.js";
+import { matchesSlackAppMessageTrigger } from "../../app-message-trigger.js";
 import { formatSlackError } from "../../errors.js";
 import { formatSlackFileReference } from "../../file-reference.js";
 import type { SlackSendIdentity } from "../../send.js";
@@ -651,6 +652,8 @@ export async function prepareSlackMessage(params: {
   opts: {
     source: "message" | "app_mention";
     wasMentioned?: boolean;
+    /** Trusted in-process reviewer/startup continuation; never set from Slack events. */
+    reviewerSynthetic?: boolean;
     relayIdentity?: SlackSendIdentity;
     eventScope?: SlackEventScope;
     /** Handler-owned race check for suppressing a duplicate dropped-history record. */
@@ -680,13 +683,20 @@ export async function prepareSlackMessage(params: {
     allowBotsMode,
     isBotMessage,
   } = conversation;
-  const authorization = await authorizeSlackInboundMessage({
-    ctx,
-    account,
-    message,
-    conversation,
-    eventScope: opts.eventScope,
-  });
+  const trustedReviewerSynthetic =
+    opts.reviewerSynthetic === true && Boolean(message.openclaw_synthetic_message_id);
+  const authorization: SlackAuthorizationContext | null = trustedReviewerSynthetic
+    ? {
+        senderId: message.user ?? ctx.botUserId ?? "REVIEWER",
+        allowFromLower: [],
+      }
+    : await authorizeSlackInboundMessage({
+        ctx,
+        account,
+        message,
+        conversation,
+        eventScope: opts.eventScope,
+      });
   if (!authorization) {
     return null;
   }
@@ -775,10 +785,17 @@ export async function prepareSlackMessage(params: {
     channelConfig?.replyToMode ?? resolveSlackReplyToMode(account, channelChatType);
   const willImplicitlyThreadReply =
     isRoom && !channelRequireMention && channelReplyToMode !== "off";
+  const matchesAppMessageTrigger =
+    !isDirectMessage &&
+    matchesSlackAppMessageTrigger({
+      triggers: account.config.appMessageTriggers,
+      message,
+    });
   const seedTopLevelRoomThreadBySource =
     opts.source === "app_mention" ||
     opts.wasMentioned === true ||
     explicitlyMentioned ||
+    matchesAppMessageTrigger ||
     willImplicitlyThreadReply;
   let routing = resolveSlackRoutingContext({
     ctx,
@@ -797,17 +814,18 @@ export async function prepareSlackMessage(params: {
   let mentionCheckTranscript: string | undefined;
   const resolveWasMentioned = (mentionRegexes: RegExp[]) =>
     opts.wasMentioned ??
-    (!isDirectMessage &&
-      matchesMentionWithExplicit({
-        text: messageText,
-        mentionRegexes,
-        explicit: {
-          hasAnyMention,
-          isExplicitlyMentioned: explicitlyMentioned,
-          canResolveExplicit: Boolean(ctx.botUserId),
-        },
-        transcript: mentionCheckTranscript,
-      }));
+    (matchesAppMessageTrigger ||
+      (!isDirectMessage &&
+        matchesMentionWithExplicit({
+          text: messageText,
+          mentionRegexes,
+          explicit: {
+            hasAnyMention,
+            isExplicitlyMentioned: explicitlyMentioned,
+            canResolveExplicit: Boolean(ctx.botUserId),
+          },
+          transcript: mentionCheckTranscript,
+        })));
   const buildPolicyMentionRegexes = (agentId: string | undefined) =>
     resolveCachedMentionRegexes(ctx, agentId, {
       provider: "slack",
@@ -1055,7 +1073,7 @@ export async function prepareSlackMessage(params: {
     },
   });
   const senderGate = messageIngress.senderAccess.gate;
-  if (isRoomish && senderGate?.allowed === false) {
+  if (!trustedReviewerSynthetic && isRoomish && senderGate?.allowed === false) {
     logVerbose(`Blocked unauthorized slack sender ${senderId} (not in sender allowlist)`);
     return null;
   }

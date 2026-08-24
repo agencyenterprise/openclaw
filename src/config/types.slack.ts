@@ -165,6 +165,21 @@ export type SlackRelayConfig = {
   gatewayId?: string;
 };
 
+/**
+ * Engage the bot on app-attributed user messages (e.g. posts carrying Slack's
+ * "Sent using @Claude" trail) as if the bot had been explicitly mentioned.
+ * A trigger matches when the author is `userId` and the message carries the
+ * app attribution: its `app_id` equals `appId`, or its text matches `textPattern`.
+ */
+export type SlackAppMessageTriggerConfig = {
+  /** Slack user ID the message must be authored by. */
+  userId: string;
+  /** Slack app ID stamped on messages the app sends on the user's behalf. */
+  appId?: string;
+  /** Regex the message text must match (e.g. the rendered "Sent using" trail). */
+  textPattern?: string;
+};
+
 export type SlackAccountConfig = {
   /** Optional display name for this account (used in CLI/UI lists). */
   name?: string;
@@ -221,6 +236,8 @@ export type SlackAccountConfig = {
   groupPolicy?: GroupPolicy;
   /** Scope configured groupChat mentionPatterns to selected Slack channel IDs. */
   mentionPatterns?: MentionPatternsPolicyConfig;
+  /** Engage the bot on matching app-attributed user messages (see type docs). */
+  appMessageTriggers?: SlackAppMessageTriggerConfig[];
   /** Supplemental context visibility policy (all|allowlist|allowlist_quote). */
   contextVisibility?: ContextVisibilityMode;
   /** Max channel messages to keep as history context (0 disables). */

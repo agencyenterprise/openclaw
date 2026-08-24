@@ -376,3 +376,121 @@ describe("isDeliveredMessageToolOnlySourceReplyResult", () => {
     ).toBe(false);
   });
 });
+
+describe("isDeliveredMessageToolOnlySourceReplyResult source-conversation matching", () => {
+  const sourceConversation = { channelId: "C0BL0FXQ43V", threadId: "1785357951.595659" };
+
+  it("credits an explicit send whose receipt lands in the source thread", () => {
+    expect(
+      isDeliveredMessageToolOnlySourceReplyResult({
+        sourceReplyDeliveryMode: "message_tool_only",
+        toolName: "message",
+        args: { action: "send", to: "C0BL0FXQ43V", message: "reply" },
+        result: {
+          deliveryStatus: "sent",
+          receipt: { primaryPlatformMessageId: "F0BLRDZA010", threadId: "1785357951.595659" },
+        },
+        sourceConversation,
+      }),
+    ).toBe(true);
+  });
+
+  it("credits the real Slack media-send envelope shape", () => {
+    const envelope = JSON.stringify({
+      channel: "slack",
+      to: "C0BL0FXQ43V",
+      via: "direct",
+      result: {
+        receipt: {
+          primaryPlatformMessageId: "F0BLRDZA010",
+          parts: [
+            {
+              platformMessageId: "F0BLRDZA010",
+              kind: "media",
+              threadId: "1785357951.595659",
+              raw: { channel: "slack", messageId: "F0BLRDZA010", channelId: "C0BL0FXQ43V" },
+            },
+          ],
+          threadId: "1785357951.595659",
+        },
+        messageId: "F0BLRDZA010",
+      },
+      deliveryStatus: "sent",
+    });
+    expect(
+      isDeliveredMessageToolOnlySourceReplyResult({
+        sourceReplyDeliveryMode: "message_tool_only",
+        toolName: "message",
+        args: { action: "send", to: "C0BL0FXQ43V", message: "reply" },
+        result: { content: [{ type: "text", text: envelope }] },
+        sourceConversation,
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects an explicit send to a different channel", () => {
+    expect(
+      isDeliveredMessageToolOnlySourceReplyResult({
+        sourceReplyDeliveryMode: "message_tool_only",
+        toolName: "message",
+        args: { action: "send", to: "C0OTHERCHAN", message: "reply" },
+        result: {
+          deliveryStatus: "sent",
+          receipt: { primaryPlatformMessageId: "123", threadId: "999.111" },
+        },
+        sourceConversation,
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects a source-channel send whose receipt lacks the source thread", () => {
+    expect(
+      isDeliveredMessageToolOnlySourceReplyResult({
+        sourceReplyDeliveryMode: "message_tool_only",
+        toolName: "message",
+        args: { action: "send", to: "C0BL0FXQ43V", message: "reply" },
+        result: { deliveryStatus: "sent", receipt: { primaryPlatformMessageId: "123" } },
+        sourceConversation,
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts a source-channel send when the source has no thread", () => {
+    expect(
+      isDeliveredMessageToolOnlySourceReplyResult({
+        sourceReplyDeliveryMode: "message_tool_only",
+        toolName: "message",
+        args: { action: "send", to: "C0BL0FXQ43V", message: "reply" },
+        result: { deliveryStatus: "sent", receipt: { primaryPlatformMessageId: "123" } },
+        sourceConversation: { channelId: "C0BL0FXQ43V" },
+      }),
+    ).toBe(true);
+  });
+
+  it("ignores prose that merely mentions the source ids", () => {
+    expect(
+      isDeliveredMessageToolOnlySourceReplyResult({
+        sourceReplyDeliveryMode: "message_tool_only",
+        toolName: "message",
+        args: { action: "send", to: "C0OTHERCHAN", message: "reply" },
+        result: {
+          deliveryStatus: "sent",
+          receipt: { primaryPlatformMessageId: "123" },
+          text: "forwarded from C0BL0FXQ43V thread 1785357951.595659",
+        },
+        sourceConversation,
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps rejecting explicit sends when no source conversation is known", () => {
+    expect(
+      isDeliveredMessageToolOnlySourceReplyResult({
+        sourceReplyDeliveryMode: "message_tool_only",
+        toolName: "message",
+        args: { action: "send", to: "C0BL0FXQ43V", message: "reply" },
+        result: { deliveryStatus: "sent" },
+      }),
+    ).toBe(false);
+  });
+});

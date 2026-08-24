@@ -183,6 +183,10 @@ export async function prepareEmbeddedAttemptAgentSession(input: {
     agent: activeSession.agent,
     sourceReplyDeliveryMode: attempt.sourceReplyDeliveryMode,
     onDeliveredSourceReply: markSourceReplyDelivered,
+    sourceConversation: {
+      channelId: attempt.currentChannelId,
+      threadId: attempt.currentThreadTs,
+    },
   });
   input.markStage("agent-session");
 

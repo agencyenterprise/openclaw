@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import type { LiveSessionModelSelection } from "../../agents/live-model-switch.js";
 import type { SessionEntry } from "../../config/sessions.js";
+import { resolveTranscriptSessionKeyBySessionId } from "../../config/sessions/session-accessor.transcript.js";
 import { mergeSessionSnapshotChanges } from "../../config/sessions/session-snapshot-merge.js";
 import { parseSqliteSessionFileMarker } from "../../config/sessions/sqlite-marker.js";
 import { isCronSessionKey } from "../../sessions/session-key-utils.js";
@@ -59,8 +60,12 @@ export function resolveCronLifecycleRevisionIdentity(lifecycleRevision: string):
 
 function cronTranscriptExists(entry: SessionEntry): boolean {
   const sessionFile = entry.sessionFile?.trim();
-  if (parseSqliteSessionFileMarker(sessionFile)) {
-    return true;
+  const sqliteMarker = parseSqliteSessionFileMarker(sessionFile);
+  if (sqliteMarker) {
+    // Same standard of proof as the file branch below: a well-formed marker is
+    // not evidence the row survived. If it is gone the entry must persist
+    // non-resumable, or every later run dies reopening a session that is not there.
+    return Boolean(resolveTranscriptSessionKeyBySessionId(sqliteMarker));
   }
   return Boolean(sessionFile && fs.existsSync(sessionFile));
 }
@@ -128,7 +133,8 @@ export function createPersistCronSessionEntry(params: {
             projectCronOwnershipFields(params.cronSession.initialSessionEntry),
           );
         const canClaimInitialRevision = params.cronSession.initialSessionEntry
-          ? !currentRevisionActive && initialEntryMatchesOwnershipFields
+          ? currentEntry === undefined ||
+            (!currentRevisionActive && initialEntryMatchesOwnershipFields)
           : currentEntry === undefined;
         // Concurrent persistent runs can resolve the same initial row. Once one
         // revision claims it, older owners must not reclaim it and delete newer state.

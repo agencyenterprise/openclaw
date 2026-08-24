@@ -538,9 +538,86 @@ export function isDeliveredMessagingToolResult(params: {
   );
 }
 
+/** Identifies the conversation an embedded run is replying to. */
+export type SourceConversationRef = {
+  channelId?: string;
+  threadId?: string;
+};
+
+const CONVERSATION_CHANNEL_KEYS = ["channelId", "channel", "to", "target"];
+const CONVERSATION_THREAD_KEYS = ["threadId", "threadTs", "thread_ts"];
+const CONVERSATION_MATCH_MAX_DEPTH = 6;
+
+function normalizedEquals(value: unknown, expected: string): boolean {
+  return typeof value === "string" && value.trim().toLowerCase() === expected;
+}
+
+function envelopeHasMatchingValue(
+  value: unknown,
+  keys: string[],
+  expected: string,
+  depth = 0,
+): boolean {
+  if (!value || typeof value !== "object" || depth > CONVERSATION_MATCH_MAX_DEPTH) {
+    return false;
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => envelopeHasMatchingValue(item, keys, expected, depth + 1));
+  }
+  const record = value as Record<string, unknown>;
+  if (keys.some((key) => normalizedEquals(record[key], expected))) {
+    return true;
+  }
+  // Tool results often arrive as a JSON envelope inside a text content block.
+  // parseJsonRecord only matches full JSON objects, so prose mentioning an id cannot match.
+  if (typeof record.text === "string") {
+    const parsed = parseJsonRecord(record.text);
+    if (parsed && envelopeHasMatchingValue(parsed, keys, expected, depth + 1)) {
+      return true;
+    }
+  }
+  return Object.values(record).some((child) =>
+    envelopeHasMatchingValue(child, keys, expected, depth + 1),
+  );
+}
+
 /**
- * Only implicit-route, non-dry-run, delivered `message.send` calls qualify.
- * Explicit routes and other messaging tools are outbound side effects, not source replies.
+ * An explicit-route send still counts as the source reply when the evidence shows it
+ * landed in the source conversation: the route/receipt names the source channel, and,
+ * for threaded sources, the delivery receipt carries the source thread id.
+ */
+function explicitRouteTargetsSourceConversation(params: {
+  args?: unknown;
+  result?: unknown;
+  hookResult?: unknown;
+  sourceConversation?: SourceConversationRef;
+}): boolean {
+  const channelId = params.sourceConversation?.channelId?.trim().toLowerCase();
+  if (!channelId) {
+    return false;
+  }
+  const channelMatches =
+    envelopeHasMatchingValue(params.args, CONVERSATION_CHANNEL_KEYS, channelId) ||
+    envelopeHasMatchingValue(params.result, CONVERSATION_CHANNEL_KEYS, channelId) ||
+    envelopeHasMatchingValue(params.hookResult, CONVERSATION_CHANNEL_KEYS, channelId);
+  if (!channelMatches) {
+    return false;
+  }
+  const threadId = params.sourceConversation?.threadId?.trim().toLowerCase();
+  if (!threadId) {
+    return true;
+  }
+  return (
+    envelopeHasMatchingValue(params.result, CONVERSATION_THREAD_KEYS, threadId) ||
+    envelopeHasMatchingValue(params.hookResult, CONVERSATION_THREAD_KEYS, threadId)
+  );
+}
+
+/**
+ * Implicit-route, non-dry-run, delivered `message.send` calls qualify, as does an
+ * explicit-route send whose delivery evidence targets the source conversation itself.
+ * Explicit routes elsewhere and other messaging tools are outbound side effects,
+ * not source replies.
  */
 export function isDeliveredMessageToolOnlySourceReplyResult(params: {
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
@@ -550,6 +627,7 @@ export function isDeliveredMessageToolOnlySourceReplyResult(params: {
   hookResult?: unknown;
   isError?: boolean;
   allowExplicitSourceRoute?: boolean;
+  sourceConversation?: SourceConversationRef;
 }): boolean {
   if (params.sourceReplyDeliveryMode !== "message_tool_only") {
     return false;
@@ -563,7 +641,11 @@ export function isDeliveredMessageToolOnlySourceReplyResult(params: {
   if (!isMessageToolSendActionName(args.action) && !sourceRouteReplyAction) {
     return false;
   }
-  if (hasExplicitMessageRoute(args) && params.allowExplicitSourceRoute !== true) {
+  if (
+    hasExplicitMessageRoute(args) &&
+    params.allowExplicitSourceRoute !== true &&
+    !explicitRouteTargetsSourceConversation(params)
+  ) {
     return false;
   }
   return isDeliveredMessagingToolResult(params);

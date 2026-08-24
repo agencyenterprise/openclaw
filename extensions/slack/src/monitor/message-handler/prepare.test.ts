@@ -2178,7 +2178,7 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
     const slackCtx = createThreadSlackCtx({
       cfg: {
         session: { store: storePath },
-        channels: { slack: { enabled: true, replyToMode: "all", groupPolicy: "open" } },
+        channels: { slack: { enabled: true, replyToMode: "all", groupPolicy: "allowlist" } },
       } as OpenClawConfig,
       replies,
     });
@@ -4314,6 +4314,8 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
     });
     slackCtx.resolveChannelName = async () => ({ name: "proj-openclaw", type: "group" });
     slackCtx.resolveUserName = async () => ({ name: "Reviewer" });
+    slackCtx.allowFrom = ["UOWNER"];
+    slackCtx.botUserId = "U_BOT";
 
     const prepared = await prepareSlackMessage({
       ctx: slackCtx,
@@ -4322,7 +4324,7 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
         type: "message",
         channel: "C0AHSKBNDB6",
         channel_type: "group",
-        user: "U1",
+        user: "U_BOT",
         text: "private reviewer correction",
         ts: rootTs,
         event_ts: rootTs,
@@ -4331,7 +4333,7 @@ Second paragraph should still reach the agent after Slack's preview cutoff.`;
         openclaw_synthetic_message_id: syntheticMessageId,
         openclaw_replace_message_ts: replaceMessageTs,
       } as SlackMessageEvent,
-      opts: { source: "message", wasMentioned: true },
+      opts: { source: "message", wasMentioned: true, reviewerSynthetic: true },
     });
 
     assertPrepared(prepared);

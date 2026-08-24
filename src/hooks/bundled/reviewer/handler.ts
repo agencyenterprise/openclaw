@@ -15,8 +15,10 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { resolveAgentMaxConcurrent } from "../../../config/agent-limits.js";
 import type { OpenClawConfig } from "../../../config/config.js";
 import { createSubsystemLogger } from "../../../logging/subsystem.js";
+import { runTasksWithConcurrency } from "../../../utils/run-with-concurrency.js";
 import { resolveHookConfig } from "../../config.js";
 import type { HookHandler } from "../../hooks.js";
 import type { InternalHookEvent, MessageSentHookContext } from "../../internal-hooks.js";
@@ -906,16 +908,16 @@ export async function reviewerContinueAnswered(params: {
 
 // Has an "engage" row been answered? (A mention/review-start row, where the bot owes a
 // reply to the thread itself.) "Answered" = the bot's latest non-reviewer reply is newer
-// than the latest non-bot (actionable) message AND not older than the row opened (− skew) —
-// i.e. the bot has responded to the most recent human input. A trailing unanswered human
-// message keeps it open (re-engage). This is the original active-threads recovery semantics.
+// than the latest non-bot (actionable) message — i.e. the bot has responded to the most
+// recent human input. The durable row can be recreated after a reply during hook/restart
+// races, so its opened_at timestamp must not override Slack's authoritative ordering.
+// A trailing unanswered human message keeps it open (re-engage).
 // On any Slack error we return false (NOT answered → re-engage / keep). Never throws.
 export async function engageAnswered(params: {
   token: string;
   botUserId: string;
   channelId: string;
   threadTs: string;
-  openedAtMs: number;
 }): Promise<boolean> {
   try {
     const messages = await fetchSlackThread(
@@ -935,8 +937,7 @@ export async function engageAnswered(params: {
         latestActionableTs = Math.max(latestActionableTs, ts);
       }
     }
-    const openedSlackTs = params.openedAtMs / 1000;
-    return latestAssistantTs > latestActionableTs && latestAssistantTs >= openedSlackTs - 60;
+    return latestAssistantTs > latestActionableTs;
   } catch (err) {
     log.warn(
       `engage-answered probe failed for ${params.channelId}:${params.threadTs}: ${String(err)}`,
@@ -954,7 +955,7 @@ async function inflightRowAnswered(
   row: { kind: string; last_dispatch: number; opened_at: number },
 ): Promise<boolean> {
   return row.kind === "engage"
-    ? engageAnswered({ token, botUserId, channelId, threadTs, openedAtMs: row.opened_at })
+    ? engageAnswered({ token, botUserId, channelId, threadTs })
     : reviewerContinueAnswered({
         token,
         botUserId,
@@ -1551,9 +1552,19 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
       return;
     }
 
-    log.info(`gateway startup: respawning ${allThreads.length} interrupted thread(s)`);
+    const recoveryConcurrency = Math.min(
+      resolveAgentMaxConcurrent(startupCfg ?? loadOpenClawConfigFromDisk()),
+      allThreads.length,
+    );
+    log.info(
+      `gateway startup: scheduling ${allThreads.length} interrupted thread(s) with concurrency=${recoveryConcurrency}`,
+    );
 
-    // --- Phase 3: Poll for dispatch function + respawn threads ---
+    // --- Phase 3: Wait for the whole gateway to become ready, then respawn threads ---
+    // The Slack reviewer dispatch function is registered before agent command/runtime
+    // admission is ready. Awaiting recovery directly inside the startup hook deadlocks
+    // readiness, while dispatching immediately produces successful-looking zero-payload
+    // turns. Run recovery after this hook returns and gate it on the local /readyz probe.
     const dispatchKey = Symbol.for("openclaw.reviewerDispatch");
     type DispatchFn = (p: {
       channelId: string;
@@ -1561,52 +1572,85 @@ const handler: HookHandler = async (event: InternalHookEvent) => {
       text: string;
       replaceMessageTs?: string;
     }) => Promise<boolean>;
-    let dispatchFn: DispatchFn | undefined;
-    for (let attempt = 0; attempt < 30; attempt++) {
-      dispatchFn = (globalThis as Record<symbol, DispatchFn | undefined>)[dispatchKey];
-      if (dispatchFn) {
-        log.info(`reviewer dispatch ready after ${attempt + 1}s`);
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-    if (!dispatchFn) {
-      // In-flight ledger rows persist (never cleared on read), so the next restart
-      // re-attempts them automatically — no need to re-track anything here.
-      log.warn(
-        "gateway startup: reviewer dispatch not available after 30s — cannot respawn threads",
-      );
-      return;
-    }
-    // Dispatch all interrupted threads CONCURRENTLY. dispatchFn blocks until the
-    // re-engaged turn completes, so awaiting serially let one long turn starve the
-    // rest (only the first interrupted thread ever got respawned after a restart that
-    // interrupted >1 thread). Run them in parallel — bounded by the Main command lane
-    // (agents.defaults.maxConcurrent) — so every interrupted thread is re-engaged.
-    await Promise.allSettled(
-      allThreads.map(async ({ channelId, threadTs, text }) => {
+    const recoverAfterGatewayReady = async (): Promise<void> => {
+      const configuredPort = Number.parseInt(process.env.OPENCLAW_GATEWAY_PORT ?? "18789", 10);
+      const gatewayPort = Number.isFinite(configuredPort) ? configuredPort : 18789;
+      let gatewayReady = false;
+      for (let attempt = 0; attempt < 90; attempt++) {
         try {
-          // [INFLIGHT-LEDGER] Count the attempt immediately BEFORE dispatch (no-op for
-          // non-ledger threads). Over-counting by one on a mid-dispatch crash is safe; it
-          // never under-counts, so a genuinely stuck thread still reaches the quarantine ceiling.
-          markInflightAttempt(channelId, threadTs);
-          const dispatched = await dispatchFn({
-            channelId,
-            threadTs,
-            text: text ?? GENERIC_STARTUP_RECOVERY_TEXT,
-          });
-          if (dispatched) {
-            log.info(`respawned thread ${channelId}:${threadTs}`);
-          } else {
-            log.warn(
-              `failed to respawn ${channelId}:${threadTs}: dispatch returned false (ledger row persists for next restart)`,
-            );
+          const response = await fetch(`http://127.0.0.1:${gatewayPort}/readyz`);
+          if (response.ok) {
+            gatewayReady = true;
+            log.info(`gateway ready for reviewer recovery after ${attempt + 1}s`);
+            break;
           }
-        } catch (err) {
-          log.warn(`failed to respawn ${channelId}:${threadTs}: ${String(err)}`);
+        } catch {
+          // The listener or readiness route may not be attached yet.
         }
-      }),
-    );
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+      if (!gatewayReady) {
+        log.warn("gateway startup: not ready after 90s — cannot respawn threads");
+        return;
+      }
+
+      let dispatchFn: DispatchFn | undefined;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        dispatchFn = (globalThis as Record<symbol, DispatchFn | undefined>)[dispatchKey];
+        if (dispatchFn) {
+          log.info(`reviewer dispatch ready after gateway readiness (${attempt + 1}s)`);
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+      if (!dispatchFn) {
+        // In-flight ledger rows persist (never cleared on read), so the next restart
+        // re-attempts them automatically — no need to re-track anything here.
+        log.warn(
+          "gateway startup: reviewer dispatch not available after readiness — cannot respawn threads",
+        );
+        return;
+      }
+
+      log.info(
+        `gateway startup: respawning ${allThreads.length} interrupted thread(s) with concurrency=${recoveryConcurrency}`,
+      );
+      // dispatchFn creates a session before the Main command lane takes ownership, so an
+      // unbounded Promise.all here bypasses agents.defaults.maxConcurrent.
+      await runTasksWithConcurrency({
+        limit: recoveryConcurrency,
+        errorMode: "continue",
+        tasks: allThreads.map(({ channelId, threadTs, text }) => async () => {
+          try {
+            // [INFLIGHT-LEDGER] Count the attempt immediately BEFORE dispatch (no-op for
+            // non-ledger threads). Over-counting by one on a mid-dispatch crash is safe; it
+            // never under-counts, so a genuinely stuck thread still reaches the quarantine ceiling.
+            markInflightAttempt(channelId, threadTs);
+            const dispatched = await dispatchFn({
+              channelId,
+              threadTs,
+              text: text ?? GENERIC_STARTUP_RECOVERY_TEXT,
+            });
+            if (dispatched) {
+              log.info(`respawned thread ${channelId}:${threadTs}`);
+            } else {
+              log.warn(
+                `failed to respawn ${channelId}:${threadTs}: dispatch returned false (ledger row persists for next restart)`,
+              );
+            }
+          } catch (err) {
+            log.warn(`failed to respawn ${channelId}:${threadTs}: ${String(err)}`);
+          }
+        }),
+      });
+    };
+
+    const recoveryTimer = setTimeout(() => {
+      void recoverAfterGatewayReady().catch((err) => {
+        log.warn(`gateway startup: reviewer recovery failed: ${String(err)}`);
+      });
+    }, 0);
+    recoveryTimer.unref?.();
     return;
   }
 

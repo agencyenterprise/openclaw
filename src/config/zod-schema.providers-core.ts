@@ -988,6 +988,31 @@ const SlackAccountSchema = z
     requireMention: z.boolean().optional(),
     groupPolicy: GroupPolicySchema.optional(),
     mentionPatterns: MentionPatternsPolicySchema.optional(),
+    appMessageTriggers: z
+      .array(
+        z
+          .object({
+            userId: z.string().min(1),
+            appId: z.string().min(1).optional(),
+            textPattern: z
+              .string()
+              .refine((value) => {
+                try {
+                  new RegExp(value, "u");
+                  return true;
+                } catch {
+                  return false;
+                }
+              }, "textPattern must be a valid regular expression")
+              .optional(),
+          })
+          .strict()
+          .refine(
+            (value) => Boolean(value.appId || value.textPattern),
+            "appMessageTriggers entries need appId or textPattern",
+          ),
+      )
+      .optional(),
     contextVisibility: ContextVisibilityModeSchema.optional(),
     historyLimit: z.number().int().min(0).optional(),
     dmHistoryLimit: z.number().int().min(0).optional(),

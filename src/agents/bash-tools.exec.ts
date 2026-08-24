@@ -16,7 +16,7 @@ import {
   type ExecAsk,
   type ExecHost,
   type ExecSecurity,
-  loadExecApprovals,
+  loadExecApprovalsForExec,
   maxAsk,
   minSecurity,
   normalizeExecAsk,
@@ -1688,7 +1688,9 @@ export function createExecTool(
         host === "sandbox"
           ? undefined
           : resolveExecApprovalsFromFile({
-              file: loadExecApprovals(),
+              // Raises ExecApprovalsBusyError on lock contention so a busy
+              // store reads as "retry", never as a security=deny lockdown.
+              file: loadExecApprovalsForExec(),
               agentId,
               overrides: {
                 security: "full",

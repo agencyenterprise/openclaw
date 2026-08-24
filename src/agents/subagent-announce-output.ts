@@ -226,6 +226,7 @@ export async function readSubagentOutput(
       ? await subagentAnnounceOutputDeps.callGateway({
           method: "chat.history",
           params: { sessionKey, limit: 100 },
+          timeoutMs: 45_000,
         })
       : undefined;
   const sourceMessages = messages ?? (Array.isArray(history?.messages) ? history.messages : []);

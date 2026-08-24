@@ -2,7 +2,10 @@ import type { SourceReplyDeliveryMode } from "../../../auto-reply/get-reply-opti
 /**
  * Detects message-tool-only sends that delivered a visible source reply.
  */
-import { isDeliveredMessageToolOnlySourceReplyResult } from "../../embedded-agent-message-tool-source-reply.js";
+import {
+  isDeliveredMessageToolOnlySourceReplyResult,
+  type SourceConversationRef,
+} from "../../embedded-agent-message-tool-source-reply.js";
 import type { AfterToolCallContext, AfterToolCallResult, Agent } from "../../runtime/index.js";
 
 function argsRecordForToolCall(context: AfterToolCallContext): Record<string, unknown> {
@@ -24,6 +27,7 @@ function isDeliveredMessageToolOnlySourceReply(params: {
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   context: AfterToolCallContext;
   hookResult?: AfterToolCallResult;
+  sourceConversation?: SourceConversationRef;
 }): boolean {
   return isDeliveredMessageToolOnlySourceReplyResult({
     sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
@@ -32,6 +36,7 @@ function isDeliveredMessageToolOnlySourceReply(params: {
     result: params.context.result,
     hookResult: params.hookResult,
     isError: params.hookResult?.isError ?? params.context.isError,
+    sourceConversation: params.sourceConversation,
   });
 }
 
@@ -40,6 +45,7 @@ export function installMessageToolOnlyTerminalHook(params: {
   agent: Agent;
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   onDeliveredSourceReply?: () => void;
+  sourceConversation?: SourceConversationRef;
 }): void {
   if (params.sourceReplyDeliveryMode !== "message_tool_only") {
     return;
@@ -52,6 +58,7 @@ export function installMessageToolOnlyTerminalHook(params: {
         sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
         context,
         hookResult,
+        sourceConversation: params.sourceConversation,
       })
     ) {
       params.onDeliveredSourceReply?.();
