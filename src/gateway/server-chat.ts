@@ -11,6 +11,7 @@ import { readToolValidationErrorSummary } from "../agents/tool-error-summary.js"
 import { DEFAULT_HEARTBEAT_ACK_MAX_CHARS, stripHeartbeatToken } from "../auto-reply/heartbeat.js";
 import { normalizeVerboseLevel } from "../auto-reply/thinking.js";
 import { getRuntimeConfig } from "../config/io.js";
+import { loadSessionEntry as loadAccessorSessionEntry } from "../config/sessions/session-accessor.js";
 import {
   type AgentEventPayload,
   type AgentEventRuntimePayload,
@@ -52,7 +53,6 @@ import {
   isRestartRecoveryLifecycleEvent,
   isStaleLifecycleEventForSession,
 } from "./session-lifecycle-state.js";
-import { loadSessionEntry } from "./session-utils.js";
 import { formatForLog } from "./ws-log.js";
 
 export {
@@ -456,7 +456,7 @@ export function createAgentEventHandler({
     agentId: string | undefined,
     event: AgentEventPayload,
   ): { suppress: boolean } => {
-    // loadSessionEntry reads and parses the ENTIRE session store (every
+    // The gateway-level loadSessionEntry reads and parses the ENTIRE session store (every
     // session_entries row) on each call. Deltas and tool events arrive by the
     // thousand per run and can never be recovery lifecycle events, so decide
     // from the event alone first (2026-08-28: this read was 63% of gateway
@@ -465,7 +465,8 @@ export function createAgentEventHandler({
       return { suppress: false };
     }
     try {
-      const { entry } = loadSessionEntry(sessionKey, {
+      const entry = loadAccessorSessionEntry({
+        sessionKey,
         ...(agentId ? { agentId } : {}),
         clone: false,
       });
@@ -1273,7 +1274,10 @@ export function createAgentEventHandler({
       return runVerbose ?? "off";
     }
     try {
-      const { cfg, entry } = loadSessionEntry(sessionKey);
+      // Runs for every tool event: read only this session's row (indexed lookup
+      // with deterministic legacy-key precedence), never the whole store.
+      const cfg = getRuntimeConfig();
+      const entry = loadAccessorSessionEntry({ sessionKey, clone: false });
       const sessionVerbose = normalizeVerboseLevel(entry?.verboseLevel);
       const sessionUpdatedAt = typeof entry?.updatedAt === "number" ? entry.updatedAt : undefined;
       const sessionChangedAfterRunStarted =

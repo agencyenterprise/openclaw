@@ -45,6 +45,11 @@ vi.mock("./server-chat.load-gateway-session-row.runtime.js", () => ({
   loadGatewaySessionRow: vi.fn(),
 }));
 
+vi.mock("../config/sessions/session-accessor.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../config/sessions/session-accessor.js")>()),
+  loadSessionEntry: vi.fn(() => undefined),
+}));
+
 vi.mock("./session-utils.js", () => ({
   loadSessionEntry: vi.fn(() => ({
     cfg: {},
@@ -58,6 +63,7 @@ vi.mock("./session-utils.js", () => ({
 }));
 
 import { getRuntimeConfig } from "../config/io.js";
+import { loadSessionEntry as loadAccessorSessionEntry } from "../config/sessions/session-accessor.js";
 import { resolveHeartbeatVisibility } from "../infra/heartbeat-visibility.js";
 import {
   createAgentEventHandler,
@@ -92,6 +98,7 @@ describe("agent event handler", () => {
         storeKeys: ["session-1"],
         legacyKey: undefined,
       });
+    vi.mocked(loadAccessorSessionEntry).mockReset().mockReturnValue(undefined);
     vi.mocked(loadGatewaySessionRow).mockReset().mockReturnValue(null);
     persistGatewaySessionLifecycleEventMock.mockReset().mockResolvedValue(undefined);
     logErrorMock.mockReset();
@@ -1713,14 +1720,10 @@ describe("agent event handler", () => {
       now: 1_000,
       resolveSessionKeyForRun: () => "session-1",
     });
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: { sessionId: "session-1", verboseLevel: "on", updatedAt: 1_500 },
-      canonicalKey: "session-1",
-      storeKeys: ["session-1"],
-      legacyKey: undefined,
+    vi.mocked(loadAccessorSessionEntry).mockReturnValue({
+      sessionId: "session-1",
+      verboseLevel: "on",
+      updatedAt: 1_500,
     });
 
     registerAgentRunContext("run-tool-toggle", {
@@ -1751,14 +1754,10 @@ describe("agent event handler", () => {
       now: 2_000,
       resolveSessionKeyForRun: () => "session-1",
     });
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: { sessionId: "session-1", verboseLevel: "off", updatedAt: 1_500 },
-      canonicalKey: "session-1",
-      storeKeys: ["session-1"],
-      legacyKey: undefined,
+    vi.mocked(loadAccessorSessionEntry).mockReturnValue({
+      sessionId: "session-1",
+      verboseLevel: "off",
+      updatedAt: 1_500,
     });
 
     registerAgentRunContext("run-tool-inline", {
@@ -2321,25 +2320,17 @@ describe("agent event handler", () => {
   });
 
   it("suppresses late interrupted pre-restart lifecycle events from live projections", () => {
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        abortedLastRun: true,
-        restartRecoveryRuns: [
-          {
-            runId: "interrupted-run",
-            lifecycleGeneration: "pre-restart",
-          },
-        ],
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
+    vi.mocked(loadAccessorSessionEntry).mockReturnValue({
+      sessionId: "session-recovery",
+      updatedAt: 2_000,
+      status: "running",
+      abortedLastRun: true,
+      restartRecoveryRuns: [
+        {
+          runId: "interrupted-run",
+          lifecycleGeneration: "pre-restart",
+        },
+      ],
     });
     const {
       broadcast,
@@ -2390,25 +2381,17 @@ describe("agent event handler", () => {
   });
 
   it("projects successful completion when a restart marker was persisted before abort", async () => {
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        abortedLastRun: true,
-        restartRecoveryRuns: [
-          {
-            runId: "completed-during-marker-write",
-            lifecycleGeneration: "pre-restart",
-          },
-        ],
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
+    vi.mocked(loadAccessorSessionEntry).mockReturnValue({
+      sessionId: "session-recovery",
+      updatedAt: 2_000,
+      status: "running",
+      abortedLastRun: true,
+      restartRecoveryRuns: [
+        {
+          runId: "completed-during-marker-write",
+          lifecycleGeneration: "pre-restart",
+        },
+      ],
     });
     const markTrackedRunTerminalPersisted = vi.fn();
     const trackTrackedRunTerminalPersistence = vi.fn();
@@ -2486,20 +2469,12 @@ describe("agent event handler", () => {
         lifecycleGeneration: "pre-restart",
       },
     ];
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        abortedLastRun: true,
-        restartRecoveryRuns,
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
+    vi.mocked(loadAccessorSessionEntry).mockReturnValue({
+      sessionId: "session-recovery",
+      updatedAt: 2_000,
+      status: "running",
+      abortedLastRun: true,
+      restartRecoveryRuns,
     });
     vi.mocked(loadGatewaySessionRow).mockReturnValue({
       key: "session-recovery",
@@ -2557,20 +2532,12 @@ describe("agent event handler", () => {
         lifecycleGeneration: "pre-restart-b",
       },
     ];
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        abortedLastRun: true,
-        restartRecoveryRuns,
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
+    vi.mocked(loadAccessorSessionEntry).mockReturnValue({
+      sessionId: "session-recovery",
+      updatedAt: 2_000,
+      status: "running",
+      abortedLastRun: true,
+      restartRecoveryRuns,
     });
     let currentRow = {
       key: "session-recovery",
@@ -2649,18 +2616,10 @@ describe("agent event handler", () => {
   });
 
   it("reloads canonical state when a restart marker races terminal persistence", async () => {
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
+    vi.mocked(loadAccessorSessionEntry).mockReturnValue({
+      sessionId: "session-recovery",
+      updatedAt: 2_000,
+      status: "running",
     });
     let currentRow = {
       key: "session-recovery",
@@ -2772,24 +2731,16 @@ describe("agent event handler", () => {
   });
 
   it("does not clear a same-id retry when an old restart terminal arrives", () => {
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        restartRecoveryRuns: [
-          {
-            runId: "shared-run",
-            lifecycleGeneration: "pre-restart",
-          },
-        ],
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
+    vi.mocked(loadAccessorSessionEntry).mockReturnValue({
+      sessionId: "session-recovery",
+      updatedAt: 2_000,
+      status: "running",
+      restartRecoveryRuns: [
+        {
+          runId: "shared-run",
+          lifecycleGeneration: "pre-restart",
+        },
+      ],
     });
     registerAgentRunContext("shared-run", {
       sessionKey: "session-recovery",
@@ -2865,24 +2816,16 @@ describe("agent event handler", () => {
     });
     expect(vi.getTimerCount()).toBe(1);
 
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        restartRecoveryRuns: [
-          {
-            runId: "shared-run",
-            lifecycleGeneration: "pre-restart",
-          },
-        ],
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
+    vi.mocked(loadAccessorSessionEntry).mockReturnValue({
+      sessionId: "session-recovery",
+      updatedAt: 2_000,
+      status: "running",
+      restartRecoveryRuns: [
+        {
+          runId: "shared-run",
+          lifecycleGeneration: "pre-restart",
+        },
+      ],
     });
     activeLifecycleGeneration = "post-restart";
     registerAgentRunContext("shared-run", {
@@ -5097,7 +5040,7 @@ describe("agent event handler", () => {
       resolveSessionKeyForRun: () => "session-1",
     });
     chatRunState.registry.add("hot-run", { sessionKey: "session-1", clientRunId: "hot-run" });
-    vi.mocked(loadSessionEntry).mockClear();
+    vi.mocked(loadAccessorSessionEntry).mockClear();
 
     handler({
       runId: "hot-run",
@@ -5115,7 +5058,7 @@ describe("agent event handler", () => {
       ts: 1_100,
       data: { phase: "end", endedAt: 1_100 },
     });
-    expect(loadSessionEntry).not.toHaveBeenCalled();
+    expect(loadAccessorSessionEntry).not.toHaveBeenCalled();
 
     handler({
       runId: "hot-run",
@@ -5126,7 +5069,80 @@ describe("agent event handler", () => {
       ts: 1_200,
       data: { phase: "end", aborted: true, stopReason: "restart", endedAt: 1_200 },
     });
-    expect(loadSessionEntry).toHaveBeenCalledTimes(1);
+    expect(loadAccessorSessionEntry).toHaveBeenCalledTimes(1);
   });
+
+  it("resolves tool verbose from the session's own entry without loading the whole store", () => {
+    const { nodeSendToSession, handler } = createHarness({
+      now: 1_000,
+      resolveSessionKeyForRun: () => "session-1",
+    });
+    vi.mocked(loadAccessorSessionEntry).mockReturnValue({
+      sessionId: "session-1",
+      verboseLevel: "on",
+      updatedAt: 1_500,
+    });
+    registerAgentRunContext("run-tool-accessor", {
+      sessionKey: "session-1",
+      verboseLevel: "off",
+    });
+
+    handler({
+      runId: "run-tool-accessor",
+      seq: 1,
+      stream: "tool",
+      ts: Date.now(),
+      data: { phase: "start", name: "read", toolCallId: "t-accessor" },
+    });
+
+    expect(loadAccessorSessionEntry).toHaveBeenCalledWith({
+      sessionKey: "session-1",
+      clone: false,
+    });
+    const nodeToolCalls = nodeSendToSession.mock.calls.filter(([, event]) => event === "agent");
+    expect(nodeToolCalls).toHaveLength(1);
+  });
+
+  it.each([
+    { stream: "assistant", data: { text: "delta" }, reads: 0 },
+    { stream: "lifecycle", data: { phase: "end", endedAt: 1_100 }, reads: 0 },
+    { stream: "tool", data: { phase: "result", name: "read" }, reads: 1 },
+    { stream: "tool", data: { phase: "error", name: "read" }, reads: 1 },
+  ] as const)(
+    "reads at most the session's own entry for $stream/$data.phase events",
+    ({ reads, ...event }) => {
+      const { chatRunState, handler } = createHarness({
+        resolveSessionKeyForRun: () => "session-1",
+      });
+      chatRunState.registry.add("hot-run", { sessionKey: "session-1", clientRunId: "hot-run" });
+      vi.mocked(loadAccessorSessionEntry).mockClear();
+      handler({ runId: "hot-run", seq: 1, sessionKey: "session-1", ts: 1_000, ...event });
+      expect(loadAccessorSessionEntry).toHaveBeenCalledTimes(reads);
+    },
+  );
+
+  it.each([
+    { data: { phase: "start" } },
+    { data: { phase: "error", aborted: true, stopReason: "restart" } },
+  ] as const)(
+    "reads the session store for lifecycle $data.phase events that can be recovery events",
+    (event) => {
+      const { chatRunState, handler } = createHarness({
+        resolveSessionKeyForRun: () => "session-1",
+      });
+      chatRunState.registry.add("hot-run", { sessionKey: "session-1", clientRunId: "hot-run" });
+      vi.mocked(loadAccessorSessionEntry).mockClear();
+      handler({
+        runId: "hot-run",
+        lifecycleGeneration: "pre-restart",
+        seq: 1,
+        stream: "lifecycle",
+        sessionKey: "session-1",
+        ts: 1_000,
+        ...event,
+      });
+      expect(loadAccessorSessionEntry).toHaveBeenCalledTimes(1);
+    },
+  );
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
