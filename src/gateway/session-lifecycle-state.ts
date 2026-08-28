@@ -234,24 +234,35 @@ export function deriveGatewaySessionLifecycleProjectionPatch(params: {
   return patch;
 }
 
+/**
+ * Event-only half of isRestartRecoveryLifecycleEvent: only a lifecycle start,
+ * or an end/error interrupted by a restart, can ever match a recovery run.
+ * Callers on the high-volume agent event path check this BEFORE touching the
+ * session store, so deltas and tool events never pay for a store read.
+ */
+export function canMatchRestartRecoveryLifecycleEvent(
+  event: Pick<LifecycleEventLike, "data">,
+): boolean {
+  const phase = resolveLifecyclePhase(event);
+  const interrupted = event.data?.stopReason === "restart";
+  return phase === "start" || ((phase === "end" || phase === "error") && interrupted);
+}
+
 export function isRestartRecoveryLifecycleEvent(params: {
   entry?: Pick<SessionEntry, "restartRecoveryRuns"> | null;
   event: Pick<LifecycleEventLike, "runId" | "lifecycleGeneration" | "data">;
 }): boolean {
+  if (!canMatchRestartRecoveryLifecycleEvent(params.event)) {
+    return false;
+  }
   const runId = params.event.runId?.trim();
   const lifecycleGeneration = params.event.lifecycleGeneration?.trim();
-  const phase = resolveLifecyclePhase(params.event);
-  const interrupted = params.event.data?.stopReason === "restart";
-  const matchesRecoveryRun = Boolean(
+  return Boolean(
     runId &&
     lifecycleGeneration &&
     params.entry?.restartRecoveryRuns?.some(
       (run) => run.runId === runId && run.lifecycleGeneration === lifecycleGeneration,
     ),
-  );
-  return (
-    matchesRecoveryRun &&
-    (phase === "start" || ((phase === "end" || phase === "error") && interrupted))
   );
 }
 

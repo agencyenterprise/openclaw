@@ -5091,5 +5091,42 @@ describe("agent event handler", () => {
       }
     });
   });
+
+  it("does not read the session store for events that cannot be restart-recovery lifecycle events", () => {
+    const { chatRunState, handler } = createHarness({
+      resolveSessionKeyForRun: () => "session-1",
+    });
+    chatRunState.registry.add("hot-run", { sessionKey: "session-1", clientRunId: "hot-run" });
+    vi.mocked(loadSessionEntry).mockClear();
+
+    handler({
+      runId: "hot-run",
+      seq: 1,
+      stream: "assistant",
+      sessionKey: "session-1",
+      ts: 1_000,
+      data: { text: "streamed delta" },
+    });
+    handler({
+      runId: "hot-run",
+      seq: 2,
+      stream: "lifecycle",
+      sessionKey: "session-1",
+      ts: 1_100,
+      data: { phase: "end", endedAt: 1_100 },
+    });
+    expect(loadSessionEntry).not.toHaveBeenCalled();
+
+    handler({
+      runId: "hot-run",
+      lifecycleGeneration: "pre-restart",
+      seq: 3,
+      stream: "lifecycle",
+      sessionKey: "session-1",
+      ts: 1_200,
+      data: { phase: "end", aborted: true, stopReason: "restart", endedAt: 1_200 },
+    });
+    expect(loadSessionEntry).toHaveBeenCalledTimes(1);
+  });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

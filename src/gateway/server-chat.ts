@@ -48,6 +48,7 @@ import { loadGatewaySessionRow } from "./server-chat.load-gateway-session-row.ru
 import { persistGatewaySessionLifecycleEvent } from "./server-chat.persist-session-lifecycle.runtime.js";
 import {
   deriveGatewaySessionLifecycleProjectionPatch,
+  canMatchRestartRecoveryLifecycleEvent,
   isRestartRecoveryLifecycleEvent,
   isStaleLifecycleEventForSession,
 } from "./session-lifecycle-state.js";
@@ -455,6 +456,14 @@ export function createAgentEventHandler({
     agentId: string | undefined,
     event: AgentEventPayload,
   ): { suppress: boolean } => {
+    // loadSessionEntry reads and parses the ENTIRE session store (every
+    // session_entries row) on each call. Deltas and tool events arrive by the
+    // thousand per run and can never be recovery lifecycle events, so decide
+    // from the event alone first (2026-08-28: this read was 63% of gateway
+    // main-thread time and the cause of 30-40 s event-loop stalls).
+    if (!canMatchRestartRecoveryLifecycleEvent(event)) {
+      return { suppress: false };
+    }
     try {
       const { entry } = loadSessionEntry(sessionKey, {
         ...(agentId ? { agentId } : {}),
