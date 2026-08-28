@@ -87,6 +87,7 @@ import {
 import { registerSlackReviewerMessageHandler } from "./reviewer-dispatch.js";
 import { setSlackDefaultSendIdentity } from "./send.runtime.js";
 import { registerSlackMonitorSlashCommands } from "./slash.js";
+import { runSlackStartupAuthTestWithRetry } from "./startup-auth-retry.js";
 import type { MonitorSlackOpts } from "./types.js";
 
 let slackBoltInterop: SlackBoltResolvedExports | undefined;
@@ -193,6 +194,12 @@ function resolveSlackRelayConfig(params: { relay: unknown; accountId: string }):
     gatewayId,
   };
 }
+
+// A boot-time auth.test that fails on transport leaves the account without a bot
+// user id until the next restart (mention detection off). Retry transient
+// failures; a platform error (invalid token) still fails immediately.
+const SLACK_STARTUP_AUTH_TEST_ATTEMPTS = 5;
+const SLACK_STARTUP_AUTH_TEST_RETRY_DELAY_MS = 15_000;
 
 export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
   const cfg = opts.config ?? getRuntimeConfig();
@@ -385,7 +392,19 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
   let authIdentityWarning: string | undefined;
   let authTestIdentity: SlackAuthTestIdentity | undefined;
   try {
-    const auth = await createSlackStartupAuthClient(botToken, clientOptions).auth.test();
+    const auth = await runSlackStartupAuthTestWithRetry({
+      authTest: () => createSlackStartupAuthClient(botToken, clientOptions).auth.test(),
+      attempts: SLACK_STARTUP_AUTH_TEST_ATTEMPTS,
+      delayMs: SLACK_STARTUP_AUTH_TEST_RETRY_DELAY_MS,
+      onRetry: (attempt, message) => {
+        runtime.log?.(
+          warn(
+            `[${account.accountId}] slack auth.test attempt ${attempt}/${SLACK_STARTUP_AUTH_TEST_ATTEMPTS} ` +
+              `failed (${message}); retrying in ${SLACK_STARTUP_AUTH_TEST_RETRY_DELAY_MS}ms`,
+          ),
+        );
+      },
+    });
     const authUserId = normalizeOptionalString(auth.user_id) ?? "";
     botId = normalizeOptionalString((auth as { bot_id?: string }).bot_id) ?? "";
     // Slack documents bot_id only for bot-token identities. Never treat the user behind a
