@@ -25,6 +25,7 @@ import {
   readTranscriptMutationStateInTransaction,
   writeSessionRoute,
 } from "./session-accessor.sqlite-transcript-state.js";
+import { copySessionEntryForPersistence } from "./session-entry-runtime-normalize.js";
 import {
   foldedSessionKeyAliasCandidates,
   normalizeStoreSessionKey,
@@ -55,6 +56,10 @@ class SqliteSessionMutationConflictError extends Error {
     this.name = "SqliteSessionMutationConflictError";
   }
 }
+
+export const testing = {
+  normalizeSessionEntryForSqlitePersistence: copySessionEntryForPersistence,
+};
 
 export function readSqliteSessionIdentitySnapshot(
   database: OpenClawAgentDatabase,
@@ -386,6 +391,7 @@ export function writeSessionEntry(
 ): void {
   const db = getSessionKysely(database.db);
   const normalizedEntry = normalizeSqliteSessionEntryTimestamp(entry);
+  const persistedEntry = copySessionEntryForPersistence(normalizedEntry);
   const updatedAt = normalizedEntry.updatedAt;
   const previousEntry = readExactSessionEntryRow(database, sessionKey)?.entry;
   // Registry writes snapshot the current transcript watermark so recovery can
@@ -450,14 +456,14 @@ export function writeSessionEntry(
       .values({
         session_key: sessionKey,
         session_id: normalizedEntry.sessionId,
-        entry_json: JSON.stringify(normalizedEntry),
+        entry_json: JSON.stringify(persistedEntry),
         updated_at: updatedAt,
         status: normalizeSqliteStatus(normalizedEntry.status),
       })
       .onConflict((conflict) =>
         conflict.column("session_key").doUpdateSet({
           session_id: normalizedEntry.sessionId,
-          entry_json: JSON.stringify(normalizedEntry),
+          entry_json: JSON.stringify(persistedEntry),
           updated_at: updatedAt,
           status: normalizeSqliteStatus(normalizedEntry.status),
         }),

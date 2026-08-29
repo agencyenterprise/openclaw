@@ -63,21 +63,71 @@ describe("resolveReusableWorkspaceSkillSnapshot", () => {
   });
 
   it("reuses cached resolvedSkills across calls with the same workspace, version, and filter", () => {
+    const resolvedSkills = [{ name: "test" }];
+    buildWorkspaceSkillSnapshotMock.mockReturnValue({ prompt: "", skills: [], resolvedSkills });
     const snapshot = strippedSnapshot();
 
-    resolveReusableWorkspaceSkillSnapshot({
+    const first = resolveReusableWorkspaceSkillSnapshot({
       workspaceDir: TEST_WORKSPACE_DIR,
       config: {},
       existingSnapshot: snapshot,
     });
+    expect(first.snapshot).not.toBe(snapshot);
+    expect(first.snapshot.resolvedSkills).toBe(resolvedSkills);
+    expect(Object.keys(first.snapshot)).not.toContain("resolvedSkills");
     expect(buildWorkspaceSkillSnapshotMock).toHaveBeenCalledTimes(1);
 
-    resolveReusableWorkspaceSkillSnapshot({
+    const secondSnapshot = strippedSnapshot();
+    const second = resolveReusableWorkspaceSkillSnapshot({
       workspaceDir: TEST_WORKSPACE_DIR,
       config: {},
-      existingSnapshot: { ...snapshot },
+      existingSnapshot: secondSnapshot,
     });
+    expect(second.snapshot).not.toBe(secondSnapshot);
+    expect(second.snapshot.resolvedSkills).toBe(resolvedSkills);
     expect(buildWorkspaceSkillSnapshotMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares refreshed resolvedSkills arrays and keeps them out of JSON", () => {
+    const builtArrays = [[{ name: "first" }], [{ name: "second" }]];
+    buildWorkspaceSkillSnapshotMock
+      .mockReturnValueOnce({ prompt: "", skills: [], resolvedSkills: builtArrays[0] })
+      .mockReturnValueOnce({ prompt: "", skills: [], resolvedSkills: builtArrays[1] });
+
+    const first = resolveReusableWorkspaceSkillSnapshot({
+      workspaceDir: TEST_WORKSPACE_DIR,
+      config: {},
+      existingSnapshot: strippedSnapshot("test", 0),
+    });
+    const second = resolveReusableWorkspaceSkillSnapshot({
+      workspaceDir: TEST_WORKSPACE_DIR,
+      config: {},
+      existingSnapshot: strippedSnapshot("test", 0),
+    });
+
+    expect(first.shouldRefresh).toBe(true);
+    expect(second.shouldRefresh).toBe(true);
+    expect(first.snapshot.resolvedSkills).toBe(builtArrays[0]);
+    expect(second.snapshot.resolvedSkills).toBe(builtArrays[0]);
+    expect(second.snapshot.resolvedSkills).not.toBe(builtArrays[1]);
+    expect(JSON.stringify(first.snapshot)).not.toContain("resolvedSkills");
+    expect(JSON.stringify(second.snapshot)).not.toContain("resolvedSkills");
+    expect(buildWorkspaceSkillSnapshotMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves stripped cron snapshots unchanged when hydration is disabled", () => {
+    const existingSnapshot = strippedSnapshot("legacy");
+
+    const result = resolveReusableWorkspaceSkillSnapshot({
+      workspaceDir: TEST_WORKSPACE_DIR,
+      config: {},
+      existingSnapshot,
+      hydrateExisting: false,
+    });
+
+    expect(result.snapshot).toBe(existingSnapshot);
+    expect(result.snapshot.resolvedSkills).toBeUndefined();
+    expect(buildWorkspaceSkillSnapshotMock).not.toHaveBeenCalled();
   });
 
   it("invalidates cached resolvedSkills when skillFilter changes", () => {
@@ -210,7 +260,7 @@ describe("resolveReusableWorkspaceSkillSnapshot", () => {
     const second = resolveReusableWorkspaceSkillSnapshot({
       workspaceDir: TEST_WORKSPACE_DIR,
       config: { channels: { discord: {} } } as OpenClawConfig,
-      existingSnapshot: { ...snapshot },
+      existingSnapshot: snapshot,
     });
 
     expect(second.snapshot.resolvedSkills).toEqual([]);
@@ -239,6 +289,37 @@ describe("resolveReusableWorkspaceSkillSnapshot", () => {
     });
 
     expect(buildWorkspaceSkillSnapshotMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("separates empty and configured skill secret inputs in the cache key", () => {
+    buildWorkspaceSkillSnapshotMock.mockImplementation((_workspaceDir, opts) => {
+      const config = (opts as { config?: OpenClawConfig }).config;
+      const skillConfig = config?.skills?.entries?.deploy;
+      const hasConfiguredSecret =
+        Boolean(skillConfig?.apiKey?.toString().trim()) ||
+        Boolean(skillConfig?.env?.API_KEY?.trim());
+      return {
+        prompt: "",
+        skills: [],
+        resolvedSkills: hasConfiguredSecret ? [{ name: "deploy" }] : [],
+      };
+    });
+    const snapshot = strippedSnapshot("deploy");
+
+    const empty = resolveReusableWorkspaceSkillSnapshot({
+      workspaceDir: TEST_WORKSPACE_DIR,
+      config: { skills: { entries: { deploy: { apiKey: "", env: { API_KEY: "" } } } } },
+      existingSnapshot: snapshot,
+    });
+    const configured = resolveReusableWorkspaceSkillSnapshot({
+      workspaceDir: TEST_WORKSPACE_DIR,
+      config: { skills: { entries: { deploy: { apiKey: "configured", env: { API_KEY: "" } } } } },
+      existingSnapshot: snapshot,
+    });
+
+    expect(empty.snapshot.resolvedSkills).toEqual([]);
+    expect(configured.snapshot.resolvedSkills).toEqual([{ name: "deploy" }]);
+    expect(buildWorkspaceSkillSnapshotMock).toHaveBeenCalledTimes(2);
   });
 
   it("refreshes persisted snapshots missing the current prompt format marker", () => {

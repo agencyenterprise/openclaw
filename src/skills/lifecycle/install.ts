@@ -18,6 +18,7 @@ import {
 } from "../loading/config.js";
 import { resolveSkillSource } from "../loading/source.js";
 import { loadWorkspaceSkillEntries as defaultLoadWorkspaceSkillEntries } from "../loading/workspace.js";
+import { bumpSkillsSnapshotVersion } from "../runtime/refresh-state.js";
 import type { SkillEntry, SkillInstallSpec, SkillsInstallPreferences } from "../types.js";
 import { installDownloadSpec } from "./install-download.js";
 import { formatInstallFailureMessage } from "./install-output.js";
@@ -64,6 +65,17 @@ function withWarnings(result: SkillInstallResult, warnings: string[]): SkillInst
     ...result,
     warnings: warnings.slice(),
   };
+}
+
+function finalizeSkillInstallResult(params: {
+  result: SkillInstallResult;
+  warnings: string[];
+  workspaceDir: string;
+}): SkillInstallResult {
+  if (params.result.ok) {
+    bumpSkillsSnapshotVersion({ workspaceDir: params.workspaceDir, reason: "manual" });
+  }
+  return withWarnings(params.result, params.warnings);
 }
 
 function resolveInstallId(spec: SkillInstallSpec, index: number): string {
@@ -752,7 +764,7 @@ export async function installSkill(params: SkillInstallRequest): Promise<SkillIn
   }
   if (spec.kind === "download") {
     const downloadResult = await installDownloadSpec({ entry, spec, timeoutMs });
-    return withWarnings(downloadResult, warnings);
+    return finalizeSkillInstallResult({ result: downloadResult, warnings, workspaceDir });
   }
 
   const prefs = deps.resolveSkillsInstallPreferences(params.config);
@@ -816,7 +828,7 @@ export async function installSkill(params: SkillInstallRequest): Promise<SkillIn
     spec.kind === "go" && !installResult.ok && isGoToolchainPrerequisiteFailure(installResult)
       ? { ...installResult, skipReason: "go" as const }
       : installResult;
-  return withWarnings(normalizedResult, warnings);
+  return finalizeSkillInstallResult({ result: normalizedResult, warnings, workspaceDir });
 }
 
 const testing = {

@@ -51,11 +51,14 @@ describe("hydrateResolvedSkills", () => {
       };
     });
     expect(buildCalls).toBe(1);
+    expect(result).not.toBe(stripped);
     expect(result.prompt).toBe("original-prompt");
     expect(result.skills).toEqual([{ name: "x" }]);
     expect(result.skillFilter).toEqual(["x"]);
     expect(result.version).toBe(7);
     expect(result.resolvedSkills).toBe(rebuiltSkills);
+    expect(Object.keys(result)).not.toContain("resolvedSkills");
+    expect(stripped.resolvedSkills).toBeUndefined();
   });
 
   it("treats an empty resolvedSkills array as populated", () => {

@@ -11,10 +11,13 @@ import { captureEnv } from "../../test-utils/env.js";
 import { createFixtureSuite } from "../../test-utils/fixture-suite.js";
 import { resolveOpenClawMetadata, resolveSkillInvocationPolicy } from "../loading/frontmatter.js";
 import { loadSkillsFromDirSafe, readSkillFrontmatterSafe } from "../loading/local-loader.js";
+import { getSkillsSnapshotVersion } from "../runtime/refresh-state.js";
 import { runCommandWithTimeoutMock } from "../test-support/install-test-mocks.js";
 import type { SkillEntry } from "../types.js";
 import { installSkill } from "./install.js";
 import { skillsInstallTesting } from "./install.test-support.js";
+
+const installDownloadSpecMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../../process/exec.js", () => ({
   runCommandWithTimeout: (...args: unknown[]) => runCommandWithTimeoutMock(...args),
@@ -22,6 +25,10 @@ vi.mock("../../process/exec.js", () => ({
 
 vi.mock("../loading/plugin-skills.js", () => ({
   resolvePluginSkillDirs: () => [],
+}));
+
+vi.mock("./install-download.js", () => ({
+  installDownloadSpec: (...args: unknown[]) => installDownloadSpecMock(...args),
 }));
 
 async function writeInstallableSkill(workspaceDir: string, name: string): Promise<string> {
@@ -40,6 +47,24 @@ metadata: {"openclaw":{"install":[{"id":"deps","kind":"node","package":"example-
     "utf-8",
   );
   await fs.writeFile(path.join(skillDir, "runner.js"), "export {};\n", "utf-8");
+  return skillDir;
+}
+
+async function writeDownloadInstallableSkill(workspaceDir: string, name: string): Promise<string> {
+  const skillDir = path.join(workspaceDir, "skills", name);
+  await fs.mkdir(skillDir, { recursive: true });
+  await fs.writeFile(
+    path.join(skillDir, "SKILL.md"),
+    `---
+name: ${name}
+description: test skill
+metadata: {"openclaw":{"install":[{"id":"deps","kind":"download","url":"https://example.com/tool.tgz","archive":"tar.gz","extract":true,"targetDir":"tool"}]}}
+---
+
+# ${name}
+`,
+    "utf-8",
+  );
   return skillDir;
 }
 
@@ -113,6 +138,14 @@ async function withWorkspaceCase(
 describe("installSkill before_install hooks", () => {
   beforeEach(() => {
     resetGlobalHookRunner();
+    installDownloadSpecMock.mockReset();
+    installDownloadSpecMock.mockResolvedValue({
+      ok: true,
+      message: "downloaded",
+      stdout: "",
+      stderr: "",
+      code: 0,
+    });
     runCommandWithTimeoutMock.mockClear();
     skillsInstallTesting.setDepsForTest({
       loadWorkspaceSkillEntries: loadTestWorkspaceSkillEntries,
@@ -136,6 +169,7 @@ describe("installSkill before_install hooks", () => {
   it("runs npm node installs with an OpenClaw-managed user prefix", async () => {
     await withWorkspaceCase(async ({ workspaceDir, stateDir }) => {
       await writeInstallableSkill(workspaceDir, "node-prefix-skill");
+      const beforeVersion = getSkillsSnapshotVersion(workspaceDir);
 
       const result = await installSkill({
         workspaceDir,
@@ -153,6 +187,40 @@ describe("installSkill before_install hooks", () => {
       expect(options.env).not.toHaveProperty("PATH");
       const stat = await fs.stat(npmPrefix);
       expect(stat.isDirectory()).toBe(true);
+      expect(getSkillsSnapshotVersion(workspaceDir)).toBeGreaterThan(beforeVersion);
+    });
+  });
+
+  it("bumps the skills snapshot version after successful download installs", async () => {
+    await withWorkspaceCase(async ({ workspaceDir }) => {
+      await writeDownloadInstallableSkill(workspaceDir, "download-skill");
+      const beforeVersion = getSkillsSnapshotVersion(workspaceDir);
+
+      const result = await installSkill({
+        workspaceDir,
+        skillName: "download-skill",
+        installId: "deps",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(installDownloadSpecMock).toHaveBeenCalledTimes(1);
+      expect(getSkillsSnapshotVersion(workspaceDir)).toBeGreaterThan(beforeVersion);
+    });
+  });
+
+  it("bumps the normalized workspace key after successful installs", async () => {
+    await withWorkspaceCase(async ({ workspaceDir }) => {
+      await writeInstallableSkill(workspaceDir, "noncanonical-skill");
+      const beforeVersion = getSkillsSnapshotVersion(workspaceDir);
+
+      const result = await installSkill({
+        workspaceDir: path.join(workspaceDir, "nested", ".."),
+        skillName: "noncanonical-skill",
+        installId: "deps",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(getSkillsSnapshotVersion(workspaceDir)).toBeGreaterThan(beforeVersion);
     });
   });
 

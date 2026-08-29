@@ -18,6 +18,7 @@ import type {
   SessionTranscriptReadScope,
   SessionTranscriptWriteScope,
 } from "./session-accessor.sqlite-contract.js";
+import { stripSessionEntryRuntimeFields } from "./session-entry-runtime-normalize.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 import { formatSqliteSessionFileMarker } from "./sqlite-marker.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
@@ -250,7 +251,7 @@ export function normalizeSqliteSessionKey(sessionKey: string): string {
 }
 
 export function cloneSessionEntry(entry: SessionEntry): SessionEntry {
-  return structuredClone(entry);
+  return stripSessionEntryRuntimeFields(structuredClone(entry));
 }
 
 export function formatSqliteSessionMarkerForScope(scope: ResolvedTranscriptScope): string {

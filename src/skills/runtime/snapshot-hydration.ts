@@ -17,5 +17,12 @@ export function hydrateResolvedSkills<T extends SnapshotWithRuntimeSkills>(
   if (snapshot.resolvedSkills !== undefined) {
     return snapshot;
   }
-  return { ...snapshot, resolvedSkills: rebuild().resolvedSkills };
+  const hydrated = { ...snapshot };
+  Object.defineProperty(hydrated, "resolvedSkills", {
+    configurable: true,
+    enumerable: false,
+    value: rebuild().resolvedSkills,
+    writable: true,
+  });
+  return hydrated;
 }

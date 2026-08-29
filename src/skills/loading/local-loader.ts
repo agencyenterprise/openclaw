@@ -40,6 +40,10 @@ function readSkillFileSync(params: {
   }
 }
 
+function flattenLoadedSkillString(value: string): string {
+  return (" " + value).slice(1);
+}
+
 function loadSingleSkillDirectory(params: {
   skillDir: string;
   source: string;
@@ -68,7 +72,9 @@ function loadSingleSkillDirectory(params: {
 
   const fallbackName = path.basename(params.skillDir).trim();
   const name = frontmatter.name?.trim() || fallbackName;
-  const description = frontmatter.description?.trim();
+  const description = frontmatter.description
+    ? flattenLoadedSkillString(frontmatter.description.trim())
+    : undefined;
   if (!name || !description) {
     return null;
   }
