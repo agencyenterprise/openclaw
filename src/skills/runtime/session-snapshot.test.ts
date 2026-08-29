@@ -89,7 +89,10 @@ describe("resolveReusableWorkspaceSkillSnapshot", () => {
   });
 
   it("shares refreshed resolvedSkills arrays and keeps them out of JSON", () => {
-    const builtArrays = [[{ name: "first" }], [{ name: "second" }]];
+    const builtArrays: [{ name: string }[], { name: string }[]] = [
+      [{ name: "first" }],
+      [{ name: "second" }],
+    ];
     buildWorkspaceSkillSnapshotMock
       .mockReturnValueOnce({ prompt: "", skills: [], resolvedSkills: builtArrays[0] })
       .mockReturnValueOnce({ prompt: "", skills: [], resolvedSkills: builtArrays[1] });

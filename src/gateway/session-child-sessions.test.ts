@@ -41,6 +41,7 @@ test("findDirectChildSessionsForParent matches direct lineage only", () => {
         spawnedBy: "agent:main:other",
       }),
     },
+    sources: {},
   });
 
   expect(

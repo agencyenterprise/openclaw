@@ -109,10 +109,10 @@ describe("upsertInflightTurn", () => {
     });
     const rows = _listInflightTurnsForTest();
     expect(rows).toHaveLength(1);
-    expect(rows[0].payload).toBe("B");
-    expect(rows[0].iteration).toBe(2);
-    expect(rows[0].opened_at).toBe(1000); // preserved (age ordering)
-    expect(rows[0].attempts).toBe(0); // RESET — a live upsert means the thread is progressing
+    expect(rows[0]!.payload).toBe("B");
+    expect(rows[0]!.iteration).toBe(2);
+    expect(rows[0]!.opened_at).toBe(1000); // preserved (age ordering)
+    expect(rows[0]!.attempts).toBe(0); // RESET — a live upsert means the thread is progressing
   });
 
   it("refuses invalid Slack keys", () => {
@@ -142,8 +142,8 @@ describe("upsertInflightTurn", () => {
       payload: "FEEDBACK",
     });
     const rows = _listInflightTurnsForTest();
-    expect(rows[0].kind).toBe("continue");
-    expect(rows[0].payload).toBe("FEEDBACK");
+    expect(rows[0]!.kind).toBe("continue");
+    expect(rows[0]!.payload).toBe("FEEDBACK");
   });
 
   it("a continue row never DOWNGRADES to engage (a real ask outranks a bare mention)", () => {
@@ -162,8 +162,8 @@ describe("upsertInflightTurn", () => {
       payload: "generic",
     });
     const rows = _listInflightTurnsForTest();
-    expect(rows[0].kind).toBe("continue"); // not downgraded
-    expect(rows[0].payload).toBe("FEEDBACK"); // continue payload preserved
+    expect(rows[0]!.kind).toBe("continue"); // not downgraded
+    expect(rows[0]!.payload).toBe("FEEDBACK"); // continue payload preserved
   });
 });
 
@@ -197,7 +197,7 @@ describe("markInflightAttempt", () => {
     });
     markInflightAttempt("C1", "1.0");
     markInflightAttempt("C1", "1.0");
-    expect(_listInflightTurnsForTest()[0].attempts).toBe(2);
+    expect(_listInflightTurnsForTest()[0]!.attempts).toBe(2);
   });
 });
 
@@ -262,7 +262,7 @@ describe("recoverInflightTurns", () => {
     const keptThreads = res.recovered.map((r) => r.thread);
     expect(keptThreads).not.toContain("0.0");
     expect(keptThreads).not.toContain("2.0");
-    expect(res.recovered[0].opened_at).toBe(1012); // newest first
+    expect(res.recovered[0]!.opened_at).toBe(1012); // newest first
     // CRUCIAL: all 13 rows are still on disk — overflow is deferred, never lost.
     expect(_listInflightTurnsForTest()).toHaveLength(13);
   });
@@ -312,7 +312,7 @@ describe("closeInflightTurnIfUnchanged (compare-and-delete race guard)", () => {
     closeInflightTurnIfUnchanged("C1", "1.0", 5000); // stale close attempt
     const rows = _listInflightTurnsForTest();
     expect(rows).toHaveLength(1); // newer continue preserved
-    expect(rows[0].payload).toBe("newer continue");
+    expect(rows[0]!.payload).toBe("newer continue");
   });
 });
 
@@ -342,7 +342,7 @@ describe("durability + graceful degradation", () => {
     // Reopen happens lazily on the next call.
     const rows = _listInflightTurnsForTest();
     expect(rows).toHaveLength(1);
-    expect(rows[0].payload).toBe("persist me");
+    expect(rows[0]!.payload).toBe("persist me");
   });
 
   it("degrades gracefully when the DB cannot be opened — never throws", () => {
