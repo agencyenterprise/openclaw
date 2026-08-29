@@ -281,6 +281,7 @@ describe("sessions.usage", () => {
         vi.mocked(loadCombinedSessionStoreForGateway).mockReturnValue({
           storePath,
           store: { [sessionKey]: { ...reloaded } },
+          sources: { [sessionKey]: { agentId: "opus", storePath } },
         });
 
         const respond = await runSessionsUsage({
@@ -640,6 +641,7 @@ describe("sessions.usage", () => {
           updatedAt: 999,
         },
       },
+      sources: { "agent:main:s-opus": { agentId: "main", storePath: "(multiple)" } },
     });
 
     const respond = await runSessionsUsage({ ...BASE_USAGE_RANGE, agentId: "opus" });
@@ -670,6 +672,7 @@ describe("sessions.usage", () => {
             updatedAt: 999,
           },
         },
+        sources: { "agent:opus:main": { agentId: "opus", storePath: "(multiple)" } },
       });
 
       const respond = await runSessionsUsage({
@@ -717,6 +720,7 @@ describe("sessions.usage", () => {
         store: {
           global: sessionEntry,
         },
+        sources: { global: { agentId: "opus", storePath: "(multiple)" } },
       });
 
       const respond = await runSessionsUsage(
@@ -760,6 +764,7 @@ describe("sessions.usage", () => {
             updatedAt: 999,
           },
         },
+        sources: { "agent:main:shared": { agentId: "main", storePath: "(multiple)" } },
       });
 
       const respond = await runSessionsUsage({
@@ -804,6 +809,7 @@ describe("sessions.usage", () => {
             updatedAt: 999,
           },
         },
+        sources: { [storeKey]: { agentId: "opus", storePath: "(multiple)" } },
       });
 
       // Query via discovered key: agent:<id>:<sessionId>
@@ -838,6 +844,7 @@ describe("sessions.usage", () => {
             usageFamilySessionIds: ["old", "current"],
           },
         },
+        sources: { [storeKey]: { agentId: "opus", storePath: "(multiple)" } },
       });
       vi.mocked(loadSessionCostSummariesFromCache).mockImplementation(async ({ sessions }) => ({
         summaries: sessions.map((session) => ({
@@ -918,6 +925,10 @@ describe("sessions.usage", () => {
             sessionFile: "run-dup.jsonl",
             updatedAt: 2_000,
           },
+        },
+        sources: {
+          [preferredKey]: { agentId: "opus", storePath: "(multiple)" },
+          "agent:other:main": { agentId: "other", storePath: "(multiple)" },
         },
       });
 

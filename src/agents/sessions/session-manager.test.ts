@@ -89,7 +89,7 @@ describe("SessionManager.open", () => {
         agentId: "main",
         storePath,
         sessionKey,
-        entry: { sessionId, updatedAt: 10 },
+        entry: { sessionId },
       }),
     ).toBeNull();
   });

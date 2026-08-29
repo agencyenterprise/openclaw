@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { Skill } from "../../skills/loading/skill-contract.js";
 import { testing } from "./session-accessor.sqlite-entry-store.js";
 import { cloneSessionEntry } from "./session-accessor.sqlite-scope.js";
 import { parseSqliteSessionEntryJson } from "./session-accessor.sqlite-status.js";
@@ -18,18 +19,20 @@ describe("normalizeSessionEntryForSqlitePersistence", () => {
           source: "workspace",
           scope: "project",
           origin: "top-level",
+          baseDir: "/skills/deploy",
         },
         disableModelInvocation: false,
       },
-    ];
-    const entry: SessionEntry = {
+    ] satisfies Skill[];
+    const entry = {
       sessionId: "session-1",
+      updatedAt: 1,
       skillsSnapshot: {
         prompt: "prompt",
         skills: [{ name: "deploy" }],
         resolvedSkills,
       },
-    };
+    } satisfies SessionEntry;
 
     const persisted = testing.normalizeSessionEntryForSqlitePersistence(entry);
 
@@ -39,14 +42,15 @@ describe("normalizeSessionEntryForSqlitePersistence", () => {
   });
 
   it("strips runtime-only resolvedSkills when cloning across the accessor boundary", () => {
-    const entry: SessionEntry = {
+    const entry = {
       sessionId: "session-1",
+      updatedAt: 1,
       skillsSnapshot: {
         prompt: "prompt",
         skills: [{ name: "deploy" }],
         resolvedSkills: [],
       },
-    };
+    } satisfies SessionEntry;
 
     const cloned = cloneSessionEntry(entry);
 
@@ -68,7 +72,11 @@ describe("normalizeSessionEntryForSqlitePersistence", () => {
       skills: { promptChars: 0, entries: [] },
       tools: { listChars: 0, schemaChars: 0, entries: [] },
     };
-    const entry: SessionEntry = { sessionId: "session-1", systemPromptReport: report };
+    const entry = {
+      sessionId: "session-1",
+      updatedAt: 1,
+      systemPromptReport: report,
+    } satisfies SessionEntry;
     const cloned = cloneSessionEntry(entry);
 
     expect(cloned).not.toBe(entry);

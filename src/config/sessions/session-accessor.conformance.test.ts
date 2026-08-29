@@ -1798,7 +1798,16 @@ describe("sqlite session normalization", () => {
     const liveReport = {
       ...report,
       generatedAt: Date.now() + 1,
-      injectedWorkspaceFiles: [{ ...report.injectedWorkspaceFiles[0], name: "live" }],
+      injectedWorkspaceFiles: [
+        {
+          name: "live",
+          path: "/tmp/live",
+          missing: false,
+          rawChars: 1,
+          injectedChars: 1,
+          truncated: false,
+        },
+      ],
     } satisfies NonNullable<SessionEntry["systemPromptReport"]>;
     const sessionKeyA = "agent:main:final-rotate-a";
     const sessionKeyB = "agent:main:final-rotate-b";
@@ -1861,7 +1870,7 @@ describe("sqlite session normalization", () => {
         agentId: "main",
         storePath: paths.sqlitePath,
         sessionKey: liveSessionKey,
-        entry: { sessionId: "live-final-session", updatedAt: 3 },
+        entry: { sessionId: "live-final-session" },
       }),
     ).toEqual(liveReport);
   });
@@ -1914,7 +1923,7 @@ describe("sqlite session normalization", () => {
         agentId: "main",
         storePath: paths.sqlitePath,
         sessionKey: sessionKeyB,
-        entry: { sessionId: "batch-shared-session", updatedAt: 3 },
+        entry: { sessionId: "batch-shared-session" },
       }),
     ).toEqual(report);
   });
@@ -2019,7 +2028,7 @@ describe("sqlite session normalization", () => {
         agentId: "main",
         storePath: paths.sqlitePath,
         sessionKey: activeKey,
-        entry: { sessionId: "stale-live-session", updatedAt: Date.now() },
+        entry: { sessionId: "stale-live-session" },
       }),
     ).toEqual(liveReport);
   });
