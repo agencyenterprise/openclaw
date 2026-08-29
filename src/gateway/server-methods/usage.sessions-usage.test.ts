@@ -5,7 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { SessionEntry } from "../../config/sessions.js";
+import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 
 vi.mock("../../config/config.js", () => {
@@ -225,6 +228,158 @@ describe("sessions.usage", () => {
     expect(sessions).toHaveLength(1);
     expect(expectDefined(sessions[0], "sessions[0] test invariant").key).toBe("agent:main:s-main");
     expect(expectDefined(sessions[0], "sessions[0] test invariant").agentId).toBe("main");
+  });
+
+  it("loads persisted contextWeight from the prompt report sidecar after SQLite reload", async () => {
+    const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-usage-context-weight-"));
+    try {
+      const storePath = path.join(storeDir, "sessions.json");
+      const sessionKey = "agent:opus:s-opus";
+      const report: NonNullable<SessionEntry["systemPromptReport"]> = {
+        source: "run",
+        generatedAt: Date.now(),
+        systemPrompt: { chars: 1_000, projectContextChars: 600, nonProjectContextChars: 400 },
+        injectedWorkspaceFiles: [
+          {
+            name: "AGENTS.md",
+            path: "/tmp/workspace/AGENTS.md",
+            missing: false,
+            rawChars: 10_000,
+            injectedChars: 9_000,
+            truncated: false,
+          },
+        ],
+        skills: { promptChars: 10, entries: [{ name: "checks", blockChars: 10 }] },
+        tools: {
+          listChars: 5,
+          schemaChars: 7,
+          entries: [{ name: "read", summaryChars: 5, schemaChars: 7, propertiesCount: 1 }],
+        },
+      };
+
+      await replaceSessionEntry(
+        { agentId: "opus", storePath, sessionKey },
+        {
+          sessionId: "s-opus",
+          sessionFile: "s-opus.jsonl",
+          updatedAt: 999,
+          totalTokens: 42,
+          totalTokensFresh: false,
+          systemPromptReport: report,
+        },
+      );
+      closeOpenClawAgentDatabasesForTest();
+      const reloaded = loadSessionEntry({ agentId: "opus", storePath, sessionKey });
+      if (!reloaded) {
+        throw new Error("missing reloaded usage session entry");
+      }
+      expect(reloaded.systemPromptReport).toBeUndefined();
+      expect(JSON.stringify(reloaded)).not.toContain("systemPromptReport");
+
+      await withUsageState(async (writeSessionFile) => {
+        writeSessionFile("s-opus.jsonl");
+        vi.mocked(loadCombinedSessionStoreForGateway).mockReturnValue({
+          storePath,
+          store: { [sessionKey]: { ...reloaded } },
+        });
+
+        const respond = await runSessionsUsage({
+          ...BASE_USAGE_RANGE,
+          agentId: "opus",
+          includeContextWeight: true,
+        });
+
+        expect(respond).toHaveBeenCalledTimes(1);
+        expect(mockArg(respond, 0, 0)).toBe(true);
+        const result = mockArg(respond, 0, 1) as {
+          sessions: Array<{
+            key: string;
+            contextWeight?: SessionEntry["systemPromptReport"] | null;
+          }>;
+        };
+        expect(result.sessions).toHaveLength(1);
+        expect(result.sessions[0]?.key).toBe(sessionKey);
+        expect(result.sessions[0]?.contextWeight).toEqual(report);
+      });
+    } finally {
+      closeOpenClawAgentDatabasesForTest();
+      fs.rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("loads contextWeight from the per-entry source for template-backed stores", async () => {
+    const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-usage-template-source-"));
+    try {
+      const templateStorePath = path.join(
+        storeDir,
+        "agents",
+        "{agentId}",
+        "sessions",
+        "sessions.json",
+      );
+      const opusStorePath = path.join(storeDir, "agents", "opus", "sessions", "sessions.json");
+      const sessionKey = "agent:opus:s-opus";
+      const report: NonNullable<SessionEntry["systemPromptReport"]> = {
+        source: "run",
+        generatedAt: Date.now(),
+        systemPrompt: { chars: 321, projectContextChars: 300, nonProjectContextChars: 21 },
+        injectedWorkspaceFiles: [
+          {
+            name: "template.AGENTS.md",
+            path: "/tmp/workspace/template.AGENTS.md",
+            missing: false,
+            rawChars: 500,
+            injectedChars: 321,
+            truncated: false,
+          },
+        ],
+        skills: { promptChars: 0, entries: [] },
+        tools: { listChars: 0, schemaChars: 0, entries: [] },
+      };
+
+      await replaceSessionEntry(
+        { agentId: "opus", storePath: opusStorePath, sessionKey },
+        {
+          sessionId: "s-opus",
+          sessionFile: "s-opus.jsonl",
+          updatedAt: 999,
+          systemPromptReport: report,
+        },
+      );
+      closeOpenClawAgentDatabasesForTest();
+      const reloaded = loadSessionEntry({ agentId: "opus", storePath: opusStorePath, sessionKey });
+      if (!reloaded) {
+        throw new Error("missing reloaded template-backed usage session entry");
+      }
+
+      await withUsageState(async (writeSessionFile) => {
+        writeSessionFile("s-opus.jsonl");
+        vi.mocked(loadCombinedSessionStoreForGateway).mockReturnValue({
+          storePath: templateStorePath,
+          store: { [sessionKey]: { ...reloaded } },
+          sources: { [sessionKey]: { agentId: "opus", storePath: opusStorePath } },
+        });
+
+        const respond = await runSessionsUsage({
+          ...BASE_USAGE_RANGE,
+          agentId: "opus",
+          includeContextWeight: true,
+        });
+
+        const result = mockArg(respond, 0, 1) as {
+          sessions: Array<{
+            key: string;
+            contextWeight?: SessionEntry["systemPromptReport"] | null;
+          }>;
+        };
+        expect(result.sessions).toHaveLength(1);
+        expect(result.sessions[0]?.key).toBe(sessionKey);
+        expect(result.sessions[0]?.contextWeight).toEqual(report);
+      });
+    } finally {
+      closeOpenClawAgentDatabasesForTest();
+      fs.rmSync(storeDir, { recursive: true, force: true });
+    }
   });
 
   it("uses explicit all-agent scope for list-style usage queries", async () => {

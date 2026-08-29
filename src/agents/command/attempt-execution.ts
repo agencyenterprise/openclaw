@@ -533,7 +533,7 @@ export function runAgentAttempt(params: {
     ? resolvedPrompt
     : annotateInterSessionPromptText(resolvedPrompt, params.opts.inputProvenance);
   const bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
-    params.sessionEntry?.systemPromptReport,
+    params.sessionEntry,
   );
   const bootstrapPromptWarningSignature =
     bootstrapPromptWarningSignaturesSeen[bootstrapPromptWarningSignaturesSeen.length - 1];

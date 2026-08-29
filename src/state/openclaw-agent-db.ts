@@ -70,7 +70,8 @@ export { resolveOpenClawAgentSqlitePath } from "./openclaw-agent-db.paths.js";
  * per pathname, protected with private file modes, and registered in the shared
  * OpenClaw state database for discovery and maintenance.
  */
-// v10 = materialized active transcript paths. v9 added SQLite STRICT tables.
+// v10 = materialized active transcript paths. Additive sidecar tables stay v10 for rollback safety.
+// v9 added SQLite STRICT tables.
 // v8 added per-transcript session provenance. v7 added per-entry lifecycle status projection.
 // v6 added session/transcript hot-path indexes.
 // v5 added transcript mutation watermarks.

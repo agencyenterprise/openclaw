@@ -4,15 +4,20 @@ import type { SessionEntry } from "./types.js";
 
 export type SqliteSessionRowBytes = {
   entryBytesByKey: Map<string, number>;
+  reportBytesBySessionId: Map<string, number>;
   trajectoryBytesBySessionId: Map<string, number>;
   transcriptBytesBySessionId: Map<string, number>;
 };
 
-function getSessionStateBytes(rowBytes: SqliteSessionRowBytes, sessionId: string): number {
+function getSessionArtifactBytes(rowBytes: SqliteSessionRowBytes, sessionId: string): number {
   return (
     (rowBytes.transcriptBytesBySessionId.get(sessionId) ?? 0) +
     (rowBytes.trajectoryBytesBySessionId.get(sessionId) ?? 0)
   );
+}
+
+function getSessionPromptReportBytes(rowBytes: SqliteSessionRowBytes, sessionId: string): number {
+  return rowBytes.reportBytesBySessionId.get(sessionId) ?? 0;
 }
 
 function getEntryUpdatedAt(entry?: SessionEntry): number {
@@ -36,6 +41,7 @@ export function enforceSqliteSessionDiskBudget(params: {
   const entryBytesByKey = new Map<string, number>();
   const sessionIdsByKey = new Map<string, readonly string[]>();
   const sessionIdRefCounts = new Map<string, number>();
+  const reportSessionIdRefCounts = new Map<string, number>();
   // State rows can be shared through usage-family references. Count each
   // session once; release its bytes only after the last entry is removed.
   for (const [key, entry] of Object.entries(params.store)) {
@@ -47,13 +53,28 @@ export function enforceSqliteSessionDiskBudget(params: {
     for (const sessionId of sessionIds) {
       sessionIdRefCounts.set(sessionId, (sessionIdRefCounts.get(sessionId) ?? 0) + 1);
     }
+    reportSessionIdRefCounts.set(
+      entry.sessionId,
+      (reportSessionIdRefCounts.get(entry.sessionId) ?? 0) + 1,
+    );
   }
   for (const sessionId of sessionIdRefCounts.keys()) {
-    totalBytes += getSessionStateBytes(params.rowBytes, sessionId);
+    totalBytes += getSessionArtifactBytes(params.rowBytes, sessionId);
+  }
+  for (const sessionId of reportSessionIdRefCounts.keys()) {
+    totalBytes += getSessionPromptReportBytes(params.rowBytes, sessionId);
+  }
+  let unreferencedReportBytes = 0;
+  for (const [sessionId, bytes] of params.rowBytes.reportBytesBySessionId) {
+    if (!reportSessionIdRefCounts.has(sessionId)) {
+      unreferencedReportBytes += bytes;
+      totalBytes += bytes;
+    }
   }
 
   const totalBytesBefore = totalBytes;
-  if (totalBytes <= maxDiskBytes) {
+  totalBytes -= unreferencedReportBytes;
+  if (totalBytesBefore <= maxDiskBytes) {
     return {
       totalBytesBefore,
       totalBytesAfter: totalBytes,
@@ -92,7 +113,14 @@ export function enforceSqliteSessionDiskBudget(params: {
         continue;
       }
       sessionIdRefCounts.delete(sessionId);
-      totalBytes -= getSessionStateBytes(params.rowBytes, sessionId);
+      totalBytes -= getSessionArtifactBytes(params.rowBytes, sessionId);
+    }
+    const nextReportRefCount = (reportSessionIdRefCounts.get(entry.sessionId) ?? 0) - 1;
+    if (nextReportRefCount > 0) {
+      reportSessionIdRefCounts.set(entry.sessionId, nextReportRefCount);
+    } else {
+      reportSessionIdRefCounts.delete(entry.sessionId);
+      totalBytes -= getSessionPromptReportBytes(params.rowBytes, entry.sessionId);
     }
   }
   return {

@@ -29,6 +29,7 @@ type SessionSqliteDatabase = Pick<
   | "conversations"
   | "session_conversations"
   | "session_entries"
+  | "session_prompt_reports"
   | "session_routes"
   | "sessions"
   | "trajectory_runtime_events"

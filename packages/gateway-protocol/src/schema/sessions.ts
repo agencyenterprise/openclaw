@@ -586,8 +586,8 @@ export const SessionsUsageParamsSchema = closedObject({
   utcOffset: Type.Optional(Type.String({ pattern: "^UTC[+-]\\d{1,2}(?::[0-5]\\d)?$" })),
   /** IANA time zone for `specific`; preferred over `utcOffset`, which remains a compatibility fallback. */
   timeZone: Type.Optional(NonEmptyString),
-  /** Maximum sessions to return (default 50). */
-  limit: Type.Optional(Type.Integer({ minimum: 1 })),
+  /** Maximum sessions to return (default 50, max 500). */
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
   /** Include context weight breakdown (systemPromptReport). */
   includeContextWeight: Type.Optional(Type.Boolean()),
 });

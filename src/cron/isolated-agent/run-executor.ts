@@ -270,7 +270,7 @@ function createCronPromptExecutor(params: {
     resetAnnounced: false,
   };
   let bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
-    params.cronSession.sessionEntry.systemPromptReport,
+    params.cronSession.sessionEntry,
   );
   const bootstrapContextMode = resolveCronBootstrapContextMode(params.agentPayload);
   if (!params.sourceDelivery) {

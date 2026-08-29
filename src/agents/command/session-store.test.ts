@@ -11,6 +11,7 @@ import {
   loadSessionEntry,
   replaceSessionEntry,
 } from "../../config/sessions/session-accessor.js";
+import { loadSessionPromptReportForEntry } from "../../config/sessions/session-prompt-report-store.js";
 import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent.js";
 import {
@@ -841,7 +842,7 @@ describe("updateSessionStoreAfterAgentRun", () => {
     });
   });
 
-  it("persists latest systemPromptReport for downstream warning dedupe", async () => {
+  it("persists latest bootstrap warning state for downstream warning dedupe", async () => {
     await withTempSessionStore(async ({ storePath }) => {
       const sessionKey = "agent:codex:report:test-system-prompt-report";
       const sessionId = "test-system-prompt-report-session";
@@ -893,13 +894,20 @@ describe("updateSessionStoreAfterAgentRun", () => {
       });
 
       const persisted = loadPersistedSessionEntry(storePath, sessionKey);
-      expect(persisted?.systemPromptReport?.bootstrapTruncation?.warningSignaturesSeen).toEqual([
+      expect(persisted?.systemPromptReport).toBeUndefined();
+      expect(persisted?.bootstrapPromptWarningSignaturesSeen).toEqual(["sig-a", "sig-b"]);
+      expect(sessionStore[sessionKey]?.systemPromptReport).toBeUndefined();
+      expect(sessionStore[sessionKey]?.bootstrapPromptWarningSignaturesSeen).toEqual([
         "sig-a",
         "sig-b",
       ]);
-      expect(sessionStore[sessionKey]?.systemPromptReport?.bootstrapTruncation?.warningMode).toBe(
-        "once",
-      );
+      expect(
+        loadSessionPromptReportForEntry({
+          storePath,
+          sessionKey,
+          entry: persisted,
+        }),
+      ).toEqual(report);
     });
   });
 

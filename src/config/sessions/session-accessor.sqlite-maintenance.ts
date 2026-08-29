@@ -77,6 +77,16 @@ function sumEventJsonBytes() {
   );
 }
 
+function sumReportJsonBytes() {
+  return (
+    // kysely-allow-raw: SQLite byte accounting needs LENGTH(CAST(... AS BLOB)),
+    // which Kysely does not expose as a typed aggregate helper.
+    sql<number | bigint>`COALESCE(SUM(length(CAST(report_json AS BLOB))), 0)`.as(
+      "report_json_bytes",
+    )
+  );
+}
+
 function sumSessionEntryJsonBytes() {
   return (
     // kysely-allow-raw: SQLite byte accounting needs LENGTH(CAST(... AS BLOB)),
@@ -107,6 +117,14 @@ function readSqliteSessionRowBytes(database: OpenClawAgentDatabase): SqliteSessi
       .select(sumEventJsonBytes())
       .groupBy("session_id"),
   ).rows;
+  const reportRows = executeSqliteQuerySync(
+    database.db,
+    db
+      .selectFrom("session_prompt_reports")
+      .select(["session_id"])
+      .select(sumReportJsonBytes())
+      .groupBy("session_id"),
+  ).rows;
   const entryBytesByKey = new Map<string, number>();
   for (const row of entryRows) {
     entryBytesByKey.set(row.session_key, Buffer.byteLength(row.entry_json, "utf8"));
@@ -121,7 +139,17 @@ function readSqliteSessionRowBytes(database: OpenClawAgentDatabase): SqliteSessi
     const bytes = row.event_json_bytes;
     trajectoryBytesBySessionId.set(row.session_id, normalizeSqliteNumber(bytes ?? 0));
   }
-  return { entryBytesByKey, trajectoryBytesBySessionId, transcriptBytesBySessionId };
+  const reportBytesBySessionId = new Map<string, number>();
+  for (const row of reportRows) {
+    const bytes = row.report_json_bytes;
+    reportBytesBySessionId.set(row.session_id, normalizeSqliteNumber(bytes ?? 0));
+  }
+  return {
+    entryBytesByKey,
+    reportBytesBySessionId,
+    trajectoryBytesBySessionId,
+    transcriptBytesBySessionId,
+  };
 }
 
 function hasSqliteSessionDiskBudgetOverflow(
@@ -144,10 +172,15 @@ function hasSqliteSessionDiskBudgetOverflow(
     database.db,
     db.selectFrom("trajectory_runtime_events").select(sumEventJsonBytes()),
   );
+  const reportRow = executeSqliteQueryTakeFirstSync(
+    database.db,
+    db.selectFrom("session_prompt_reports").select(sumReportJsonBytes()),
+  );
   const entryBytes = normalizeSqliteNumber(entryRow?.entry_json_bytes ?? 0);
   const transcriptBytes = normalizeSqliteNumber(transcriptRow?.event_json_bytes ?? 0);
   const trajectoryBytes = normalizeSqliteNumber(trajectoryRow?.event_json_bytes ?? 0);
-  return entryBytes + transcriptBytes + trajectoryBytes > maintenance.maxDiskBytes;
+  const reportBytes = normalizeSqliteNumber(reportRow?.report_json_bytes ?? 0);
+  return entryBytes + transcriptBytes + trajectoryBytes + reportBytes > maintenance.maxDiskBytes;
 }
 
 function applySqliteSessionDiskBudget(params: {
@@ -250,11 +283,11 @@ export function applySqliteSessionEntryMaintenance(
   },
 ): SqliteSessionEntryMaintenancePlan {
   if (params.skipMaintenance) {
-    return { entryRemovals: [], stateDeletePlans: [] };
+    return { entryRemovals: [], promptReportOrphanSweep: false, stateDeletePlans: [] };
   }
   const maintenance = params.maintenanceConfig ?? resolveMaintenanceConfig();
   if (maintenance.mode === "warn") {
-    return { entryRemovals: [], stateDeletePlans: [] };
+    return { entryRemovals: [], promptReportOrphanSweep: false, stateDeletePlans: [] };
   }
 
   const entryCount = readSqliteSessionEntryCount(database);
@@ -281,7 +314,7 @@ export function applySqliteSessionEntryMaintenance(
       force: params.forceMaintenance,
     });
   if (!shouldLoadStore) {
-    return { entryRemovals: [], stateDeletePlans: [] };
+    return { entryRemovals: [], promptReportOrphanSweep: false, stateDeletePlans: [] };
   }
 
   const db = getSessionKysely(database.db);
@@ -379,8 +412,23 @@ export function applySqliteSessionEntryMaintenance(
       expectedEntry: removedEntriesByKey.get(sessionKey),
       sessionKey,
     })),
+    promptReportOrphanSweep: true,
     stateDeletePlans: deletePlans,
   };
+}
+
+function deleteUnreferencedSessionPromptReportRows(database: OpenClawAgentDatabase): void {
+  // kysely-allow-raw: report GC is a committed-state anti-join keyed by session_id;
+  // session_key is historical metadata and must not decide liveness.
+  database.db
+    .prepare(
+      `DELETE FROM session_prompt_reports
+       WHERE NOT EXISTS (
+         SELECT 1 FROM session_entries
+         WHERE session_entries.session_id = session_prompt_reports.session_id
+       )`,
+    )
+    .run();
 }
 
 export function finalizeSqliteSessionEntryMaintenancePlansBestEffort(
@@ -389,7 +437,12 @@ export function finalizeSqliteSessionEntryMaintenancePlansBestEffort(
 ): SessionLifecycleArchivedTranscript[] {
   const entryRemovals = plans.flatMap((plan) => plan.entryRemovals);
   const stateDeletePlans = plans.flatMap((plan) => plan.stateDeletePlans);
-  if (entryRemovals.length === 0 && stateDeletePlans.length === 0) {
+  const shouldSweepPromptReportOrphans = plans.some((plan) => plan.promptReportOrphanSweep);
+  if (
+    entryRemovals.length === 0 &&
+    stateDeletePlans.length === 0 &&
+    !shouldSweepPromptReportOrphans
+  ) {
     return [];
   }
   try {
@@ -399,6 +452,22 @@ export function finalizeSqliteSessionEntryMaintenancePlansBestEffort(
       deletePlannedSqliteLifecycleArtifactEntries(database, entryRemovals);
       archivedTranscripts = deleteMaterializedSqliteSessionStatePlans(database, materializedPlans);
     }, toDatabaseOptions(scope));
+    if (shouldSweepPromptReportOrphans) {
+      try {
+        runOpenClawAgentWriteTransaction((database) => {
+          deleteUnreferencedSessionPromptReportRows(database);
+        }, toDatabaseOptions(scope));
+      } catch (error) {
+        getChildLogger({ subsystem: "session-sqlite" }).warn(
+          "SQLite session prompt report cleanup failed",
+          {
+            agentId: scope.agentId,
+            error,
+            path: scope.path,
+          },
+        );
+      }
+    }
     emitCommittedSessionEntryRemovals(entryRemovals);
     return archivedTranscripts;
   } catch (error) {

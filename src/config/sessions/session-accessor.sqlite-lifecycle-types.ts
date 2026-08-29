@@ -10,6 +10,7 @@ export type SqliteSessionEntryRemovalPlan = {
 };
 export type SqliteSessionEntryMaintenancePlan = {
   entryRemovals: SqliteSessionEntryRemovalPlan[];
+  promptReportOrphanSweep: boolean;
   stateDeletePlans: SqliteSessionStateDeletePlan[];
 };
 export type SqliteLifecycleArtifactCleanupPlan = {

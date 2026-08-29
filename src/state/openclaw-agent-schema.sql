@@ -125,6 +125,17 @@ CREATE INDEX IF NOT EXISTS idx_agent_session_entries_status
   ON session_entries(status, session_key)
   WHERE status IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS session_prompt_reports (
+  session_id TEXT NOT NULL PRIMARY KEY,
+  session_key TEXT NOT NULL,
+  report_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_agent_session_prompt_reports_key
+  ON session_prompt_reports(session_key, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS transcript_events (
   session_id TEXT NOT NULL,
   seq INTEGER NOT NULL,

@@ -905,9 +905,8 @@ export function createFollowupRunner(params: {
           isControlUiVisible: shouldSurfaceToControlUi,
         });
       }
-      let bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
-        activeSessionEntry?.systemPromptReport,
-      );
+      let bootstrapPromptWarningSignaturesSeen =
+        resolveBootstrapWarningSignaturesSeen(activeSessionEntry);
       const preserveUserFacingSessionState = shouldPreserveUserFacingSessionStateForInputProvenance(
         queued.run.inputProvenance,
       );

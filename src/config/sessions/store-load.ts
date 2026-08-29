@@ -13,6 +13,7 @@ import {
 } from "../../utils/delivery-context.shared.js";
 import { getFileStatSnapshot } from "../cache-utils.js";
 import { normalizeRestartRecoveryEntryFields } from "./restart-recovery-state.js";
+import { stripSessionEntryRuntimeFields } from "./session-entry-runtime-normalize.js";
 import { hydrateSessionStoreSkillPromptRefs } from "./skill-prompt-blobs.js";
 import {
   cloneSessionStoreRecord,
@@ -328,19 +329,10 @@ export function normalizeSessionEntryDelivery(entry: SessionEntry): SessionEntry
   };
 }
 
-// resolvedSkills carries the full parsed Skill[] (including each SKILL.md body)
-// and is only used as an in-turn cache by the runtime — see
-// src/skills/runtime/embedded-run-entries.ts. Persisting it bloats
-// sessions.json by orders of magnitude when many sessions are active. Strip
-// it from every entry that flows through normalize, so neither the in-memory
-// store reloaded from disk nor the JSON serialized back to disk carries it.
+// resolvedSkills carries full parsed Skill[] bodies, and prompt reports live in
+// their own SQLite table; keep both out of persisted session-entry JSON.
 export function stripPersistedSkillsCache(entry: SessionEntry): SessionEntry {
-  const snapshot = entry.skillsSnapshot;
-  if (!snapshot || snapshot.resolvedSkills === undefined) {
-    return entry;
-  }
-  const { resolvedSkills: _drop, ...rest } = snapshot;
-  return { ...entry, skillsSnapshot: rest };
+  return stripSessionEntryRuntimeFields(entry);
 }
 
 export function normalizeSessionStore(store: Record<string, SessionEntry>): boolean {

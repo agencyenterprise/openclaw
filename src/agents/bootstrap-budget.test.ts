@@ -171,6 +171,15 @@ describe("bootstrap prompt warnings", () => {
   it("resolves seen signatures from report history or legacy single signature", () => {
     expect(
       resolveBootstrapWarningSignaturesSeen({
+        bootstrapPromptWarningSignaturesSeen: ["sig-state", "sig-a"],
+        bootstrapTruncation: {
+          warningSignaturesSeen: ["sig-report"],
+        },
+      }),
+    ).toEqual(["sig-state", "sig-a"]);
+
+    expect(
+      resolveBootstrapWarningSignaturesSeen({
         bootstrapTruncation: {
           warningSignaturesSeen: ["sig-a", " ", "sig-b", "sig-a"],
           promptWarningSignature: "legacy-ignored",

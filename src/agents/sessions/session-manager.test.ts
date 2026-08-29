@@ -11,10 +11,12 @@ import {
   loadTranscriptEvents,
   upsertSessionEntry,
 } from "../../config/sessions/session-accessor.js";
+import { loadSessionPromptReportForEntry } from "../../config/sessions/session-prompt-report-store.js";
 import { formatSqliteSessionFileMarker } from "../../config/sessions/sqlite-marker.js";
 import { withOwnedSessionTranscriptWrites } from "../../config/sessions/transcript-write-context.js";
 import * as Logger from "../../logger.js";
 import { isTranscriptOnlyOpenClawAssistantMessage } from "../../shared/transcript-only-openclaw-assistant.js";
+import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
 import { prepareSessionManagerForRun } from "../embedded-agent-runner/session-manager-init.js";
 import { repairSessionFileIfNeeded } from "../session-file-repair.js";
 import { loadSqliteMarkedSessionFile } from "./session-manager-file.js";
@@ -38,9 +40,58 @@ async function makeTempDir(): Promise<string> {
 
 describe("SessionManager.open", () => {
   afterEach(async () => {
+    closeOpenClawAgentDatabasesForTest();
     await Promise.all(
       tempPaths.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })),
     );
+  });
+
+  it("reclaims prompt reports displaced by SQLite-backed SessionManager branching", async () => {
+    const dir = await makeTempDir();
+    const storePath = path.join(dir, "sessions.json");
+    const sessionId = "sqlite-branch-source";
+    const sessionKey = "agent:main:dashboard:sqlite-branch";
+    const marker = formatSqliteSessionFileMarker({ agentId: "main", sessionId, storePath });
+    await upsertSessionEntry(
+      { agentId: "main", sessionKey, storePath },
+      {
+        sessionFile: marker,
+        sessionId,
+        systemPromptReport: {
+          source: "run",
+          generatedAt: Date.now(),
+          systemPrompt: { chars: 1, projectContextChars: 1, nonProjectContextChars: 0 },
+          injectedWorkspaceFiles: [],
+          skills: { promptChars: 0, entries: [] },
+          tools: { listChars: 0, schemaChars: 0, entries: [] },
+        },
+        updatedAt: 10,
+      },
+    );
+    const user = await appendTranscriptMessage(
+      { agentId: "main", sessionId, sessionKey, storePath },
+      { cwd: dir, message: { role: "user", content: "question" } },
+    );
+    await appendTranscriptMessage(
+      { agentId: "main", sessionId, sessionKey, storePath },
+      { cwd: dir, message: buildAssistantMessage("answer"), parentId: user.messageId },
+    );
+
+    const sessionManager = SessionManager.open(marker, dir, dir);
+    const newSessionFile = sessionManager.createBranchedSession(user.messageId);
+
+    expect(newSessionFile).toMatch(/^sqlite:main:/);
+    expect(loadSessionEntry({ agentId: "main", sessionKey, storePath })?.sessionId).not.toBe(
+      sessionId,
+    );
+    expect(
+      loadSessionPromptReportForEntry({
+        agentId: "main",
+        storePath,
+        sessionKey,
+        entry: { sessionId, updatedAt: 10 },
+      }),
+    ).toBeNull();
   });
 
   it("opens SQLite markers without creating marker-named files and persists assistant replies", async () => {

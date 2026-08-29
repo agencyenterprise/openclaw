@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionEntry } from "../../config/sessions.js";
+import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
+import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
 import { buildContextReply } from "./commands-context-report.js";
 import { buildCommandContext } from "./commands-context.js";
 import type { HandleCommandsParams } from "./commands-types.js";
@@ -131,6 +133,44 @@ describe("buildContextReply", () => {
     expect(result.text).toContain("Causes: 1 file(s) exceeded max/file.");
     expect(result.text).toContain("agents.list[].bootstrapMaxChars");
     expect(result.text).toContain("agents.defaults.*");
+  });
+
+  it("renders persisted run context after a fresh SQLite reload", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "openclaw-context-report-sidecar-"));
+    try {
+      const storePath = join(dir, "sessions.json");
+      const sessionKey = "agent:default:roundtrip-context";
+      const sessionId = "roundtrip-context-session";
+      const params = makeParams("/context list", true, { storePath, sessionKey, sessionId });
+      const entry = params.sessionEntry;
+      if (!entry) {
+        throw new Error("missing session entry");
+      }
+
+      await replaceSessionEntry({ storePath, sessionKey }, entry);
+      closeOpenClawAgentDatabasesForTest();
+      const reloaded = loadSessionEntry({ storePath, sessionKey });
+      if (!reloaded) {
+        throw new Error("missing reloaded session entry");
+      }
+      const spreadReloaded = { ...reloaded };
+      params.sessionEntry = spreadReloaded;
+      params.sessionStore = { [sessionKey]: spreadReloaded };
+
+      expect(spreadReloaded.systemPromptReport).toBeUndefined();
+      expect(JSON.stringify(spreadReloaded)).not.toContain("systemPromptReport");
+
+      const result = await buildContextReply(params);
+
+      expect(result.text).toContain("System prompt (run):");
+      expect(result.text).not.toContain("System prompt (estimate):");
+      expect(result.text).toContain("Injected workspace files:");
+      expect(result.text).toContain("AGENTS.md");
+      expect(result.text).toContain("⚠ Bootstrap context is over configured limits");
+    } finally {
+      closeOpenClawAgentDatabasesForTest();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("does not show bootstrap truncation warning when there is no truncation", async () => {

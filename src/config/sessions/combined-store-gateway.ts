@@ -18,6 +18,17 @@ import {
 } from "./targets.js";
 import type { SessionEntry } from "./types.js";
 
+export type CombinedSessionEntrySource = {
+  agentId: string;
+  storePath: string;
+};
+
+export type CombinedSessionStoreForGateway = {
+  storePath: string;
+  store: Record<string, SessionEntry>;
+  sources: Record<string, CombinedSessionEntrySource>;
+};
+
 // Template-backed stores need per-agent scans before they can be merged for Gateway views.
 function isStorePathTemplate(store?: string): boolean {
   return typeof store === "string" && store.includes("{agentId}");
@@ -39,11 +50,13 @@ function loadGatewayStoreEntries(params: {
 function mergeSessionEntryIntoCombined(params: {
   cfg: OpenClawConfig;
   combined: Record<string, SessionEntry>;
+  sources: Record<string, CombinedSessionEntrySource>;
   entry: SessionEntry;
   agentId: string;
   canonicalKey: string;
+  storePath: string;
 }) {
-  const { cfg, combined, entry, agentId, canonicalKey } = params;
+  const { cfg, combined, sources, entry, agentId, canonicalKey, storePath } = params;
   const existing = combined[canonicalKey];
 
   if (existing && (existing.updatedAt ?? 0) > (entry.updatedAt ?? 0)) {
@@ -75,16 +88,14 @@ function mergeSessionEntryIntoCombined(params: {
       spawnedBy,
     };
   }
+  sources[canonicalKey] = { agentId, storePath };
 }
 
 /** Loads and canonicalizes session entries for gateway views across one or more agent stores. */
 export function loadCombinedSessionStoreForGateway(
   cfg: OpenClawConfig,
   opts: { agentId?: string; configuredAgentsOnly?: boolean } = {},
-): {
-  storePath: string;
-  store: Record<string, SessionEntry>;
-} {
+): CombinedSessionStoreForGateway {
   const storeConfig = cfg.session?.store;
   if (storeConfig && !isStorePathTemplate(storeConfig)) {
     // A single shared store still needs keys canonicalized as if owned by the default agent.
@@ -92,6 +103,7 @@ export function loadCombinedSessionStoreForGateway(
     const defaultAgentId = normalizeAgentId(resolveDefaultAgentId(cfg));
     const store = loadGatewayStoreEntries({ agentId: defaultAgentId, storePath });
     const combined: Record<string, SessionEntry> = {};
+    const sources: Record<string, CombinedSessionEntrySource> = {};
     for (const [key, entry] of Object.entries(store)) {
       const canonicalKey = resolveStoredSessionKeyForAgentStore({
         cfg,
@@ -101,12 +113,14 @@ export function loadCombinedSessionStoreForGateway(
       mergeSessionEntryIntoCombined({
         cfg,
         combined,
+        sources,
         entry,
         agentId: defaultAgentId,
         canonicalKey,
+        storePath,
       });
     }
-    return { storePath, store: combined };
+    return { storePath, store: combined, sources };
   }
 
   const requestedAgentId =
@@ -119,6 +133,7 @@ export function loadCombinedSessionStoreForGateway(
       ? resolveSessionStoreTargets(cfg, { allAgents: true })
       : resolveAllAgentSessionStoreTargetsSync(cfg);
   const combined: Record<string, SessionEntry> = {};
+  const sources: Record<string, CombinedSessionEntrySource> = {};
   for (const target of targets) {
     const agentId = target.agentId;
     const storePath = target.storePath;
@@ -132,9 +147,11 @@ export function loadCombinedSessionStoreForGateway(
       mergeSessionEntryIntoCombined({
         cfg,
         combined,
+        sources,
         entry,
         agentId,
         canonicalKey,
+        storePath,
       });
     }
   }
@@ -145,5 +162,5 @@ export function loadCombinedSessionStoreForGateway(
       : typeof storeConfig === "string" && storeConfig.trim()
         ? storeConfig.trim()
         : "(multiple)";
-  return { storePath, store: combined };
+  return { storePath, store: combined, sources };
 }

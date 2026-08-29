@@ -137,6 +137,8 @@ function collectCachedSnapshotPaths(entry: SessionEntry): CachedSnapshotPath[] {
   for (const location of collectResolvedSkillPaths(snapshot?.resolvedSkills)) {
     paths.push({ field: "skillsSnapshot.resolvedSkills", path: location });
   }
+  // Current SQLite prompt reports live in a sidecar table; this doctor only
+  // repairs legacy inline session JSON snapshots written by older builds.
   if (isRecord(report)) {
     for (const location of collectInjectedWorkspaceFilePaths(report.injectedWorkspaceFiles)) {
       paths.push({ field: "systemPromptReport.injectedWorkspaceFiles", path: location });

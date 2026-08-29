@@ -2,6 +2,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 // Session store caches share parsed stores, immutable snapshots, and serialized JSON.
 import { parseStrictNonNegativeInteger } from "../../infra/parse-finite-number.js";
 import { createExpiringMapCache, isCacheEnabled, resolveCacheTtlMs } from "../cache-utils.js";
+import { copySessionEntryForRuntimeCache } from "./session-entry-runtime-normalize.js";
 import { clearSessionSkillPromptRefCache } from "./skill-prompt-blobs.js";
 import type { SessionEntry, SessionSkillPromptRef } from "./types.js";
 
@@ -108,6 +109,18 @@ function internSessionStoreLargeStrings(store: Record<string, SessionEntry>): vo
     internSessionEntryLargeStrings(entry);
   }
 }
+
+function cloneSessionStoreForRuntimeCache(
+  store: Record<string, SessionEntry>,
+): Record<string, SessionEntry> {
+  return Object.fromEntries(
+    Object.entries(store).map(([sessionKey, entry]) => [
+      sessionKey,
+      copySessionEntryForRuntimeCache(entry),
+    ]),
+  );
+}
+
 function deepFreeze<T>(value: T, seen = new WeakSet<object>()): DeepReadonly<T> {
   if (!value || typeof value !== "object") {
     return value as DeepReadonly<T>;
@@ -344,12 +357,8 @@ export function writeSessionStoreCache(params: {
   takeOwnership?: boolean;
 }): void {
   bumpSessionStoreCacheVersion(params.storePath);
-  const store =
-    params.takeOwnership === true ? params.store : cloneSessionStoreRecord(params.store);
-  // Ownership is only taken for freshly parsed store objects that no caller will mutate afterward.
-  if (params.takeOwnership === true) {
-    internSessionStoreLargeStrings(store);
-  }
+  const store = cloneSessionStoreForRuntimeCache(params.store);
+  internSessionStoreLargeStrings(store);
   SESSION_STORE_CACHE.set(params.storePath, {
     store,
     mtimeMs: params.mtimeMs,

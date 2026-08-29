@@ -485,6 +485,8 @@ export type SessionEntry = SessionRestartRecoveryState &
     lastAccountId?: string;
     lastThreadId?: string | number;
     skillsSnapshot?: SessionSkillSnapshot;
+    /** Lightweight bootstrap warning dedupe state retained after runtime prompt reports are stripped. */
+    bootstrapPromptWarningSignaturesSeen?: string[];
     systemPromptReport?: SessionSystemPromptReport;
     /**
      * Generic plugin-owned runtime debug entries shown in verbose status surfaces.

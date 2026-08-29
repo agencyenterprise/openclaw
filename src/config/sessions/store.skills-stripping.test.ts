@@ -162,6 +162,62 @@ describe("session store strips resolvedSkills from persistence", () => {
     expect(reloaded["agent:main:test:1"]?.skillsSnapshot?.skills).toHaveLength(6);
   });
 
+  it("strips runtime-only systemPromptReport from session entries", async () => {
+    await updateSessionStore(
+      storePath,
+      (store) => {
+        store["agent:main:test:1"] = {
+          ...makeEntry("session-1", makeSnapshot(2)),
+          systemPromptReport: {
+            source: "run",
+            generatedAt: Date.now(),
+            bootstrapTruncation: {
+              warningMode: "once",
+              warningShown: true,
+              promptWarningSignature: "sig-a",
+              warningSignaturesSeen: ["sig-a", "sig-b"],
+              truncatedFiles: 1,
+              nearLimitFiles: 1,
+              totalNearLimit: false,
+            },
+            systemPrompt: {
+              chars: 1024,
+              projectContextChars: 512,
+              nonProjectContextChars: 512,
+            },
+            injectedWorkspaceFiles: [
+              {
+                name: "AGENTS.md",
+                path: "/repo/AGENTS.md",
+                missing: false,
+                rawChars: 2048,
+                injectedChars: 1024,
+                truncated: true,
+              },
+            ],
+            skills: { promptChars: 4096, entries: [{ name: "skill-0", blockChars: 2048 }] },
+            tools: {
+              listChars: 0,
+              schemaChars: 8192,
+              entries: [{ name: "shell", summaryChars: 64, schemaChars: 8192 }],
+            },
+          },
+        };
+      },
+      { skipMaintenance: true },
+    );
+
+    const raw = await fs.readFile(storePath, "utf-8");
+    expect(raw).not.toContain("systemPromptReport");
+    expect(raw).not.toContain("injectedWorkspaceFiles");
+    const reloaded = loadSessionStore(storePath, { skipCache: true });
+    expect(reloaded["agent:main:test:1"]?.systemPromptReport).toBeUndefined();
+    expect(reloaded["agent:main:test:1"]?.bootstrapPromptWarningSignaturesSeen).toEqual([
+      "sig-a",
+      "sig-b",
+    ]);
+  });
+
   it("keeps the on-disk file small with many sessions and skills", async () => {
     const SESSION_COUNT = 100;
     const SKILLS_PER_SESSION = 50;

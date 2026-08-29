@@ -448,6 +448,46 @@ describe("openclaw agent database", () => {
     ).toEqual({ updated_at: 1 });
   });
 
+  it("ensures additive prompt-report tables when reopening an existing schema-v10 database", () => {
+    const stateDir = createTempStateDir();
+    const env = { OPENCLAW_STATE_DIR: stateDir };
+    const first = openOpenClawAgentDatabase({ agentId: "worker-1", env });
+    const databasePath = first.path;
+    expect(readSqliteNumberPragma(first.db, "user_version")).toBe(10);
+    closeOpenClawAgentDatabasesForTest();
+
+    const sqlite = requireNodeSqlite();
+    const existingV10 = new sqlite.DatabaseSync(databasePath);
+    try {
+      existingV10.exec(`
+        DROP INDEX IF EXISTS idx_agent_session_prompt_reports_key;
+        DROP TABLE IF EXISTS session_prompt_reports;
+        PRAGMA user_version = 10;
+      `);
+      expect(
+        existingV10
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+          .get("session_prompt_reports"),
+      ).toBeUndefined();
+    } finally {
+      existingV10.close();
+    }
+
+    const reopened = openOpenClawAgentDatabase({ agentId: "worker-1", env });
+
+    expect(readSqliteNumberPragma(reopened.db, "user_version")).toBe(10);
+    expect(
+      reopened.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .get("session_prompt_reports"),
+    ).toEqual({ name: "session_prompt_reports" });
+    expect(
+      reopened.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get("idx_agent_session_prompt_reports_key"),
+    ).toEqual({ name: "idx_agent_session_prompt_reports_key" });
+  });
+
   it("creates the per-agent schema and registers it globally", () => {
     const stateDir = createTempStateDir();
     const database = openOpenClawAgentDatabase({

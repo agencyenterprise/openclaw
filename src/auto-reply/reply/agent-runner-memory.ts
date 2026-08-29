@@ -1310,8 +1310,7 @@ export async function runMemoryFlushIfNeeded(params: {
   let activeSessionEntry = entry ?? params.sessionEntry;
   const activeSessionStore = params.sessionStore;
   let bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
-    activeSessionEntry?.systemPromptReport ??
-      (params.sessionKey ? activeSessionStore?.[params.sessionKey]?.systemPromptReport : undefined),
+    activeSessionEntry ?? (params.sessionKey ? activeSessionStore?.[params.sessionKey] : undefined),
   );
   const flushRunId = memoryDeps.randomUUID();
   if (params.sessionKey) {

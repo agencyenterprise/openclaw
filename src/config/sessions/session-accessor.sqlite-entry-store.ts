@@ -4,8 +4,12 @@ import {
   executeSqliteQuerySync,
   executeSqliteQueryTakeFirstSync,
 } from "../../infra/kysely-sync.js";
+import { getChildLogger } from "../../logging/logger.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
-import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import {
+  deferOpenClawAgentPostCommitPublication,
+  type OpenClawAgentDatabase,
+} from "../../state/openclaw-agent-db.js";
 import { normalizeSqliteNumber } from "./session-accessor.sqlite-normalize.js";
 import { resolveSessionEntryProvenanceRow } from "./session-accessor.sqlite-provenance.js";
 import {
@@ -26,6 +30,10 @@ import {
   writeSessionRoute,
 } from "./session-accessor.sqlite-transcript-state.js";
 import { copySessionEntryForPersistence } from "./session-entry-runtime-normalize.js";
+import {
+  deleteUnreferencedSessionPromptReportsForSessionIds,
+  writeSessionPromptReport,
+} from "./session-prompt-report-store.js";
 import {
   foldedSessionKeyAliasCandidates,
   normalizeStoreSessionKey,
@@ -285,10 +293,59 @@ export function normalizeSqliteLifecycleTarget(target: {
   };
 }
 
+function readExactSessionIdForKey(
+  database: OpenClawAgentDatabase,
+  sessionKey: string,
+): string | undefined {
+  const db = getSessionKysely(database.db);
+  const row = executeSqliteQueryTakeFirstSync(
+    database.db,
+    db.selectFrom("session_entries").select("session_id").where("session_key", "=", sessionKey),
+  );
+  return row?.session_id;
+}
+
+function deletePromptReportCandidatesBestEffort(
+  database: OpenClawAgentDatabase,
+  sessionIds: Iterable<string>,
+): void {
+  const candidates = uniqueStrings(
+    [...sessionIds].map((sessionId) => sessionId.trim()).filter(Boolean),
+  );
+  if (candidates.length === 0) {
+    return;
+  }
+  try {
+    deleteUnreferencedSessionPromptReportsForSessionIds(database, candidates);
+  } catch (error) {
+    getChildLogger({ subsystem: "session-sqlite" }).warn(
+      "SQLite session prompt report cleanup failed",
+      { error, sessionIds: candidates },
+    );
+  }
+}
+
+function deferPromptReportCandidateCleanup(
+  database: OpenClawAgentDatabase,
+  sessionIds: Iterable<string>,
+): void {
+  const candidates = uniqueStrings(
+    [...sessionIds].map((sessionId) => sessionId.trim()).filter(Boolean),
+  );
+  if (candidates.length === 0) {
+    return;
+  }
+  const cleanup = () => deletePromptReportCandidatesBestEffort(database, candidates);
+  if (!deferOpenClawAgentPostCommitPublication(database, cleanup)) {
+    cleanup();
+  }
+}
+
 export function deleteSqliteSessionEntryRows(
   database: OpenClawAgentDatabase,
   sessionKey: string,
 ): void {
+  const previousSessionId = readExactSessionIdForKey(database, sessionKey);
   const db = getSessionKysely(database.db);
   executeSqliteQuerySync(
     database.db,
@@ -298,6 +355,9 @@ export function deleteSqliteSessionEntryRows(
     database.db,
     db.deleteFrom("session_entries").where("session_key", "=", sessionKey),
   );
+  if (previousSessionId) {
+    deferPromptReportCandidateCleanup(database, [previousSessionId]);
+  }
 }
 
 export function deleteSqliteLifecycleTargetRows(
@@ -368,19 +428,11 @@ export function deleteLegacySessionEntryRows(
   if (legacyKeys.length === 0) {
     return;
   }
-  const db = getSessionKysely(database.db);
   for (const legacyKey of legacyKeys) {
     if (legacyKey === sessionKey) {
       continue;
     }
-    executeSqliteQuerySync(
-      database.db,
-      db.deleteFrom("session_routes").where("session_key", "=", legacyKey),
-    );
-    executeSqliteQuerySync(
-      database.db,
-      db.deleteFrom("session_entries").where("session_key", "=", legacyKey),
-    );
+    deleteSqliteSessionEntryRows(database, legacyKey);
   }
 }
 
@@ -394,6 +446,7 @@ export function writeSessionEntry(
   const persistedEntry = copySessionEntryForPersistence(normalizedEntry);
   const updatedAt = normalizedEntry.updatedAt;
   const previousEntry = readExactSessionEntryRow(database, sessionKey)?.entry;
+  const previousSessionId = previousEntry?.sessionId;
   // Registry writes snapshot the current transcript watermark so recovery can
   // distinguish same-millisecond transcript writes before and after this row.
   const transcriptObservedAt =
@@ -469,6 +522,17 @@ export function writeSessionEntry(
         }),
       ),
   );
+  if (previousSessionId && previousSessionId !== normalizedEntry.sessionId) {
+    deferPromptReportCandidateCleanup(database, [previousSessionId]);
+  }
+  if (normalizedEntry.systemPromptReport) {
+    writeSessionPromptReport(database, {
+      sessionId: normalizedEntry.sessionId,
+      sessionKey,
+      report: normalizedEntry.systemPromptReport,
+      updatedAt,
+    });
+  }
 }
 
 /** Resolves the parent fork decision using SQLite transcript rows when totals are stale. */

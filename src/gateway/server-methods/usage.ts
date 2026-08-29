@@ -14,6 +14,7 @@ import {
   resolveSessionFilePath,
   resolveSessionFilePathOptions,
 } from "../../config/sessions/paths.js";
+import { loadSessionPromptReportsForEntries } from "../../config/sessions/session-prompt-report-store.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
@@ -69,6 +70,7 @@ import type { GatewayRequestHandlers, RespondFn } from "./types.js";
 const COST_USAGE_CACHE_TTL_MS = 30_000;
 const COST_USAGE_CACHE_MAX = 256;
 const USAGE_AGENT_LOAD_CONCURRENCY = 12;
+const SESSIONS_USAGE_LIMIT_MAX = 500;
 
 async function runUsageAgentTasks<T>(tasks: Array<() => Promise<T>>): Promise<T[]> {
   const result = await runTasksWithConcurrency({
@@ -1151,7 +1153,8 @@ export const usageHandlers: GatewayRequestHandlers = {
     const config = context.getRuntimeConfig();
     const { startMs, endMs, includeUntimestamped } = dateRange.value;
     const dayBucket = resolveDayBucket(dateInterpretation);
-    const limit = typeof p.limit === "number" && Number.isFinite(p.limit) ? p.limit : 50;
+    const requestedLimit = typeof p.limit === "number" && Number.isFinite(p.limit) ? p.limit : 50;
+    const limit = Math.min(requestedLimit, SESSIONS_USAGE_LIMIT_MAX);
     const includeContextWeight = p.includeContextWeight ?? false;
     const specificKey = normalizeOptionalString(p.key) ?? null;
     const requestedAgentId = normalizeOptionalString(p.agentId);
@@ -1188,7 +1191,11 @@ export const usageHandlers: GatewayRequestHandlers = {
 
     // Load session store for named sessions
     const sessionStoreOpts = effectiveAgentId ? { agentId: effectiveAgentId } : {};
-    const { storePath, store } = loadCombinedSessionStoreForGateway(config, sessionStoreOpts);
+    const {
+      storePath,
+      store,
+      sources: storeSources = {},
+    } = loadCombinedSessionStoreForGateway(config, sessionStoreOpts);
     const scopedStore = effectiveAgentId
       ? filterSessionStoreByAgent({
           config,
@@ -1442,6 +1449,37 @@ export const usageHandlers: GatewayRequestHandlers = {
       }
     }
 
+    const contextReportsByKey = new Map<string, SessionEntry["systemPromptReport"] | null>();
+    if (includeContextWeight) {
+      const reportGroups = new Map<
+        string,
+        {
+          agentId?: string;
+          storePath?: string;
+          entries: Array<{ sessionKey: string; entry?: SessionEntry }>;
+        }
+      >();
+      for (const merged of mergedEntries.slice(0, limit)) {
+        const source = storeSources[merged.key];
+        const agentId = source?.agentId ?? merged.agentId;
+        const sourceStorePath =
+          source?.storePath ?? (storePath !== "(multiple)" ? storePath : undefined);
+        const groupKey = `${agentId ?? ""}\0${sourceStorePath ?? ""}`;
+        const group = reportGroups.get(groupKey) ?? {
+          ...(agentId ? { agentId } : {}),
+          ...(sourceStorePath ? { storePath: sourceStorePath } : {}),
+          entries: [],
+        };
+        group.entries.push({ sessionKey: merged.key, entry: merged.storeEntry });
+        reportGroups.set(groupKey, group);
+      }
+      for (const group of reportGroups.values()) {
+        for (const [sessionKey, report] of loadSessionPromptReportsForEntries(group)) {
+          contextReportsByKey.set(sessionKey, report);
+        }
+      }
+    }
+
     // Track session-level aggregates across every matched session, so profile
     // stats stay correct when the row list is truncated by `limit`.
     let longestSessionDurationMs = 0;
@@ -1601,7 +1639,7 @@ export const usageHandlers: GatewayRequestHandlers = {
           model: merged.storeEntry?.model,
           usage,
           contextWeight: includeContextWeight
-            ? (merged.storeEntry?.systemPromptReport ?? null)
+            ? (contextReportsByKey.get(merged.key) ?? null)
             : undefined,
         });
       }

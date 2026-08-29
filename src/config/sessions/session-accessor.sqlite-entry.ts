@@ -257,7 +257,7 @@ export async function patchSqliteSessionEntry(
       ];
       previousIdentity = createSqliteSessionIdentitySnapshot(fresh.selectedRows);
       const merged = options.replaceEntry
-        ? cloneSessionEntry(patch as SessionEntry)
+        ? structuredClone(patch as SessionEntry)
         : options.preserveActivity
           ? mergeSessionEntryPreserveActivity(writeBase, patch)
           : mergeSessionEntry(writeBase, patch);
@@ -331,7 +331,7 @@ export async function patchSqliteSessionEntryTarget(
       ];
       previousIdentity = createSqliteSessionIdentitySnapshot(fresh.rows);
       const merged = options.replaceEntry
-        ? cloneSessionEntry(patch as SessionEntry)
+        ? structuredClone(patch as SessionEntry)
         : options.preserveActivity
           ? mergeSessionEntryPreserveActivity(writeBase, patch)
           : mergeSessionEntry(writeBase, patch);

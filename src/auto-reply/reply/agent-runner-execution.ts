@@ -226,7 +226,7 @@ async function runAgentTurnWithFallbackInternalWithRetryState(
     attemptedRuntimeProvider: fallbackProvider,
     attemptedRuntimeModel: fallbackModel,
     bootstrapPromptWarningSignaturesSeen: resolveBootstrapWarningSignaturesSeen(
-      params.getActiveSessionEntry()?.systemPromptReport,
+      params.getActiveSessionEntry(),
     ),
   };
   const clearRecoveredAutoFallbackPrimaryProbe = async (paramsForClear: {

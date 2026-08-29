@@ -109,13 +109,25 @@ function appendSeenSignature(signatures: string[], signature: string): string[] 
 
 /** Restores prompt-warning dedupe state from a previous bootstrap report. */
 export function resolveBootstrapWarningSignaturesSeen(report?: {
+  bootstrapPromptWarningSignaturesSeen?: string[];
+  systemPromptReport?: {
+    bootstrapTruncation?: {
+      warningMode?: BootstrapPromptWarningMode;
+      warningSignaturesSeen?: string[];
+      promptWarningSignature?: string;
+    };
+  };
   bootstrapTruncation?: {
     warningMode?: BootstrapPromptWarningMode;
     warningSignaturesSeen?: string[];
     promptWarningSignature?: string;
   };
 }): string[] {
-  const truncation = report?.bootstrapTruncation;
+  const seenFromState = normalizeSeenSignatures(report?.bootstrapPromptWarningSignaturesSeen);
+  if (seenFromState.length > 0) {
+    return seenFromState;
+  }
+  const truncation = report?.bootstrapTruncation ?? report?.systemPromptReport?.bootstrapTruncation;
   const seenFromReport = normalizeSeenSignatures(truncation?.warningSignaturesSeen);
   if (seenFromReport.length > 0) {
     return seenFromReport;

@@ -13,6 +13,7 @@ import {
 } from "../../agents/embedded-agent-runner/tool-result-char-estimator.js";
 import type { AgentMessage } from "../../agents/runtime/index.js";
 import { buildSystemPromptReport } from "../../agents/system-prompt-report.js";
+import { loadSessionPromptReportForEntry } from "../../config/sessions/session-prompt-report-store.js";
 import {
   resolveFreshSessionTotalTokens,
   type SessionEntry,
@@ -56,7 +57,19 @@ function formatListTop(
 function resolveRunContextReport(params: HandleCommandsParams): SessionSystemPromptReport | null {
   const targetSessionEntry = params.sessionStore?.[params.sessionKey] ?? params.sessionEntry;
   const existing = targetSessionEntry?.systemPromptReport;
-  return existing?.source === "run" ? existing : null;
+  if (existing?.source === "run") {
+    return existing;
+  }
+  if (!params.storePath) {
+    return null;
+  }
+  const stored = loadSessionPromptReportForEntry({
+    ...(params.agentId ? { agentId: params.agentId } : {}),
+    storePath: params.storePath,
+    sessionKey: params.sessionKey,
+    entry: targetSessionEntry,
+  });
+  return stored?.source === "run" ? stored : null;
 }
 
 function resolveContextReportAgentId(params: HandleCommandsParams): string {

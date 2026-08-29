@@ -115,6 +115,13 @@ export interface SessionEntries {
   updated_at: number;
 }
 
+export interface SessionPromptReports {
+  report_json: string;
+  session_id: string;
+  session_key: string;
+  updated_at: number;
+}
+
 export interface SessionRoutes {
   session_id: string;
   session_key: string;
@@ -241,6 +248,7 @@ export interface DB {
   schema_meta: SchemaMeta;
   session_conversations: SessionConversations;
   session_entries: SessionEntries;
+  session_prompt_reports: SessionPromptReports;
   session_routes: SessionRoutes;
   session_transcript_active_events: SessionTranscriptActiveEvents;
   session_transcript_fts: SessionTranscriptFts;

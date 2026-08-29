@@ -6,12 +6,17 @@ import {
   readPersistedAuthProfileStateRaw,
   writePersistedAuthProfileStateRaw,
 } from "../../agents/auth-profiles/sqlite.js";
-import { executeSqliteQueryTakeFirstSync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
+import {
+  executeSqliteQuerySync,
+  executeSqliteQueryTakeFirstSync,
+  getNodeSqliteKysely,
+} from "../../infra/kysely-sync.js";
 import { onSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
   closeOpenClawAgentDatabasesForTest,
   openOpenClawAgentDatabase,
+  runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { appendSqliteTrajectoryRuntimeEvents } from "../../trajectory/runtime-store.sqlite.js";
@@ -43,6 +48,11 @@ import {
   type TranscriptMessageAppendResult,
   type TranscriptUpdatePayload,
 } from "./session-accessor.js";
+import { writeSessionEntry } from "./session-accessor.sqlite-entry-store.js";
+import {
+  applySqliteSessionEntryMaintenance,
+  finalizeSqliteSessionEntryMaintenancePlansBestEffort,
+} from "./session-accessor.sqlite-maintenance.js";
 import {
   appendSqliteTranscriptEvent,
   appendSqliteTranscriptMessage,
@@ -63,6 +73,7 @@ import {
   restoreSqliteCompactionCheckpointSession,
   upsertSqliteSessionEntry,
 } from "./session-accessor.sqlite.js";
+import { loadSessionPromptReportForEntry } from "./session-prompt-report-store.js";
 import { parseSqliteSessionFileMarker } from "./sqlite-marker.js";
 import type { SessionCompactionCheckpoint, SessionEntry } from "./types.js";
 
@@ -1383,6 +1394,86 @@ describe("sqlite session normalization", () => {
     expect(result.decision?.parentTokens).toBeGreaterThan(100_000);
   });
 
+  it("reclaims prompt reports displaced by parent skip patch without maintenance", async () => {
+    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
+    const parentKey = "agent:main:parent-reclaim";
+    const childKey = "agent:main:parent-reclaim-child";
+    await upsertSqliteSessionEntry(
+      {
+        agentId: "main",
+        env,
+        sessionKey: parentKey,
+        storePath: paths.sqlitePath,
+      },
+      {
+        sessionId: "parent-reclaim-session",
+        totalTokens: 1,
+        totalTokensFresh: false,
+        updatedAt: 10,
+      },
+    );
+    await replaceSqliteSessionEntry(
+      {
+        agentId: "main",
+        env,
+        sessionKey: childKey,
+        storePath: paths.sqlitePath,
+      },
+      {
+        sessionId: "parent-skip-old-child-session",
+        systemPromptReport: {
+          source: "run",
+          generatedAt: Date.now(),
+          systemPrompt: { chars: 1, projectContextChars: 1, nonProjectContextChars: 0 },
+          injectedWorkspaceFiles: [],
+          skills: { promptChars: 0, entries: [] },
+          tools: { listChars: 0, schemaChars: 0, entries: [] },
+        },
+        updatedAt: 9,
+      },
+    );
+    await replaceSqliteTranscriptEvents(
+      {
+        agentId: "main",
+        env,
+        sessionId: "parent-reclaim-session",
+        sessionKey: parentKey,
+        storePath: paths.sqlitePath,
+      },
+      [
+        { type: "session", id: "parent-reclaim-session", cwd: paths.tempDir },
+        {
+          type: "message",
+          id: "oversized-parent-reclaim",
+          parentId: null,
+          message: { role: "user", content: "x".repeat(420_000) },
+        },
+      ],
+    );
+
+    const result = await forkSqliteSessionEntryFromParentTarget({
+      fallbackEntry: { sessionId: "", updatedAt: 1 },
+      parentTarget: { canonicalKey: parentKey, storeKeys: [parentKey] },
+      sessionTarget: { canonicalKey: childKey, storeKeys: [childKey] },
+      storePath: paths.sqlitePath,
+      decisionSkipPatch: () => ({ sessionId: "parent-skip-new-child-session", updatedAt: 11 }),
+    });
+
+    expect(result).toMatchObject({
+      status: "skipped",
+      reason: "decision-skip",
+      sessionEntry: {
+        sessionId: "parent-skip-new-child-session",
+      },
+    });
+    const database = openOpenClawAgentDatabase({ agentId: "main", env, path: paths.sqlitePath });
+    expect(
+      database.db
+        .prepare("SELECT session_id FROM session_prompt_reports WHERE session_id = ?")
+        .get("parent-skip-old-child-session"),
+    ).toBeUndefined();
+  });
+
   it("does not move current routes back to stale transcript session ids", async () => {
     const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
     const scope = {
@@ -1559,6 +1650,452 @@ describe("sqlite session normalization", () => {
         storePath: paths.sqlitePath,
       }).map((summary) => summary.sessionKey),
     ).toEqual(["agent:main:newer", "agent:main:newest"]);
+  });
+
+  it("deletes stale prompt reports when forced maintenance sweeps after a key rotates ids", async () => {
+    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
+    const scope = {
+      agentId: "main",
+      env,
+      sessionKey: "agent:main:rotating-report",
+      storePath: paths.sqlitePath,
+    };
+    const report: NonNullable<SessionEntry["systemPromptReport"]> = {
+      source: "run",
+      generatedAt: Date.now(),
+      systemPrompt: { chars: 3, projectContextChars: 3, nonProjectContextChars: 0 },
+      injectedWorkspaceFiles: [
+        {
+          name: "old",
+          path: "/tmp/old",
+          missing: false,
+          rawChars: 1,
+          injectedChars: 1,
+          truncated: false,
+        },
+      ],
+      skills: { promptChars: 0, entries: [] },
+      tools: { listChars: 0, schemaChars: 0, entries: [] },
+    };
+
+    await replaceSqliteSessionEntry(scope, {
+      sessionId: "new-report-session",
+      updatedAt: 2,
+    });
+
+    const database = openOpenClawAgentDatabase({ agentId: "main", env, path: paths.sqlitePath });
+    database.db
+      .prepare(
+        `INSERT INTO sessions (session_id, session_key, created_at, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run("old-report-session", scope.sessionKey, 1, 1);
+    database.db
+      .prepare(
+        `INSERT INTO session_prompt_reports (session_id, session_key, report_json, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run("old-report-session", scope.sessionKey, JSON.stringify(report), 1);
+    const plan = applySqliteSessionEntryMaintenance(database, {
+      activeSessionKey: scope.sessionKey,
+      archiveDirectory: path.join(paths.stateDir, "archive"),
+      forceMaintenance: true,
+    });
+    finalizeSqliteSessionEntryMaintenancePlansBestEffort(
+      { agentId: "main", env, path: paths.sqlitePath },
+      [plan],
+    );
+    const db = getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db);
+    const rows = executeSqliteQuerySync(
+      database.db,
+      db.selectFrom("session_prompt_reports").select(["session_id", "session_key"]),
+    ).rows;
+
+    expect(rows).toEqual([]);
+  });
+
+  it("preserves a shared live session prompt report when another key rotates", async () => {
+    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
+    const report: NonNullable<SessionEntry["systemPromptReport"]> = {
+      source: "run",
+      generatedAt: Date.now(),
+      systemPrompt: { chars: 6, projectContextChars: 6, nonProjectContextChars: 0 },
+      injectedWorkspaceFiles: [
+        {
+          name: "shared",
+          path: "/tmp/shared",
+          missing: false,
+          rawChars: 1,
+          injectedChars: 1,
+          truncated: false,
+        },
+      ],
+      skills: { promptChars: 0, entries: [] },
+      tools: { listChars: 0, schemaChars: 0, entries: [] },
+    };
+    const sessionKeyA = "agent:main:shared-a";
+    const sessionKeyB = "agent:main:shared-b";
+    const database = openOpenClawAgentDatabase({ agentId: "main", env, path: paths.sqlitePath });
+
+    writeSessionEntry(database, sessionKeyA, {
+      sessionId: "shared-session",
+      updatedAt: 1,
+      systemPromptReport: report,
+    });
+    writeSessionEntry(database, sessionKeyB, {
+      sessionId: "shared-session",
+      updatedAt: 2,
+    });
+    writeSessionEntry(database, sessionKeyA, {
+      sessionId: "rotated-session",
+      updatedAt: 3,
+    });
+    const db = getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db);
+    const rows = executeSqliteQuerySync(
+      database.db,
+      db
+        .selectFrom("session_prompt_reports")
+        .select(["session_id", "session_key"])
+        .orderBy("session_id"),
+    ).rows;
+    const sharedEntry = loadSqliteSessionEntry({
+      agentId: "main",
+      env,
+      sessionKey: sessionKeyB,
+      storePath: paths.sqlitePath,
+    });
+
+    expect(rows).toEqual([{ session_id: "shared-session", session_key: sessionKeyA }]);
+    expect(
+      loadSessionPromptReportForEntry({
+        agentId: "main",
+        storePath: paths.sqlitePath,
+        sessionKey: sessionKeyB,
+        entry: sharedEntry,
+      }),
+    ).toEqual(report);
+  });
+
+  it("deletes a shared prompt report after the final referencing key rotates and forced maintenance sweeps", () => {
+    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
+    const report = {
+      source: "run" as const,
+      generatedAt: Date.now(),
+      systemPrompt: { chars: 6, projectContextChars: 6, nonProjectContextChars: 0 },
+      injectedWorkspaceFiles: [
+        {
+          name: "shared",
+          path: "/tmp/shared",
+          missing: false,
+          rawChars: 1,
+          injectedChars: 1,
+          truncated: false,
+        },
+      ],
+      skills: { promptChars: 0, entries: [] },
+      tools: { listChars: 0, schemaChars: 0, entries: [] },
+    } satisfies NonNullable<SessionEntry["systemPromptReport"]>;
+    const liveReport = {
+      ...report,
+      generatedAt: Date.now() + 1,
+      injectedWorkspaceFiles: [{ ...report.injectedWorkspaceFiles[0], name: "live" }],
+    } satisfies NonNullable<SessionEntry["systemPromptReport"]>;
+    const sessionKeyA = "agent:main:final-rotate-a";
+    const sessionKeyB = "agent:main:final-rotate-b";
+    const liveSessionKey = "agent:main:final-rotate-live";
+    const database = openOpenClawAgentDatabase({ agentId: "main", env, path: paths.sqlitePath });
+
+    writeSessionEntry(database, sessionKeyA, { sessionId: "rotated-a-session", updatedAt: 4 });
+    writeSessionEntry(database, sessionKeyB, { sessionId: "rotated-b-session", updatedAt: 5 });
+    writeSessionEntry(database, liveSessionKey, {
+      sessionId: "live-final-session",
+      updatedAt: 3,
+      systemPromptReport: liveReport,
+    });
+    database.db
+      .prepare(
+        `INSERT INTO sessions (session_id, session_key, created_at, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run("shared-final-session", sessionKeyA, 1, 1);
+    database.db
+      .prepare(
+        `INSERT INTO session_prompt_reports (session_id, session_key, report_json, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run("shared-final-session", sessionKeyA, JSON.stringify(report), 1);
+
+    const plan = applySqliteSessionEntryMaintenance(database, {
+      activeSessionKey: liveSessionKey,
+      archiveDirectory: path.join(paths.stateDir, "archive"),
+      forceMaintenance: true,
+    });
+    finalizeSqliteSessionEntryMaintenancePlansBestEffort(
+      { agentId: "main", env, path: paths.sqlitePath },
+      [plan],
+    );
+
+    const db = getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db);
+    const rows = executeSqliteQuerySync(
+      database.db,
+      db
+        .selectFrom("session_prompt_reports")
+        .select(["session_id", "session_key"])
+        .orderBy("session_id"),
+    ).rows;
+    const orphanRow = database.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM session_prompt_reports
+         WHERE NOT EXISTS (
+           SELECT 1 FROM session_entries
+           WHERE session_entries.session_id = session_prompt_reports.session_id
+         )`,
+      )
+      .get() as { count: number };
+
+    expect(rows).toEqual([{ session_id: "live-final-session", session_key: liveSessionKey }]);
+    expect(orphanRow.count).toBe(0);
+    expect(
+      loadSessionPromptReportForEntry({
+        agentId: "main",
+        storePath: paths.sqlitePath,
+        sessionKey: liveSessionKey,
+        entry: { sessionId: "live-final-session", updatedAt: 3 },
+      }),
+    ).toEqual(liveReport);
+  });
+
+  it("preserves a re-referenced prompt report across ordered writes in one transaction", () => {
+    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
+    const report = {
+      source: "run" as const,
+      generatedAt: Date.now(),
+      systemPrompt: { chars: 4, projectContextChars: 4, nonProjectContextChars: 0 },
+      injectedWorkspaceFiles: [
+        {
+          name: "batch",
+          path: "/tmp/batch",
+          missing: false,
+          rawChars: 1,
+          injectedChars: 1,
+          truncated: false,
+        },
+      ],
+      skills: { promptChars: 0, entries: [] },
+      tools: { listChars: 0, schemaChars: 0, entries: [] },
+    } satisfies NonNullable<SessionEntry["systemPromptReport"]>;
+    const envScope = { agentId: "main", env, path: paths.sqlitePath };
+    const sessionKeyA = "agent:main:batch-order-a";
+    const sessionKeyB = "agent:main:batch-order-b";
+
+    runOpenClawAgentWriteTransaction((database) => {
+      writeSessionEntry(database, sessionKeyA, {
+        sessionId: "batch-shared-session",
+        updatedAt: 1,
+        systemPromptReport: report,
+      });
+      writeSessionEntry(database, sessionKeyA, {
+        sessionId: "batch-replacement-session",
+        updatedAt: 2,
+      });
+      writeSessionEntry(database, sessionKeyB, { sessionId: "batch-shared-session", updatedAt: 3 });
+    }, envScope);
+    const database = openOpenClawAgentDatabase({ agentId: "main", env, path: paths.sqlitePath });
+    const plan = applySqliteSessionEntryMaintenance(database, {
+      activeSessionKey: sessionKeyB,
+      archiveDirectory: path.join(paths.stateDir, "archive"),
+      forceMaintenance: true,
+    });
+    finalizeSqliteSessionEntryMaintenancePlansBestEffort(envScope, [plan]);
+
+    expect(
+      loadSessionPromptReportForEntry({
+        agentId: "main",
+        storePath: paths.sqlitePath,
+        sessionKey: sessionKeyB,
+        entry: { sessionId: "batch-shared-session", updatedAt: 3 },
+      }),
+    ).toEqual(report);
+  });
+
+  it("sweeps orphan prompt reports through stale-entry maintenance", async () => {
+    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
+    const scopeFor = (sessionKey: string) => ({
+      agentId: "main",
+      env,
+      sessionKey,
+      storePath: paths.sqlitePath,
+    });
+    const reportFor = (name: string) =>
+      ({
+        source: "run" as const,
+        generatedAt: Date.now(),
+        systemPrompt: { chars: 4, projectContextChars: 4, nonProjectContextChars: 0 },
+        injectedWorkspaceFiles: [
+          {
+            name,
+            path: `/tmp/${name}`,
+            missing: false,
+            rawChars: 1,
+            injectedChars: 1,
+            truncated: false,
+          },
+        ],
+        skills: { promptChars: 0, entries: [] },
+        tools: { listChars: 0, schemaChars: 0, entries: [] },
+      }) satisfies NonNullable<SessionEntry["systemPromptReport"]>;
+    const database = openOpenClawAgentDatabase({ agentId: "main", env, path: paths.sqlitePath });
+    const orphanKey = "agent:main:stale-orphan";
+    const activeKey = "agent:main:stale-active";
+    const liveReport = reportFor("stale-live");
+    const staleUpdatedAt = Date.now() - 2 * 24 * 60 * 60 * 1000;
+
+    writeSessionEntry(database, orphanKey, {
+      sessionId: "stale-replacement-session",
+      updatedAt: staleUpdatedAt + 1,
+    });
+    writeSessionEntry(database, activeKey, {
+      sessionId: "stale-live-session",
+      updatedAt: Date.now(),
+      systemPromptReport: liveReport,
+    });
+    database.db
+      .prepare(
+        `INSERT INTO sessions (session_id, session_key, created_at, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run("stale-orphan-session", orphanKey, staleUpdatedAt, staleUpdatedAt);
+    database.db
+      .prepare(
+        `INSERT INTO session_prompt_reports (session_id, session_key, report_json, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(
+        "stale-orphan-session",
+        orphanKey,
+        JSON.stringify(reportFor("stale-orphan")),
+        staleUpdatedAt,
+      );
+
+    await patchSqliteSessionEntry(
+      scopeFor(activeKey),
+      () => ({ modelOverride: "gpt-5.5", updatedAt: Date.now() }),
+      {
+        maintenanceConfig: {
+          highWaterBytes: null,
+          maxDiskBytes: null,
+          maxEntries: 100,
+          mode: "enforce",
+          modelRunPruneAfterMs: 24 * 60 * 60 * 1000,
+          pruneAfterMs: 24 * 60 * 60 * 1000,
+          resetArchiveRetentionMs: null,
+        },
+      },
+    );
+
+    const rows = executeSqliteQuerySync(
+      database.db,
+      getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db)
+        .selectFrom("session_prompt_reports")
+        .select(["session_id", "session_key"])
+        .orderBy("session_id"),
+    ).rows;
+    const orphanRow = database.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM session_prompt_reports
+         WHERE NOT EXISTS (
+           SELECT 1 FROM session_entries
+           WHERE session_entries.session_id = session_prompt_reports.session_id
+         )`,
+      )
+      .get() as { count: number };
+
+    expect(rows).toEqual([{ session_id: "stale-live-session", session_key: activeKey }]);
+    expect(orphanRow.count).toBe(0);
+    expect(
+      loadSessionPromptReportForEntry({
+        agentId: "main",
+        storePath: paths.sqlitePath,
+        sessionKey: activeKey,
+        entry: { sessionId: "stale-live-session", updatedAt: Date.now() },
+      }),
+    ).toEqual(liveReport);
+  });
+
+  it("counts stale-entry prompt report bytes when enforcing SQLite session disk budgets", async () => {
+    vi.mocked(getRuntimeConfig).mockReturnValue({
+      session: {
+        maintenance: {
+          highWaterBytes: 600,
+          maxDiskBytes: 1_000,
+          maxEntries: 100,
+          mode: "enforce",
+          pruneAfter: "365d",
+        },
+      },
+    });
+    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
+    const scopeFor = (sessionKey: string) => ({
+      agentId: "main",
+      env,
+      sessionKey,
+      storePath: paths.sqlitePath,
+    });
+    const largeReport = (name: string): NonNullable<SessionEntry["systemPromptReport"]> => ({
+      source: "run",
+      generatedAt: Date.now(),
+      systemPrompt: { chars: 2_000, projectContextChars: 2_000, nonProjectContextChars: 0 },
+      injectedWorkspaceFiles: [
+        {
+          name,
+          path: `/tmp/${name}-${"x".repeat(1_500)}`,
+          missing: false,
+          rawChars: 2_000,
+          injectedChars: 2_000,
+          truncated: false,
+        },
+      ],
+      skills: { promptChars: 0, entries: [] },
+      tools: { listChars: 0, schemaChars: 0, entries: [] },
+    });
+    const oldUpdatedAt = Date.now() - 2 * 24 * 60 * 60 * 1000;
+
+    await patchSqliteSessionEntry(
+      scopeFor("agent:main:old-report-budget"),
+      () => ({
+        sessionId: "old-report-budget-session",
+        updatedAt: oldUpdatedAt,
+        systemPromptReport: largeReport("old"),
+      }),
+      {
+        fallbackEntry: { sessionId: "old-report-budget-session", updatedAt: oldUpdatedAt },
+        replaceEntry: true,
+        skipMaintenance: true,
+      },
+    );
+    await patchSqliteSessionEntry(
+      scopeFor("agent:main:active-report-budget"),
+      () => ({ sessionId: "active-report-budget-session", updatedAt: Date.now() }),
+      {
+        fallbackEntry: { sessionId: "active-report-budget-session", updatedAt: Date.now() },
+        replaceEntry: true,
+        skipMaintenance: true,
+      },
+    );
+
+    await patchSqliteSessionEntry(scopeFor("agent:main:active-report-budget"), () => ({
+      modelOverride: "gpt-5.5",
+    }));
+
+    expect(
+      listSqliteSessionEntries({
+        agentId: "main",
+        env,
+        storePath: paths.sqlitePath,
+      }).map((summary) => summary.sessionKey),
+    ).toEqual(["agent:main:active-report-budget"]);
   });
 
   it("evicts old SQLite transcript rows only when no remaining entry references them", async () => {
@@ -1923,6 +2460,21 @@ describe("sqlite session normalization", () => {
       updatedAt: 10,
       compactionCheckpoints: [checkpoint],
     });
+    await replaceSqliteSessionEntry(
+      { ...sourceEntryScope, sessionKey: branchKey },
+      {
+        sessionId: "checkpoint-branch-old-session",
+        systemPromptReport: {
+          source: "run",
+          generatedAt: Date.now(),
+          systemPrompt: { chars: 1, projectContextChars: 1, nonProjectContextChars: 0 },
+          injectedWorkspaceFiles: [],
+          skills: { promptChars: 0, entries: [] },
+          tools: { listChars: 0, schemaChars: 0, entries: [] },
+        },
+        updatedAt: 9,
+      },
+    );
 
     const notify = vi.fn();
     const unsubscribe = onSessionIdentityMutation(notify);
@@ -1948,8 +2500,8 @@ describe("sqlite session normalization", () => {
       result.entry,
     );
     expect(notify).toHaveBeenCalledWith({
-      kind: "create",
-      previous: { sessionKeys: [] },
+      kind: "replace",
+      previous: { sessionId: "checkpoint-branch-old-session", sessionKeys: [branchKey] },
       current: { sessionId: result.entry.sessionId, sessionKeys: [branchKey] },
     });
     expect(result.entry).toEqual(
@@ -1966,6 +2518,12 @@ describe("sqlite session normalization", () => {
       expect.objectContaining({ id: "pre-msg", type: "message" }),
     ]);
     expect(fs.existsSync(path.join(paths.tempDir, `${result.entry.sessionId}.jsonl`))).toBe(false);
+    const database = openOpenClawAgentDatabase({ agentId: "main", env, path: paths.sqlitePath });
+    expect(
+      database.db
+        .prepare("SELECT session_id FROM session_prompt_reports WHERE session_id = ?")
+        .get("checkpoint-branch-old-session"),
+    ).toBeUndefined();
   });
 
   it("falls back to post-compaction SQLite rows when no pre-compaction rows exist", async () => {
@@ -2087,6 +2645,14 @@ describe("sqlite session normalization", () => {
       label: "Current",
       sessionId: "current-session",
       sessionFile: "sqlite:main:current-session",
+      systemPromptReport: {
+        source: "run",
+        generatedAt: Date.now(),
+        systemPrompt: { chars: 1, projectContextChars: 1, nonProjectContextChars: 0 },
+        injectedWorkspaceFiles: [],
+        skills: { promptChars: 0, entries: [] },
+        tools: { listChars: 0, schemaChars: 0, entries: [] },
+      },
       updatedAt: 10,
       compactionCheckpoints: [checkpoint],
     });
@@ -2101,6 +2667,7 @@ describe("sqlite session normalization", () => {
     if (result.status !== "created") {
       throw new Error(`expected restore creation, got ${result.status}`);
     }
+    expect(result.entry.sessionId).not.toBe("current-session");
 
     const restoredScope = {
       ...sourceScope,
@@ -2121,6 +2688,39 @@ describe("sqlite session normalization", () => {
       expect.objectContaining({ id: "pre-msg", type: "message" }),
     ]);
     expect(fs.existsSync(path.join(paths.tempDir, `${result.entry.sessionId}.jsonl`))).toBe(false);
+    const database = openOpenClawAgentDatabase({ agentId: "main", env, path: paths.sqlitePath });
+    expect(
+      database.db
+        .prepare("SELECT session_id FROM session_prompt_reports WHERE session_id = ?")
+        .get("current-session"),
+    ).toBeUndefined();
+  });
+
+  it("commits entry removals when best-effort prompt report sweep fails", async () => {
+    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
+    const scope = {
+      agentId: "main",
+      env,
+      sessionKey: "agent:main:sweep-throws",
+      storePath: paths.sqlitePath,
+    };
+    const expectedEntry = { sessionId: "sweep-throws-session", updatedAt: 1 };
+    await replaceSqliteSessionEntry(scope, expectedEntry);
+    const database = openOpenClawAgentDatabase({ agentId: "main", env, path: paths.sqlitePath });
+    database.db.exec("DROP TABLE session_prompt_reports");
+
+    finalizeSqliteSessionEntryMaintenancePlansBestEffort(
+      { agentId: "main", env, path: paths.sqlitePath },
+      [
+        {
+          entryRemovals: [{ expectedEntry, sessionKey: scope.sessionKey }],
+          promptReportOrphanSweep: true,
+          stateDeletePlans: [],
+        },
+      ],
+    );
+
+    expect(loadSqliteSessionEntry(scope)).toBeUndefined();
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
