@@ -1634,11 +1634,22 @@ describe("sqlite session normalization", () => {
         skipMaintenance: true,
       },
     );
+    // Three removable rows for a cap of two: the row being written is protected
+    // as the active key, and the cap bounds the removable population only.
+    await patchSqliteSessionEntry(
+      scopeFor("agent:main:newer-2"),
+      () => ({ sessionId: "newer-2-session", updatedAt: Date.now() + 2 }),
+      {
+        fallbackEntry: { sessionId: "newer-2-session", updatedAt: Date.now() + 2 },
+        replaceEntry: true,
+        skipMaintenance: true,
+      },
+    );
     await patchSqliteSessionEntry(
       scopeFor("agent:main:newest"),
-      () => ({ sessionId: "newest-session", updatedAt: Date.now() + 2 }),
+      () => ({ sessionId: "newest-session", updatedAt: Date.now() + 3 }),
       {
-        fallbackEntry: { sessionId: "newest-session", updatedAt: Date.now() + 2 },
+        fallbackEntry: { sessionId: "newest-session", updatedAt: Date.now() + 3 },
         replaceEntry: true,
       },
     );
@@ -1649,7 +1660,7 @@ describe("sqlite session normalization", () => {
         env,
         storePath: paths.sqlitePath,
       }).map((summary) => summary.sessionKey),
-    ).toEqual(["agent:main:newer", "agent:main:newest"]);
+    ).toEqual(["agent:main:newer", "agent:main:newer-2", "agent:main:newest"]);
   });
 
   it("deletes stale prompt reports when forced maintenance sweeps after a key rotates ids", async () => {

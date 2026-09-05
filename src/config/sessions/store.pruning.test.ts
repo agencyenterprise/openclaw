@@ -318,6 +318,9 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
       [activeKey, { sessionId: "active-session", updatedAt: now - 3 }],
       ["removable", { sessionId: "removable-session", updatedAt: now - 2 }],
       ["writer", { sessionId: "writer-session", updatedAt: now - 1 }],
+      // Two removable rows for a cap of one: protected rows no longer consume
+      // the cap, so the eviction has to come from the removable population.
+      ["removable-newer", { sessionId: "removable-newer-session", updatedAt: now }],
     ]);
     const admission = await beginSessionWorkAdmission({
       scope: storePath,
@@ -345,6 +348,7 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
 
       expect(store).toHaveProperty(activeKey);
       expect(store).toHaveProperty("writer");
+      expect(store).toHaveProperty("removable-newer");
       expect(store.removable).toBeUndefined();
     } finally {
       admission.release();
@@ -361,6 +365,7 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
       [firstAlias, { sessionId: activeSessionId, updatedAt: now - 3 }],
       [secondAlias, { sessionId: activeSessionId, updatedAt: now - 2 }],
       ["removable", { sessionId: "removable-session", updatedAt: now - 1 }],
+      ["removable-newer", { sessionId: "removable-newer-session", updatedAt: now }],
     ]);
     const admission = await beginSessionWorkAdmission({
       scope: storePath,
@@ -387,6 +392,7 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
 
       expect(store).toHaveProperty(firstAlias);
       expect(store).toHaveProperty(secondAlias);
+      expect(store).toHaveProperty("removable-newer");
       expect(store.removable).toBeUndefined();
     } finally {
       admission.release();
@@ -401,6 +407,7 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
     const store = makeStore([
       [rawActiveKey, { sessionId: "active-legacy-session", updatedAt: now - 2 }],
       ["removable", { sessionId: "removable-session", updatedAt: now - 1 }],
+      ["removable-newer", { sessionId: "removable-newer-session", updatedAt: now }],
     ]);
     const admission = await beginSessionWorkAdmission({
       scope: storePath,
@@ -426,6 +433,7 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
       });
 
       expect(store).toHaveProperty(rawActiveKey);
+      expect(store).toHaveProperty("removable-newer");
       expect(store.removable).toBeUndefined();
     } finally {
       admission.release();
@@ -646,7 +654,8 @@ describe("capEntryCount", () => {
       ["newest", makeEntry(now)],
     ]);
 
-    const evicted = capEntryCount(store, 3);
+    // The cap bounds the removable rows; the protected thread is exempt from it.
+    const evicted = capEntryCount(store, 2);
 
     expect(evicted).toBe(2);
     expect(Object.keys(store)).toHaveLength(3);
@@ -666,7 +675,7 @@ describe("capEntryCount", () => {
       ["old", makeEntry(now - DAY_MS)],
     ]);
 
-    const evicted = capEntryCount(store, 2);
+    const evicted = capEntryCount(store, 1);
 
     expect(evicted).toBe(1);
     expect(store).toHaveProperty(lockedKey);
@@ -686,7 +695,7 @@ describe("capEntryCount", () => {
     const unregister = registerSessionMaintenancePreserveKeysProvider(() => [childKey]);
 
     try {
-      const evicted = capEntryCount(store, 2, {
+      const evicted = capEntryCount(store, 1, {
         preserveKeys: collectSessionMaintenancePreserveKeys(),
       });
 
@@ -716,7 +725,7 @@ describe("capEntryCount", () => {
     ]);
 
     try {
-      const evicted = capEntryCount(store, 2, {
+      const evicted = capEntryCount(store, 1, {
         preserveKeys: collectSessionMaintenancePreserveKeys(),
       });
 
@@ -728,6 +737,35 @@ describe("capEntryCount", () => {
     } finally {
       unregister();
     }
+  });
+
+  it("keeps the newest removable rows when protected rows already exceed the cap", () => {
+    // Regression: charging protected rows to the budget left `maxEntries -
+    // preservedCount <= 0`, so every unprotected row - including the one the
+    // current write had just created - was deleted on each maintenance pass.
+    const now = Date.now();
+    const protectedKeys = Array.from(
+      { length: 5 },
+      (_unused, index) => `agent:main:discord:channel:123456:thread:${index}`,
+    );
+    const store = makeStore([
+      ...protectedKeys.map(
+        (key, index): [string, SessionEntry] => [key, makeEntry(now - (10 + index) * DAY_MS)],
+      ),
+      ["agent:main:cron:job:run:oldest", makeEntry(now - 3 * DAY_MS)],
+      ["agent:main:cron:job:run:mid", makeEntry(now - 2 * DAY_MS)],
+      ["agent:main:cron:job:run:newest", makeEntry(now)],
+    ]);
+
+    const evicted = capEntryCount(store, 2);
+
+    expect(evicted).toBe(1);
+    for (const key of protectedKeys) {
+      expect(store).toHaveProperty(key);
+    }
+    expect(store).toHaveProperty("agent:main:cron:job:run:newest");
+    expect(store).toHaveProperty("agent:main:cron:job:run:mid");
+    expect(store["agent:main:cron:job:run:oldest"]).toBeUndefined();
   });
 
   it("can temporarily exceed the cap when every candidate is runtime-protected", () => {

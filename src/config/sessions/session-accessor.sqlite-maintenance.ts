@@ -5,7 +5,6 @@ import {
   executeSqliteQueryTakeFirstSync,
 } from "../../infra/kysely-sync.js";
 import { getChildLogger } from "../../logging/logger.js";
-import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 import {
   openOpenClawAgentDatabase,
   runOpenClawAgentWriteTransaction,
@@ -40,15 +39,13 @@ import {
   type ResolvedSqliteReadScope,
 } from "./session-accessor.sqlite-scope.js";
 import { parseSqliteSessionEntryJson as parseSessionEntryRow } from "./session-accessor.sqlite-status.js";
+import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
 import {
   collectSessionMaintenancePreserveKeys,
-  collectSessionMaintenancePreserveKeysForStore,
+  collectSessionMaintenancePreserveKeysForStoreScopes,
 } from "./store-maintenance-preserve.js";
-import {
-  resolveMaintenanceConfig,
-  resolveSessionStorePathForAgent,
-} from "./store-maintenance-runtime.js";
+import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
 import {
   capEntryCount,
   pruneStaleModelRunEntries,
@@ -279,6 +276,40 @@ function hasStaleSqliteSessionEntryCandidate(
   return rows.some((row) => !preserveKeys?.has(normalizeStoreSessionKey(row.session_key)));
 }
 
+/**
+ * Matches the session store scopes whose work admissions own rows in one SQLite
+ * database.
+ *
+ * Admissions are registered under the session store path their runtime resolved
+ * (see the `beginSessionWorkAdmission` callers), and several store paths can
+ * address one database file: every agent sharing an explicit `*.sqlite` store,
+ * an explicit path a caller passed instead of the configured one, and a config
+ * value that has since been reloaded. Maintenance therefore protects admissions
+ * by the database file it is actually maintaining - the path the accessor
+ * opened - instead of re-resolving one path from the current config and the
+ * agent id guessed from the written key.
+ */
+function createSqliteMaintenanceStoreScopeMatcher(
+  database: OpenClawAgentDatabase,
+): (storeScope: string) => boolean {
+  const maintainedPath = database.path;
+  const decidedScopes = new Map<string, boolean>();
+  return (storeScope: string): boolean => {
+    const decided = decidedScopes.get(storeScope);
+    if (decided !== undefined) {
+      return decided;
+    }
+    // A custom store path only names its per-agent database once the agent id is
+    // known, so an unqualified miss is retried against the maintained agent.
+    const matches =
+      resolveSqliteTargetFromSessionStorePath(storeScope).path === maintainedPath ||
+      resolveSqliteTargetFromSessionStorePath(storeScope, { agentId: database.agentId }).path ===
+        maintainedPath;
+    decidedScopes.set(storeScope, matches);
+    return matches;
+  };
+}
+
 export function applySqliteSessionEntryMaintenance(
   database: OpenClawAgentDatabase,
   params: {
@@ -350,15 +381,11 @@ export function applySqliteSessionEntryMaintenance(
   // Rows owned by an in-flight turn are never eviction candidates, however far
   // over retention the store is: dropping one destroys live runtime state, and
   // a cron run continuation row that disappears mid-run can no longer be sealed.
-  // Admissions are registered under the agent's session store path, so resolve
-  // the same path the runtime opened them under.
   const preserveKeys =
-    collectSessionMaintenancePreserveKeysForStore({
+    collectSessionMaintenancePreserveKeysForStoreScopes({
       baseKeys: collectSqliteSessionMaintenanceBaseKeys(store, params.activeSessionKey),
+      matchesStoreScope: createSqliteMaintenanceStoreScopeMatcher(database),
       store,
-      storePath: resolveSessionStorePathForAgent(
-        resolveAgentIdFromSessionKey(params.activeSessionKey),
-      ),
     }) ?? new Set<string>();
   if (
     shouldRunModelRunPrune({

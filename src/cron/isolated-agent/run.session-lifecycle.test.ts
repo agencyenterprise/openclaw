@@ -7,6 +7,7 @@ import {
   runExclusiveSessionLifecycleMutation,
 } from "../../sessions/session-lifecycle-admission.js";
 import { makeIsolatedAgentJobFixture, makeIsolatedAgentParamsFixture } from "./job-fixtures.js";
+import { cleanupCronRunSessionAfterRun } from "./session-cleanup.js";
 import {
   dispatchCronDeliveryMock,
   loadRunCronIsolatedAgentTurn,
@@ -225,6 +226,72 @@ describe("runCronIsolatedAgentTurn session lifecycle", () => {
     expect(result.status).toBe("ok");
     expect(callGatewayMock).toHaveBeenCalledTimes(1);
     expect(admissionActiveDuringDelete).toBe(false);
+  });
+
+  it("never writes the hidden run row after releasing a delete-after-run lease", async () => {
+    const sessionKey = "agent:main:cron:test-job";
+    const sessionId = "isolated-session";
+    const runSessionKey = `${sessionKey}:run:${sessionId}`;
+    const storePath = inMemoryStorePath;
+    resolveCronSessionMock.mockReturnValue(
+      makeCronSession({
+        storePath,
+        initialSessionEntry: undefined,
+        isNewSession: true,
+        sessionEntry: makeCronSessionEntry({ sessionId }),
+      }),
+    );
+    loadSessionEntryMock.mockReturnValue(undefined);
+
+    const sessionWrites: Array<{ sessionKey: string; admitted: boolean }> = [];
+    const storeBackedPatchSessionEntry = patchSessionEntryMock.getMockImplementation();
+    patchSessionEntryMock.mockImplementation(
+      async (scope: { storePath?: string; sessionKey: string }, ...rest: unknown[]) => {
+        sessionWrites.push({
+          sessionKey: scope.sessionKey,
+          admitted: isSessionWorkAdmissionActive(storePath, [scope.sessionKey, sessionId]),
+        });
+        return await storeBackedPatchSessionEntry?.(scope, ...rest);
+      },
+    );
+    // Production deletes the session from inside delivery dispatch, which
+    // releases the lease before the gateway call. Anything the run writes after
+    // that point touches a row it no longer owns, so session maintenance is
+    // free to evict the hidden run row out from under the write.
+    const defaultDispatchCronDelivery = dispatchCronDeliveryMock.getMockImplementation();
+    dispatchCronDeliveryMock.mockImplementationOnce(async (params) => {
+      await cleanupCronRunSessionAfterRun({
+        job: params.job,
+        agentSessionKey: params.agentSessionKey,
+        sessionId: params.sessionId,
+        lifecycleRevision: params.lifecycleRevision,
+        sessionUpdatedAt: params.sessionUpdatedAt,
+        beforeDelete: params.beforeSessionDelete,
+        reason: "cron-delete-after-run-delivery",
+      });
+      return {
+        ...(await defaultDispatchCronDelivery?.(params)),
+        cronRunSessionCleanupAttempted: true,
+      };
+    });
+
+    const result = await runCronIsolatedAgentTurn(
+      makeIsolatedAgentParamsFixture({
+        agentId: "main",
+        sessionKey: "cron:test-job",
+        job: makeIsolatedAgentJobFixture({
+          sessionTarget: "isolated",
+          deleteAfterRun: true,
+          delivery: { mode: "none" },
+        }),
+      }),
+    );
+
+    expect(result.status).toBe("ok");
+    expect(callGatewayMock).toHaveBeenCalledTimes(1);
+    const runRowWrites = sessionWrites.filter((write) => write.sessionKey === runSessionKey);
+    expect(runRowWrites.length).toBeGreaterThan(0);
+    expect(runRowWrites.filter((write) => !write.admitted)).toEqual([]);
   });
 
   it("keeps a non-deleting isolated run admitted through delivery", async () => {

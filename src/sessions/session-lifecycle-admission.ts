@@ -326,23 +326,39 @@ export function isSessionWorkAdmissionActive(
   );
 }
 
-/** Active session identities for one store/lifecycle scope. */
-export function collectActiveSessionWorkAdmissionIdentities(scope: string): Set<string> {
-  const normalizedScope = scope.trim();
-  if (!normalizedScope) {
-    throw new Error("session lifecycle scope is required");
-  }
+/**
+ * Active session identities for every lifecycle scope the matcher accepts.
+ *
+ * One physical store can be admitted under more than one scope string - one per
+ * agent sharing the file, plus explicit store paths a caller passed instead of
+ * the configured one - so consumers that own a file rather than a scope string
+ * match scopes themselves.
+ */
+export function collectActiveSessionWorkAdmissionIdentitiesForScopes(
+  matchesScope: (scope: string) => boolean,
+): Set<string> {
   const identities = new Set<string>();
   for (const [normalizedIdentity, admissions] of ACTIVE_SESSION_WORK_ADMISSIONS) {
     if (admissions.size === 0) {
       continue;
     }
     const decoded = decodeSessionIdentity(normalizedIdentity);
-    if (decoded?.scope === normalizedScope) {
+    if (decoded && matchesScope(decoded.scope)) {
       identities.add(decoded.identity);
     }
   }
   return identities;
+}
+
+/** Active session identities for one store/lifecycle scope. */
+export function collectActiveSessionWorkAdmissionIdentities(scope: string): Set<string> {
+  const normalizedScope = scope.trim();
+  if (!normalizedScope) {
+    throw new Error("session lifecycle scope is required");
+  }
+  return collectActiveSessionWorkAdmissionIdentitiesForScopes(
+    (candidate) => candidate === normalizedScope,
+  );
 }
 
 /** Unique admitted turns; one lease can be indexed under several identities. */

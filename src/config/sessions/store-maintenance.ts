@@ -483,39 +483,30 @@ function wouldCapActiveSession(params: {
   activeSessionKey: string;
   maxEntries: number;
 }): boolean {
-  if (params.keys.length <= params.maxEntries) {
+  // Mirrors capEntryCount: protected rows are exempt from the cap, so only the
+  // removable population competes for the `maxEntries` surviving slots.
+  const removableKeys = params.keys.filter(
+    (key) => !shouldPreserveMaintenanceEntry({ key, entry: params.store[key] }),
+  );
+  if (removableKeys.length <= params.maxEntries) {
     return false;
   }
   if (params.maxEntries <= 0) {
     return true;
   }
 
-  const protectedCount = params.keys.filter(
-    (key) =>
-      key !== params.activeSessionKey &&
-      shouldPreserveMaintenanceEntry({ key, entry: params.store[key] }),
-  ).length;
-  const maxRemovableEntries = Math.max(0, params.maxEntries - protectedCount);
-  // If protected entries fill the cap, the active unprotected session would be the one removed.
-  if (maxRemovableEntries <= 0) {
-    return true;
-  }
-
   const activeUpdatedAt = getEntryUpdatedAt(params.activeEntry);
   let newerOrTieBeforeActive = 0;
   let seenActive = false;
-  for (const key of params.keys) {
+  for (const key of removableKeys) {
     if (key === params.activeSessionKey) {
       seenActive = true;
-      continue;
-    }
-    if (shouldPreserveMaintenanceEntry({ key, entry: params.store[key] })) {
       continue;
     }
     const entryUpdatedAt = getEntryUpdatedAt(params.store[key]);
     if (entryUpdatedAt > activeUpdatedAt || (!seenActive && entryUpdatedAt === activeUpdatedAt)) {
       newerOrTieBeforeActive++;
-      if (newerOrTieBeforeActive >= maxRemovableEntries) {
+      if (newerOrTieBeforeActive >= params.maxEntries) {
         return true;
       }
     }
@@ -525,7 +516,19 @@ function wouldCapActiveSession(params: {
 }
 
 /**
- * Cap the store to the N most recently updated entries.
+ * Cap the removable store population to the N most recently updated entries.
+ *
+ * Cap policy: protected rows are exempt from the cap, not counted against it.
+ * Protection covers durable conversation surfaces, model-locked harness rows and
+ * anything an in-flight turn owns, none of which maintenance may delete, so a
+ * store holding P protected rows settles at up to P + `maxEntries` rows.
+ *
+ * Charging protected rows to the budget instead created a zero-budget cliff:
+ * once P >= `maxEntries` the removable budget was 0, so every unprotected row -
+ * including the row the current write had just created - was deleted on every
+ * write, which is what destroyed cron run rows before their seal. Bounding only
+ * the evictable population keeps the cap meaningful without that cliff.
+ *
  * Entries without `updatedAt` are sorted last (removed first when over limit).
  * Mutates `store` in-place.
  */
@@ -539,11 +542,7 @@ export function capEntryCount(
   } = {},
 ): number {
   const maxEntries = overrideMax ?? resolveMaintenanceConfigFromInput().maxEntries;
-  const preservedCount = Object.entries(store).filter(([key, entry]) =>
-    shouldPreserveMaintenanceEntry({ key, entry, preserveKeys: opts.preserveKeys }),
-  ).length;
-  const maxRemovableEntries = Math.max(0, maxEntries - preservedCount);
-  // Protected entries reduce the removable budget instead of being counted as deletion targets.
+  const maxRemovableEntries = Math.max(0, maxEntries);
   const keys = Object.keys(store).filter(
     (key) =>
       !shouldPreserveMaintenanceEntry({
@@ -563,6 +562,7 @@ export function capEntryCount(
     return bTime - aTime;
   });
 
+  // `sorted` is newest-first, so this drops everything past the newest budget.
   const toRemove = sorted.slice(maxRemovableEntries);
   for (const key of toRemove) {
     const entry = store[key];

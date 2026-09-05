@@ -1419,10 +1419,14 @@ describe("Integration: saveSessionStore with pruning", () => {
       },
     });
 
-    expect(Object.keys(loaded)).toHaveLength(50);
+    // Durable pointers are exempt from the cap, which bounds the removable rows:
+    // the newest 50 sessions survive alongside the three protected pointers.
+    expect(Object.keys(loaded)).toHaveLength(53);
     expect(loaded).toHaveProperty(channelKey);
     expect(loaded).toHaveProperty(threadKey);
     expect(loaded).toHaveProperty(topicKey);
+    expect(loaded["session-49"]).toBeDefined();
+    expect(loaded["session-50"]).toBeUndefined();
     expect(loaded["session-74"]).toBeUndefined();
   });
 
@@ -1450,8 +1454,10 @@ describe("Integration: saveSessionStore with pruning", () => {
         },
       });
 
-      expect(Object.keys(loaded)).toHaveLength(50);
+      expect(Object.keys(loaded)).toHaveLength(51);
       expect(loaded).toHaveProperty(childKey);
+      expect(loaded["session-49"]).toBeDefined();
+      expect(loaded["session-50"]).toBeUndefined();
       expect(loaded["session-74"]).toBeUndefined();
     } finally {
       unregister();

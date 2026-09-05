@@ -1709,6 +1709,15 @@ export async function runCronIsolatedAgentTurn(params: {
   let outcome: "completed" | "error" = "completed";
   let outcomeError: string | undefined;
   let cronRunSessionCleanupAttempted = false;
+  // A self-deleting run releases its admission before deleting its own session,
+  // so the release can land before the cleanup seal below. Track it: once the
+  // admission is gone the run no longer owns the run row, and no longer keeps it
+  // out of maintenance eviction, so a seal from here would race a row it lost.
+  let sessionWorkAdmissionReleased = false;
+  const releaseSessionWorkAdmission = () => {
+    sessionWorkAdmissionReleased = true;
+    prepared.context.sessionWorkAdmission.release();
+  };
   try {
     assertAgentRunLifecycleGenerationCurrent(runLifecycleGeneration);
     const existingRunContext = getAgentRunContext(initialSessionId);
@@ -1790,7 +1799,7 @@ export async function runCronIsolatedAgentTurn(params: {
       },
       // Self-deleting sessions must release before their own lifecycle mutation.
       // Other runs retain admission through delivery and release in finally.
-      beforeSessionDelete: prepared.context.sessionWorkAdmission.release,
+      beforeSessionDelete: releaseSessionWorkAdmission,
     });
     if (finalized.status === "error") {
       outcome = "error";
@@ -1822,7 +1831,11 @@ export async function runCronIsolatedAgentTurn(params: {
     });
   } finally {
     try {
-      await prepared.context.runContinuationSession?.seal();
+      // finalizeCronRun already sealed the run row before any path that can
+      // release early, so skipping here loses no state.
+      if (!sessionWorkAdmissionReleased) {
+        await prepared.context.runContinuationSession?.seal();
+      }
     } catch (sealError) {
       logWarn(
         `[cron:${params.job.id}] Failed to seal run continuation during cleanup: ${String(sealError)}`,
@@ -1846,7 +1859,7 @@ export async function runCronIsolatedAgentTurn(params: {
           sessionId: prepared.context.currentRunSessionId(),
           lifecycleRevision: prepared.context.cronSession.lifecycleRevision,
           sessionUpdatedAt: prepared.context.cronSession.sessionEntry.updatedAt,
-          beforeDelete: prepared.context.sessionWorkAdmission.release,
+          beforeDelete: releaseSessionWorkAdmission,
           reason: "cron-delete-after-run-finally",
         });
         cronRunSessionCleanupAttempted = cleanupOutcome !== "not-requested";
@@ -1872,7 +1885,7 @@ export async function runCronIsolatedAgentTurn(params: {
           runContextOwnerToken,
         });
       } finally {
-        prepared.context.sessionWorkAdmission.release();
+        releaseSessionWorkAdmission();
       }
     }
   }
