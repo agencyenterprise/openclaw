@@ -221,6 +221,17 @@ export type CliBackendConfig = {
   };
 };
 
+export type HeartbeatGateConfig = {
+  /** Executable run before a scheduled heartbeat turn. Spawned directly, never through a shell. */
+  command: string;
+  /** Arguments passed to the executable. */
+  args?: string[];
+  /** Working directory for the gate command. Default: the agent workspace dir. */
+  cwd?: string;
+  /** Gate command timeout in milliseconds. Default: 60000. */
+  timeoutMs?: number;
+};
+
 export type AgentDefaultsConfig = {
   /** Global default provider params applied to all models before per-model and per-agent overrides. */
   params?: Record<string, unknown>;
@@ -461,6 +472,13 @@ export type AgentDefaultsConfig = {
      * Cron lanes are always treated as busy for heartbeat deferral.
      */
     skipWhenBusy?: boolean;
+    /**
+     * Optional cheap pre-turn gate for scheduled heartbeats. Exit code 3 skips the
+     * turn ("no work"), exit code 0 runs it. Any other exit code, a timeout, or a
+     * spawn failure logs an error and runs the turn anyway, so a broken gate can
+     * never silence the agent. Wake-, cron- and commitment-triggered runs bypass it.
+     */
+    gate?: HeartbeatGateConfig;
     /**
      * When enabled, deliver the model's reasoning payload for heartbeat runs (when available)
      * as a separate message prefixed with `Thinking.` (same as `/reasoning on`).

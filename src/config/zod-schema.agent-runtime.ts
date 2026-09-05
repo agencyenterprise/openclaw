@@ -106,6 +106,15 @@ export const HeartbeatSchema = z
     lightContext: z.boolean().optional(),
     isolatedSession: z.boolean().optional(),
     skipWhenBusy: z.boolean().optional(),
+    gate: z
+      .object({
+        command: z.string().min(1),
+        args: z.array(z.string()).optional(),
+        cwd: z.string().min(1).optional(),
+        timeoutMs: z.number().int().positive().optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((val, ctx) => {

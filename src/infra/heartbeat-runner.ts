@@ -130,6 +130,7 @@ import {
   isRelayableExecCompletionEvent,
 } from "./heartbeat-events-filter.js";
 import { emitHeartbeatEvent, resolveIndicatorType } from "./heartbeat-events.js";
+import { evaluateHeartbeatGate, HEARTBEAT_SKIP_GATE_NO_WORK } from "./heartbeat-gate.js";
 import { HEARTBEAT_RUN_SCOPE, type HeartbeatRunScope } from "./heartbeat-run-scope.js";
 import {
   computeNextHeartbeatPhaseDueMs,
@@ -833,7 +834,7 @@ function truncateHeartbeatPreview(value: string | undefined): string | undefined
   return value ? truncateUtf16Safe(value, 200) : undefined;
 }
 
-type HeartbeatSkipReason = "empty-heartbeat-file";
+type HeartbeatSkipReason = "empty-heartbeat-file" | typeof HEARTBEAT_SKIP_GATE_NO_WORK;
 
 function buildCommitmentDeliveryKey(commitment: CommitmentRecord): string {
   return [
@@ -904,6 +905,44 @@ type HeartbeatPreflight = HeartbeatWakePayloadFlags & {
   tasks?: HeartbeatTask[];
   heartbeatFileContent?: string;
 };
+
+type HeartbeatFileGateResult = Pick<
+  HeartbeatPreflight,
+  "skipReason" | "tasks" | "heartbeatFileContent"
+>;
+
+/** Reads HEARTBEAT.md and reports whether an empty file alone should skip the run. */
+async function resolveHeartbeatFileGate(params: {
+  workspaceDir: string;
+  hasDueCommitments: boolean;
+}): Promise<HeartbeatFileGateResult> {
+  const heartbeatFilePath = path.join(params.workspaceDir, DEFAULT_HEARTBEAT_FILENAME);
+  let heartbeatFileContent: string;
+  try {
+    heartbeatFileContent = await fs.readFile(heartbeatFilePath, "utf-8");
+  } catch (err: unknown) {
+    // Missing HEARTBEAT.md is intentional in some setups (for example, when
+    // heartbeat instructions live outside the file), so keep the run active.
+    // The heartbeat prompt already says "if it exists".
+    if (!hasErrnoCode(err, "ENOENT")) {
+      log.warn(`heartbeat: could not read HEARTBEAT.md: ${formatErrorMessage(err)}`, {
+        path: heartbeatFilePath,
+      });
+    }
+    return {};
+  }
+
+  const tasks = parseHeartbeatTasks(heartbeatFileContent);
+  if (
+    isHeartbeatContentEffectivelyEmpty(heartbeatFileContent) &&
+    tasks.length === 0 &&
+    !params.hasDueCommitments
+  ) {
+    return { skipReason: "empty-heartbeat-file", tasks: [], heartbeatFileContent };
+  }
+  // Return tasks even if file has other content - backward compatible
+  return { tasks, heartbeatFileContent };
+}
 
 async function resolveHeartbeatPreflight(params: {
   cfg: OpenClawConfig;
@@ -984,40 +1023,25 @@ async function resolveHeartbeatPreflight(params: {
   }
 
   const workspaceDir = resolveAgentWorkspaceDir(params.cfg, params.agentId);
-  const heartbeatFilePath = path.join(workspaceDir, DEFAULT_HEARTBEAT_FILENAME);
-  let heartbeatFileContent: string | undefined;
-  try {
-    heartbeatFileContent = await fs.readFile(heartbeatFilePath, "utf-8");
-    const tasks = parseHeartbeatTasks(heartbeatFileContent);
-    if (
-      isHeartbeatContentEffectivelyEmpty(heartbeatFileContent) &&
-      tasks.length === 0 &&
-      dueCommitments.length === 0
-    ) {
-      return {
-        ...basePreflight,
-        skipReason: "empty-heartbeat-file",
-        tasks: [],
-        heartbeatFileContent,
-      };
-    }
-    // Return tasks even if file has other content - backward compatible
-    return {
-      ...basePreflight,
-      tasks,
-      heartbeatFileContent,
-    };
-  } catch (err: unknown) {
-    if (hasErrnoCode(err, "ENOENT")) {
-      // Missing HEARTBEAT.md is intentional in some setups (for example, when
-      // heartbeat instructions live outside the file), so keep the run active.
-      // The heartbeat prompt already says "if it exists".
-      return basePreflight;
-    }
-    // For other read errors, proceed with heartbeat as before.
+  const fileGate = await resolveHeartbeatFileGate({
+    workspaceDir,
+    hasDueCommitments: dueCommitments.length > 0,
+  });
+  if (fileGate.skipReason) {
+    return { ...basePreflight, ...fileGate };
   }
 
-  return basePreflight;
+  // The gate command is the cheap deterministic half of the heartbeat: it decides
+  // whether this scheduled tick has enough work to be worth a model turn.
+  const gateDecision = await evaluateHeartbeatGate({
+    gate: params.heartbeat?.gate,
+    cwd: workspaceDir,
+  });
+  if (gateDecision.action === "skip") {
+    return { ...basePreflight, ...fileGate, skipReason: HEARTBEAT_SKIP_GATE_NO_WORK };
+  }
+
+  return { ...basePreflight, ...fileGate };
 }
 
 type HeartbeatPromptResolution = {

@@ -67,6 +67,7 @@ Example config:
 - The heartbeat prompt is sent **verbatim** as the user message. The system prompt includes a "Heartbeats" section only when heartbeats are enabled for the default agent (and `includeSystemPromptSection` is not `false`), and the run is flagged internally.
 - When heartbeats are disabled with `0m`, normal runs also omit `HEARTBEAT.md` from bootstrap context so the model does not see heartbeat-only instructions.
 - Active hours (`heartbeat.activeHours`) are checked in the configured timezone. Outside the window, heartbeats are skipped until the next tick inside the window.
+- `heartbeat.gate` runs a cheap command before each scheduled turn so an expensive model turn only happens when that command reports work (exit `0`); exit `3` skips the tick. A gate that fails, times out, or returns any other exit code is logged as an error and the turn runs anyway.
 - Heartbeats automatically defer while cron work is active or queued. Set `heartbeat.skipWhenBusy: true` to also defer an agent on its own session-keyed subagent or nested command lanes; sibling agents no longer pause just because another agent has subagent work in flight.
 
 ## What the heartbeat prompt is for
@@ -239,6 +240,15 @@ Use `accountId` to target a specific account on multi-account channels like Tele
 <ParamField path="skipWhenBusy" type="boolean" default="false">
   When true, heartbeat runs defer on that agent's extra busy lanes: its own session-keyed subagent or nested command work. Cron lanes always defer heartbeats, even without this flag, so local-model hosts do not run cron and heartbeat prompts at the same time.
 </ParamField>
+<ParamField path="gate" type="object">
+  Optional cheap pre-turn gate. `command` (plus optional `args`, `cwd`, `timeoutMs`) is spawned
+  directly (never through a shell) before a scheduled heartbeat turn is built. Exit code `3` skips
+  the turn as `reason=gate-no-work`, exit code `0` runs it. Any other exit code, a timeout, or a
+  spawn failure logs an error and runs the turn anyway, so a broken gate can never silence the
+  agent. The gate's first stdout line is logged with the skip. `cwd` defaults to the agent
+  workspace dir and `timeoutMs` defaults to `60000`. Wake-, cron- and commitment-triggered runs
+  bypass the gate.
+</ParamField>
 <ParamField path="session" type="string">
   Optional session key for heartbeat runs.
 
@@ -310,6 +320,7 @@ Use `accountId` to target a specific account on multi-account channels like Tele
 
   </Accordion>
   <Accordion title="Visibility and skip behavior">
+    - If `gate` is configured and the gate command exits `3`, the run is skipped as `reason=gate-no-work` before any model turn is built.
     - If `showOk`, `showAlerts`, and `useIndicator` are all disabled, the run is skipped up front as `reason=alerts-disabled`.
     - If only alert delivery is disabled, OpenClaw can still run the heartbeat, update due-task timestamps, restore the session idle timestamp, and suppress the outward alert payload.
     - If the resolved heartbeat target supports typing, OpenClaw shows typing while the heartbeat run is active. This uses the same target the heartbeat would send chat output to, and it is disabled by `typingMode: "never"`.
