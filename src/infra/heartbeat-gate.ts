@@ -12,9 +12,21 @@ export const HEARTBEAT_SKIP_GATE_NO_WORK = "gate-no-work";
 /** Exit code the gate command uses to say "no work, skip this heartbeat". */
 export const HEARTBEAT_GATE_SKIP_EXIT_CODE = 3;
 
-const DEFAULT_HEARTBEAT_GATE_TIMEOUT_MS = 60_000;
+/**
+ * Outer timeout for the whole gate command.
+ *
+ * Must stay above the gate script's own inner timeout (`DEFAULT_TIMEOUT_S = 90` in
+ * scripts/heartbeat_gate.py) plus shutdown grace, so the script gets to report
+ * "undecided" instead of being killed by this timer before it can decide.
+ */
+export const DEFAULT_HEARTBEAT_GATE_TIMEOUT_MS = 120_000;
+
 const HEARTBEAT_GATE_SUMMARY_MAX_CHARS = 200;
 const HEARTBEAT_GATE_MAX_OUTPUT_BYTES = 64 * 1024;
+
+/** Contract with the gate command: its last stdout line is this verdict object. */
+const HEARTBEAT_GATE_VERDICT_NAME = "heartbeat";
+const HEARTBEAT_GATE_VERDICT_VERSION = 1;
 
 /** Normalized outcome of one gate command run. */
 export type HeartbeatGateCommandResult = {
@@ -53,6 +65,42 @@ function resolveGateSummary(stdout: string): string {
   return truncateUtf16Safe(firstLine, HEARTBEAT_GATE_SUMMARY_MAX_CHARS);
 }
 
+/**
+ * The gate's own verdict, or undefined when it did not state one this run.
+ *
+ * The exit code alone is not evidence: any wrong, obsolete or half-installed
+ * executable can exit 3. A skip is only honored when the gate also names itself
+ * and its contract version on its last stdout line.
+ */
+function resolveGateVerdict(stdout: string): "skip" | "run" | undefined {
+  const lastLine = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .findLast((line) => line.length > 0);
+  if (!lastLine) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(lastLine);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const verdictLine = parsed as Record<string, unknown>;
+  if (
+    verdictLine.gate !== HEARTBEAT_GATE_VERDICT_NAME ||
+    verdictLine.version !== HEARTBEAT_GATE_VERDICT_VERSION
+  ) {
+    return undefined;
+  }
+  return verdictLine.verdict === "skip" || verdictLine.verdict === "run"
+    ? verdictLine.verdict
+    : undefined;
+}
+
 function withSummary(message: string, summary: string): string {
   return summary ? `${message}: ${summary}` : message;
 }
@@ -60,10 +108,10 @@ function withSummary(message: string, summary: string): string {
 /**
  * Decide whether a scheduled heartbeat turn is worth running.
  *
- * The gate command is the cheap deterministic half of the heartbeat: exit 3 means
- * "no work, skip the model turn", exit 0 means "run it". Anything else (unexpected
- * exit code, timeout, spawn failure) fails loud and still runs the turn, so a broken
- * gate can never silence the agent.
+ * The gate command is the cheap deterministic half of the heartbeat: exit 3 plus a
+ * `"verdict": "skip"` line means "no work, skip the model turn", exit 0 means "run it".
+ * Anything else (unexpected exit code, exit 3 without the verdict line, timeout, spawn
+ * failure) fails loud and still runs the turn, so a broken gate can never silence the agent.
  */
 export async function evaluateHeartbeatGate(params: {
   gate?: HeartbeatGateConfig;
@@ -106,6 +154,17 @@ export async function evaluateHeartbeatGate(params: {
     return { action: "run" };
   }
   if (result.code === HEARTBEAT_GATE_SKIP_EXIT_CODE) {
+    const verdict = resolveGateVerdict(result.stdout);
+    if (verdict !== "skip") {
+      log.error(
+        withSummary(
+          `heartbeat gate exited ${HEARTBEAT_GATE_SKIP_EXIT_CODE} without a skip verdict line, running the turn anyway`,
+          summary,
+        ),
+        { command, verdict },
+      );
+      return { action: "run" };
+    }
     log.info(withSummary("heartbeat skipped: gate found no work", summary), { command, summary });
     return { action: "skip" };
   }

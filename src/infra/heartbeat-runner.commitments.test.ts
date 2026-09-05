@@ -1,6 +1,8 @@
+import { existsSync } from "node:fs";
 // Covers heartbeat commitment checks and runner scheduling behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
+import process from "node:process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HEARTBEAT_TOKEN } from "../auto-reply/tokens.js";
 import { listDueCommitmentSessionKeys } from "../commitments/store.js";
@@ -109,10 +111,26 @@ describe("runHeartbeatOnce commitments", () => {
     visibleReplies?: "automatic" | "message_tool";
     isolatedSession?: boolean;
     runScope?: "commitment-only";
+    withSkippingGate?: boolean;
   }) {
     return await withTempHeartbeatSandbox(async ({ tmpDir, storePath, replySpy }) => {
       setTestEnvValue("OPENCLAW_STATE_DIR", tmpDir);
       const sessionKey = "agent:main:telegram:user-155462274";
+      // A gate that would skip the tick if the runner ever consulted it. The
+      // marker file proves the executable was not spawned at all.
+      const gateMarkerPath = path.join(tmpDir, "gate-ran");
+      const skippingGate = {
+        command: process.execPath,
+        args: [
+          "-e",
+          `require("node:fs").writeFileSync(${JSON.stringify(gateMarkerPath)}, "ran");` +
+            `process.stdout.write(${JSON.stringify(
+              `heartbeat gate: no work (actionable=0 money=0 jobs=0)\n` +
+                `${JSON.stringify({ gate: "heartbeat", version: 1, verdict: "skip" })}\n`,
+            )});process.exit(3);`,
+        ],
+        timeoutMs: 30_000,
+      };
       const cfg: OpenClawConfig = {
         agents: {
           defaults: {
@@ -121,6 +139,7 @@ describe("runHeartbeatOnce commitments", () => {
               every: "5m",
               target: params?.target ?? "last",
               ...(params?.isolatedSession ? { isolatedSession: true } : {}),
+              ...(params?.withSkippingGate ? { gate: skippingGate } : {}),
             },
           },
         },
@@ -192,6 +211,7 @@ describe("runHeartbeatOnce commitments", () => {
       return {
         result,
         sendTelegram,
+        gateRan: existsSync(gateMarkerPath),
         store: await loadCommitmentStore(),
       };
     });
@@ -851,5 +871,23 @@ tasks:
       attempts: 1,
       sentAtMs: nowMs,
     });
+  });
+
+  it("delivers a due commitment without asking the pre-turn gate", async () => {
+    // The gate only reads Slack threads and the job registry, so it cannot see
+    // the commitment ledger. Letting it answer here would drop a due follow-up
+    // on any quiet tick.
+    const { result, sendTelegram, gateRan, store } = await setupCommitmentCase({
+      withSkippingGate: true,
+    });
+
+    expect(gateRan).toBe(false);
+    expect(result.status).toBe("ran");
+    expect(sendTelegram).toHaveBeenCalledWith(
+      "155462274",
+      "How did the interview go?",
+      expect.any(Object),
+    );
+    expect(store.commitments[0]).toMatchObject({ id: "cm_interview", status: "sent" });
   });
 });

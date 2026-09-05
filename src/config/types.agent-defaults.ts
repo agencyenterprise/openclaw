@@ -228,7 +228,7 @@ export type HeartbeatGateConfig = {
   args?: string[];
   /** Working directory for the gate command. Default: the agent workspace dir. */
   cwd?: string;
-  /** Gate command timeout in milliseconds. Default: 60000. */
+  /** Gate command timeout in milliseconds. Default: 120000. */
   timeoutMs?: number;
 };
 

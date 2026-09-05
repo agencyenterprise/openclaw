@@ -1002,7 +1002,10 @@ async function resolveHeartbeatPreflight(params: {
     wakeFlags.isCronWake ||
     shouldInspectWakePendingEvents ||
     hasTaggedCronEvents;
-  const shouldBypassFileGates =
+  // Triggers that are their own evidence of work never reach either gate: they were
+  // asked for explicitly, so neither an empty HEARTBEAT.md nor the gate command may
+  // veto them. Due commitments bypass the gate command too, further down.
+  const shouldBypassHeartbeatGates =
     params.runScope === "commitment-only" ||
     wakeFlags.isExecEventWake ||
     wakeFlags.isCronWake ||
@@ -1018,7 +1021,7 @@ async function resolveHeartbeatPreflight(params: {
     shouldInspectPendingEvents,
   } satisfies Omit<HeartbeatPreflight, "skipReason">;
 
-  if (shouldBypassFileGates) {
+  if (shouldBypassHeartbeatGates) {
     return basePreflight;
   }
 
@@ -1028,6 +1031,14 @@ async function resolveHeartbeatPreflight(params: {
     hasDueCommitments: dueCommitments.length > 0,
   });
   if (fileGate.skipReason) {
+    return { ...basePreflight, ...fileGate };
+  }
+
+  // A due commitment is the work this turn exists for, so it bypasses the gate
+  // command exactly the way it bypasses the empty-file gate above. The gate only
+  // inspects Slack threads and the job registry; it cannot see the commitment
+  // ledger, so letting it answer here would drop a due follow-up.
+  if (dueCommitments.length > 0) {
     return { ...basePreflight, ...fileGate };
   }
 
