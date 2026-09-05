@@ -5,6 +5,7 @@ import {
   executeSqliteQueryTakeFirstSync,
 } from "../../infra/kysely-sync.js";
 import { getChildLogger } from "../../logging/logger.js";
+import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 import {
   openOpenClawAgentDatabase,
   runOpenClawAgentWriteTransaction,
@@ -40,8 +41,14 @@ import {
 } from "./session-accessor.sqlite-scope.js";
 import { parseSqliteSessionEntryJson as parseSessionEntryRow } from "./session-accessor.sqlite-status.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
-import { collectSessionMaintenancePreserveKeys } from "./store-maintenance-preserve.js";
-import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
+import {
+  collectSessionMaintenancePreserveKeys,
+  collectSessionMaintenancePreserveKeysForStore,
+} from "./store-maintenance-preserve.js";
+import {
+  resolveMaintenanceConfig,
+  resolveSessionStorePathForAgent,
+} from "./store-maintenance-runtime.js";
 import {
   capEntryCount,
   pruneStaleModelRunEntries,
@@ -340,10 +347,19 @@ export function applySqliteSessionEntryMaintenance(
       removedSessionIds.add(sessionId);
     }
   };
+  // Rows owned by an in-flight turn are never eviction candidates, however far
+  // over retention the store is: dropping one destroys live runtime state, and
+  // a cron run continuation row that disappears mid-run can no longer be sealed.
+  // Admissions are registered under the agent's session store path, so resolve
+  // the same path the runtime opened them under.
   const preserveKeys =
-    collectSessionMaintenancePreserveKeys(
-      collectSqliteSessionMaintenanceBaseKeys(store, params.activeSessionKey),
-    ) ?? new Set<string>();
+    collectSessionMaintenancePreserveKeysForStore({
+      baseKeys: collectSqliteSessionMaintenanceBaseKeys(store, params.activeSessionKey),
+      store,
+      storePath: resolveSessionStorePathForAgent(
+        resolveAgentIdFromSessionKey(params.activeSessionKey),
+      ),
+    }) ?? new Set<string>();
   if (
     shouldRunModelRunPrune({
       maintenance,
