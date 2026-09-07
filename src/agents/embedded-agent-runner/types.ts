@@ -170,6 +170,8 @@ export type EmbeddedAgentRunMeta = {
   providerStarted?: boolean;
   agentHarnessResultClassification?: "empty" | "reasoning-only" | "planning-only";
   terminalReplyKind?: "silent-empty";
+  /** Set when Anthropic's server-side safety fallback re-served the turn on another model. */
+  providerFallback?: { fromModel: string | null; toModel: string | null };
   yielded?: boolean;
   error?: {
     kind:

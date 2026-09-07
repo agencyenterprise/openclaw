@@ -120,6 +120,47 @@ export function buildFallbackClearedNotice(params: {
   return `↪️ Model Fallback cleared: ${selected}`;
 }
 
+/**
+ * Converts a provider model id (e.g. `anthropic/claude-opus-5`, `claude-fable-5-1`) into a
+ * plain-English label (`Claude Opus 5`, `Claude Fable 5.1`) so user-facing notices never leak
+ * internal identifiers.
+ */
+function formatPlainModelLabel(modelId: string): string {
+  const bare = (modelId.split("/").pop() ?? modelId).trim().replace(/-\d{8}$/, "");
+  const tokens = bare.split("-").filter(Boolean);
+  if (tokens.length === 0) {
+    return modelId;
+  }
+  return tokens
+    .map((token, index) => {
+      const isNumeric = /^\d+$/.test(token);
+      const previous = index > 0 ? tokens[index - 1] : undefined;
+      const prevNumeric = previous !== undefined && /^\d+$/.test(previous);
+      const word = isNumeric ? token : token.charAt(0).toUpperCase() + token.slice(1);
+      if (index === 0) {
+        return word;
+      }
+      return isNumeric && prevNumeric ? `.${word}` : ` ${word}`;
+    })
+    .join("");
+}
+
+/**
+ * Builds the warning shown when Anthropic's server-side safety fallback re-served the turn on a
+ * different model. Names the served model in plain words; returns null when no model is served.
+ */
+export function buildServerSideFallbackNotice(params: {
+  fromModel: string | null;
+  toModel: string | null;
+}): string | null {
+  const served = params.toModel ? formatPlainModelLabel(params.toModel) : null;
+  if (!served) {
+    return null;
+  }
+  const declined = params.fromModel ? formatPlainModelLabel(params.fromModel) : "the primary model";
+  return `⚠️ ${declined} hit a safety guardrail on this request; answered with ${served} instead.`;
+}
+
 type ResolvedFallbackTransition = {
   selectedModelRef: string;
   activeModelRef: string;

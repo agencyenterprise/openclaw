@@ -3584,6 +3584,49 @@ describe("runEmbeddedAgent incomplete-turn safety", () => {
   });
 
   it.each([
+    [
+      "provider_refusal diagnostic",
+      {
+        diagnostics: [
+          {
+            type: "provider_refusal",
+            timestamp: 0,
+            details: { provider: "anthropic", category: "bio", explanation: null },
+          },
+        ],
+      },
+    ],
+    [
+      "Anthropic refusal error message",
+      {
+        errorMessage:
+          "Anthropic refusal (category: bio). The safety classifier declined this request and the fallback model declined it too. You can rephrase and send again, run /compact in this thread to shrink its context and retry, or /new to start a fresh session.",
+      },
+    ],
+  ])(
+    "does not silently retry classifier refusals so they surface immediately (%s)",
+    (_label, refusalFields) => {
+      // Same empty/zero-output shape that would otherwise retry (see the test above), but a
+      // classifier refusal is a terminal decline and must post on the first turn.
+      const assistant = {
+        role: "assistant",
+        stopReason: "error",
+        provider: "anthropic",
+        model: "claude-fable-5-1",
+        content: [],
+        usage: { input: 3, output: 0, totalTokens: 3 },
+        ...refusalFields,
+      } as unknown as EmbeddedRunAttemptResult["lastAssistant"];
+      expect(
+        shouldRetrySilentErrorAssistantTurn({
+          attempt: makeAttemptResult({ assistantTexts: [], lastAssistant: assistant }),
+          assistant,
+        }),
+      ).toBe(false);
+    },
+  );
+
+  it.each([
     {
       name: "visible text",
       content: [

@@ -514,6 +514,19 @@ function isUnsignedThinkingOnlyAssistantTurn(message: unknown): boolean {
   return assessLastAssistantMessage(message as AgentMessage) === "incomplete-thinking";
 }
 
+/**
+ * True when a terminal assistant error is an Anthropic safety-classifier refusal. Prefers the
+ * structured `provider_refusal` diagnostic and falls back to the refusal error-message prefix.
+ */
+function isAnthropicClassifierRefusal(
+  assistant: NonNullable<EmbeddedRunAttemptResult["lastAssistant"]>,
+): boolean {
+  if (assistant.diagnostics?.some((entry) => entry.type === "provider_refusal")) {
+    return true;
+  }
+  return assistant.errorMessage?.startsWith("Anthropic refusal") === true;
+}
+
 export function shouldRetrySilentErrorAssistantTurn(params: {
   attempt: Pick<
     EmbeddedRunAttemptResult,
@@ -550,6 +563,12 @@ export function shouldRetrySilentErrorAssistantTurn(params: {
 
   const assistant = params.assistant;
   if (!assistant || assistant.stopReason !== "error") {
+    return false;
+  }
+  // A classifier refusal is a terminal decline, not a transient empty turn — surface it
+  // immediately instead of burning silent retries. Prefer the structured diagnostic; the
+  // errorMessage prefix is the fallback signal when diagnostics are unavailable.
+  if (isAnthropicClassifierRefusal(assistant)) {
     return false;
   }
 

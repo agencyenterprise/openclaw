@@ -5,7 +5,11 @@ import {
   resolveActiveFallbackState,
   type FallbackNoticeState,
 } from "../status/fallback-notice-state.js";
-import { buildFallbackNotice, resolveFallbackTransition } from "./fallback-state.js";
+import {
+  buildFallbackNotice,
+  buildServerSideFallbackNotice,
+  resolveFallbackTransition,
+} from "./fallback-state.js";
 
 const baseAttempt = {
   provider: "demo-primary",
@@ -254,5 +258,29 @@ describe("fallback-state", () => {
         attempts: [],
       }),
     ).toContain("selected openai/gpt-5.5");
+  });
+});
+
+describe("buildServerSideFallbackNotice", () => {
+  it("names the served model in plain words when a fallback boundary is recorded", () => {
+    expect(
+      buildServerSideFallbackNotice({ fromModel: "claude-fable-5-1", toModel: "claude-opus-5" }),
+    ).toBe(
+      "⚠️ Claude Fable 5.1 hit a safety guardrail on this request; answered with Claude Opus 5 instead.",
+    );
+  });
+
+  it("strips provider prefixes and dots version segments", () => {
+    expect(
+      buildServerSideFallbackNotice({ fromModel: null, toModel: "anthropic/claude-opus-4-8" }),
+    ).toBe(
+      "⚠️ the primary model hit a safety guardrail on this request; answered with Claude Opus 4.8 instead.",
+    );
+  });
+
+  it("returns null when no served model is known", () => {
+    expect(
+      buildServerSideFallbackNotice({ fromModel: "claude-fable-5-1", toModel: null }),
+    ).toBeNull();
   });
 });

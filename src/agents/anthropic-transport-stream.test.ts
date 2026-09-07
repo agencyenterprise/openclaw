@@ -686,7 +686,7 @@ describe("anthropic transport stream", () => {
       } as AnthropicStreamOptions,
     );
 
-    expect(latestAnthropicRequest().payload.fallbacks).toEqual([{ model: "claude-opus-4-8" }]);
+    expect(latestAnthropicRequest().payload.fallbacks).toEqual([{ model: "claude-opus-5" }]);
     expect(latestAnthropicRequestHeaders().get("anthropic-beta")).toBe(
       "fine-grained-tool-streaming-2025-05-14,server-side-fallback-2026-06-01",
     );
@@ -1382,7 +1382,7 @@ describe("anthropic transport stream", () => {
     expect(result.stopReason).toBe("error");
     expect(result.content).toEqual([]);
     expect(result.errorMessage).toBe(
-      "Anthropic refusal (category: bio): This request is not allowed.",
+      "Anthropic refusal (category: bio). The safety classifier declined this request and the fallback model declined it too. You can rephrase and send again, run /compact in this thread to shrink its context and retry, or /new to start a fresh session.",
     );
     expect(result.usage).toMatchObject({ input: 3, output: 2 });
     expect(result.diagnostics).toEqual([

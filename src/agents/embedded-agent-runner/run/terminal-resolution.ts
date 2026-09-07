@@ -37,6 +37,26 @@ import {
 } from "./terminal-retry-state.js";
 import type { EmbeddedRunAttemptResult } from "./types.js";
 
+/**
+ * Reads the Anthropic server-side safety fallback boundary recorded on a completed
+ * assistant message, if any. Consumed to warn the user that a guardrail fired and
+ * another model answered.
+ */
+function resolveProviderFallback(
+  assistant: AssistantMessage | undefined,
+): { fromModel: string | null; toModel: string | null } | undefined {
+  const diagnostic = assistant?.diagnostics?.find((entry) => entry.type === "provider_fallback");
+  if (!diagnostic) {
+    return undefined;
+  }
+  const readModel = (value: unknown): string | null =>
+    typeof value === "string" && value.trim() ? value : null;
+  return {
+    fromModel: readModel(diagnostic.details?.fromModel),
+    toModel: readModel(diagnostic.details?.toModel),
+  };
+}
+
 const MAX_MISSING_ASSISTANT_RETRIES = 1;
 const MAX_TOOL_USE_TERMINAL_CONTINUATIONS = 1;
 const COMPACTION_CONTINUATION_RETRY_INSTRUCTION =
@@ -430,6 +450,7 @@ function completeEmbeddedRun(
   log.debug(
     `embedded run done: runId=${input.runParams.runId} sessionId=${input.runParams.sessionId} durationMs=${Date.now() - input.startedAtMs} aborted=${input.terminalAborted}`,
   );
+  const providerFallback = resolveProviderFallback(input.attemptAssistant);
   markEmbeddedRunAuthProfileSuccess({
     authProfileStateMode: input.runParams.authProfileStateMode,
     profileId: input.authProfileId,
@@ -502,6 +523,7 @@ function completeEmbeddedRun(
           name: call.name,
           arguments: JSON.stringify(call.params),
         })),
+        ...(providerFallback ? { providerFallback } : {}),
         executionTrace: {
           winnerProvider: input.reportedModelRef.provider,
           winnerModel: input.reportedModelRef.model,

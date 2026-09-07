@@ -1068,7 +1068,7 @@ describe("Anthropic provider", () => {
     expect(result.stopReason).toBe("error");
     expect(result.content).toEqual([]);
     expect(result.errorMessage).toBe(
-      "Anthropic refusal (category: cyber): This request is not allowed.",
+      "Anthropic refusal (category: cyber). The safety classifier declined this request and the fallback model declined it too. You can rephrase and send again, run /compact in this thread to shrink its context and retry, or /new to start a fresh session.",
     );
     expect(result.usage).toMatchObject({ input: 3, output: 2 });
     expect(result.diagnostics).toEqual([
@@ -1099,7 +1099,7 @@ describe("Anthropic provider", () => {
     await stream.result();
 
     expect((capturedPayload as { fallbacks?: unknown }).fallbacks).toEqual([
-      { model: "claude-opus-4-8" },
+      { model: "claude-opus-5" },
     ]);
     await vi.waitFor(() => expect(anthropicMockState.configs).toHaveLength(1));
     const config = anthropicMockState.configs[0] as {

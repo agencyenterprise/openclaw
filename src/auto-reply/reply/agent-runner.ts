@@ -76,6 +76,7 @@ import {
 import {
   buildFallbackClearedNotice,
   buildFallbackNotice,
+  buildServerSideFallbackNotice,
   resolveFallbackTransition,
 } from "../fallback-state.js";
 import { DEFAULT_HEARTBEAT_ACK_MAX_CHARS, stripHeartbeatToken } from "../heartbeat.js";
@@ -2426,11 +2427,24 @@ export async function runReplyAgent(params: {
       return returnWithQueuedFollowupDrain(undefined);
     }
 
-    const payloadCandidates = (
-      fallbackNoticePayloads.length > 0
-        ? [...fallbackNoticePayloads, ...payloadArray]
-        : payloadArray
-    ).filter(
+    // Anthropic's server-side safety fallback answers on a different model inside one call;
+    // warn the user in the same reply so a silent model swap is never invisible.
+    const serverSideFallbackNotice = runResult.meta?.providerFallback
+      ? buildServerSideFallbackNotice(runResult.meta.providerFallback)
+      : null;
+    const serverSideFallbackNoticePayloads: ReplyPayload[] = serverSideFallbackNotice
+      ? [
+          markReplyPayloadForSourceSuppressionDelivery({
+            text: serverSideFallbackNotice,
+            isFallbackNotice: true,
+          }),
+        ]
+      : [];
+    const payloadCandidates = [
+      ...serverSideFallbackNoticePayloads,
+      ...fallbackNoticePayloads,
+      ...payloadArray,
+    ].filter(
       (payload) =>
         (payload.isReasoning !== true || opts?.reasoningPayloadsEnabled === true) &&
         (payload.isCommentary !== true || opts?.commentaryPayloadsEnabled === true),

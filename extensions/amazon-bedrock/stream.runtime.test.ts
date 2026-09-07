@@ -562,7 +562,7 @@ describe("Bedrock Fable contract", () => {
     expect(eventTypes).toEqual(["error"]);
     expect(result.content).toEqual([]);
     expect(result.errorMessage).toBe(
-      "Anthropic refusal (category: cyber): This request is not allowed.",
+      "Anthropic refusal (category: cyber). The safety classifier declined this request and the fallback model declined it too. You can rephrase and send again, run /compact in this thread to shrink its context and retry, or /new to start a fresh session.",
     );
     expect(result.diagnostics).toEqual([
       expect.objectContaining({

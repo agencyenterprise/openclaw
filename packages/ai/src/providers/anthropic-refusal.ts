@@ -26,10 +26,14 @@ function readAnthropicRefusalDetails(value: unknown): AnthropicRefusalDetails {
   };
 }
 
+const REFUSAL_ADVICE =
+  " The safety classifier declined this request and the fallback model declined it too." +
+  " You can rephrase and send again, run /compact in this thread to shrink its context and retry," +
+  " or /new to start a fresh session.";
+
 function formatAnthropicRefusalMessage(details: AnthropicRefusalDetails): string {
   const category = details.category ? ` (category: ${details.category})` : "";
-  const explanation = details.explanation ? `: ${details.explanation}` : ".";
-  return `Anthropic refusal${category}${explanation}`;
+  return `Anthropic refusal${category}.${REFUSAL_ADVICE}`;
 }
 
 export function applyAnthropicRefusal(
