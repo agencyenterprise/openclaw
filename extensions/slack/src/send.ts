@@ -34,6 +34,12 @@ import type { SlackAuthoredTextPlacement } from "./authored-text.js";
 import { buildSlackCompleteBlocksFallbackText } from "./blocks-fallback.js";
 import { validateSlackBlocksArray } from "./blocks-input.js";
 import {
+  extractHcomBridgeMarker,
+  findHcomBridgeMarkerDeep,
+  stripHcomBridgeHarnessTextDeep,
+  withHcomBridgeMarkerMetadata,
+} from "./bridge-marker.js";
+import {
   postSlackMessageBestEffort,
   uploadSlackFile,
   withSlackDnsRequestRetry,
@@ -956,9 +962,13 @@ export async function sendMessageSlack(
   message: string,
   opts: SlackSendOpts,
 ): Promise<SlackSendResult> {
-  const normalizedMessage = normalizeOptionalString(message) ?? "";
+  // The hcom bridge marker proves delivery through message metadata, never
+  // through visible text (bridge-marker.ts). Take it out of the text and the
+  // blocks first, so nothing downstream can render it into a human-facing post.
+  const { text: markerFreeMessage, marker: textMarker } = extractHcomBridgeMarker(message);
+  const normalizedMessage = normalizeOptionalString(markerFreeMessage) ?? "";
   const trimmedMessage =
-    opts.textIsSlackPlainText && normalizedMessage ? message : normalizedMessage;
+    opts.textIsSlackPlainText && normalizedMessage ? markerFreeMessage : normalizedMessage;
   const cfg = requireRuntimeConfig(opts.cfg, "Slack send");
   const account = resolveSlackAccount({
     cfg,
@@ -982,7 +992,9 @@ export async function sendMessageSlack(
       receipt: createSlackSendReceipt({ platformMessageIds: [], kind: "unknown" }),
     };
   }
-  const blocks = opts.blocks == null ? undefined : validateSlackBlocksArray(opts.blocks);
+  const authoredBlocks = opts.blocks == null ? undefined : validateSlackBlocksArray(opts.blocks);
+  const hcomBridgeMarker = textMarker ?? findHcomBridgeMarkerDeep(authoredBlocks);
+  const blocks = authoredBlocks ? stripHcomBridgeHarnessTextDeep(authoredBlocks) : undefined;
   if (!normalizedMessage && !opts.mediaUrl && !blocks) {
     throw new Error("Slack send requires text, blocks, or media");
   }
@@ -1002,9 +1014,12 @@ export async function sendMessageSlack(
     threadTs: opts.threadTs,
     ...(enterpriseDelivery ? { teamId: enterpriseDelivery.teamId } : {}),
   });
-  const queuedOpts = enterpriseDelivery
-    ? Object.freeze({ ...opts, client: enterpriseDelivery.client })
+  const markedOpts = hcomBridgeMarker
+    ? { ...opts, metadata: withHcomBridgeMarkerMetadata(opts.metadata, hcomBridgeMarker) }
     : opts;
+  const queuedOpts = enterpriseDelivery
+    ? Object.freeze({ ...markedOpts, client: enterpriseDelivery.client })
+    : markedOpts;
   const result = await runQueuedSlackSend(queueKey, () =>
     sendMessageSlackQueued({
       trimmedMessage,

@@ -1,6 +1,7 @@
 // Slack plugin module builds shared chat.postMessage payloads.
 import type { MessageMetadata } from "@slack/types";
 import type { Block, ChatPostMessageArguments, KnownBlock } from "@slack/web-api";
+import { stripHcomBridgeHarnessText, stripHcomBridgeHarnessTextDeep } from "./bridge-marker.js";
 
 export type SlackUnfurlOptions = {
   unfurlLinks?: boolean;
@@ -62,11 +63,16 @@ export function buildSlackPostMessagePayload(params: {
         ? { thread_ts: params.threadTs }
         : {};
   const unfurlPayload = buildSlackUnfurlPayload(params.unfurl);
-  if (params.blocks?.length) {
+  // Belt and braces for Constitution Article 8: no bridge bookkeeping reaches a
+  // human, whichever path built this payload. The marker itself travels as
+  // message metadata instead (see bridge-marker.ts).
+  const text = stripHcomBridgeHarnessText(params.text);
+  const blocks = params.blocks ? stripHcomBridgeHarnessTextDeep(params.blocks) : params.blocks;
+  if (blocks?.length) {
     return {
       channel: params.channelId,
-      text: params.text,
-      blocks: params.blocks,
+      text,
+      blocks,
       ...(params.metadata ? { metadata: params.metadata } : {}),
       ...(typeof params.mrkdwn === "boolean" ? { mrkdwn: params.mrkdwn } : {}),
       ...threadPayload,
@@ -75,7 +81,7 @@ export function buildSlackPostMessagePayload(params: {
   }
   return {
     channel: params.channelId,
-    text: params.text,
+    text,
     ...(params.metadata ? { metadata: params.metadata } : {}),
     ...(typeof params.mrkdwn === "boolean" ? { mrkdwn: params.mrkdwn } : {}),
     ...threadPayload,
