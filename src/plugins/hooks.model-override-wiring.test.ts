@@ -303,6 +303,53 @@ describe("model override pipeline wiring", () => {
         vi.useRealTimers();
       }
     });
+
+    it("budgets each before_prompt_build hook on its own timeout, leaving others on the default", async () => {
+      vi.useFakeTimers();
+      try {
+        // fractal-memory-recall derives its budget from its retrieval deadline
+        // (timeoutMs + margin). Every other plugin keeps the built-in 15s default.
+        const budgetedMs = 8_500;
+        addBeforePromptBuildHook(
+          registry,
+          "fractal-memory-recall",
+          () => new Promise<PluginHookBeforePromptBuildResult>(() => {}),
+          10,
+          budgetedMs,
+        );
+        addBeforePromptBuildHook(
+          registry,
+          "default-budget-plugin",
+          async () => {
+            await new Promise((resolve) => {
+              setTimeout(resolve, budgetedMs + 1_000);
+            });
+            return { prependContext: "slower than the recall budget" };
+          },
+          1,
+        );
+        const logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+        const runner = createHookRunner(registry, { logger });
+
+        const resultPromise = runner.runBeforePromptBuild(
+          { prompt: "test", messages: [] },
+          stubCtx,
+        );
+        // The runner awaits hooks in priority order, so the slower hook only
+        // starts its own timer once the budgeted one has already timed out.
+        await vi.advanceTimersByTimeAsync(budgetedMs);
+        await vi.advanceTimersByTimeAsync(budgetedMs + 1_000);
+
+        await expect(resultPromise).resolves.toEqual({
+          prependContext: "slower than the recall budget",
+        });
+        expect(logger.error).toHaveBeenCalledWith(
+          `[hooks] before_prompt_build handler from fractal-memory-recall failed: timed out after ${budgetedMs}ms`,
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe("graceful degradation + hook detection", () => {

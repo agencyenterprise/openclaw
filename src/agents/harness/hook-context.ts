@@ -8,6 +8,7 @@ import type {
   PluginHookAgentContext,
   PluginHookChannelContext,
   PluginHookContextWindowSource,
+  PluginHookInboundMessageContext,
 } from "../../plugins/hook-types.js";
 
 /**
@@ -37,6 +38,7 @@ export type AgentHarnessHookContext = {
   chatId?: string;
   channel?: string;
   channelContext?: PluginHookChannelContext;
+  inboundMessage?: PluginHookInboundMessageContext;
 };
 
 /** Builds the sparse hook context object passed to agent harness plugin hooks. */
@@ -55,6 +57,7 @@ export function buildAgentHookContext(params: AgentHarnessHookContext): PluginHo
     ...(params.channel ? { channel: params.channel } : {}),
     ...(params.trigger ? { trigger: params.trigger } : {}),
     ...(params.channelId ? { channelId: params.channelId } : {}),
+    ...(params.inboundMessage ? { inboundMessage: params.inboundMessage } : {}),
     ...(params.contextTokenBudget ? { contextTokenBudget: params.contextTokenBudget } : {}),
     ...(params.contextWindowSource ? { contextWindowSource: params.contextWindowSource } : {}),
     ...(params.contextWindowReferenceTokens

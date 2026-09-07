@@ -578,3 +578,27 @@ describe("message hook mappers", () => {
     });
   });
 });
+
+describe("inbound mention and chat type metadata", () => {
+  it("carries wasMentioned and chatType into the internal message:received context", () => {
+    const canonical = deriveInboundMessageHookContext(
+      makeInboundCtx({ WasMentioned: true, ChatType: "channel" }),
+    );
+    expect(canonical.wasMentioned).toBe(true);
+    expect(canonical.chatType).toBe("channel");
+
+    const internalReceived = toInternalMessageReceivedContext(canonical);
+    expect(internalReceived.metadata?.wasMentioned).toBe(true);
+    expect(internalReceived.metadata?.chatType).toBe("channel");
+  });
+
+  it("leaves both undefined when the inbound context has neither", () => {
+    const internalReceived = toInternalMessageReceivedContext(
+      deriveInboundMessageHookContext(
+        makeInboundCtx({ WasMentioned: undefined, ChatType: undefined }),
+      ),
+    );
+    expect(internalReceived.metadata?.wasMentioned).toBeUndefined();
+    expect(internalReceived.metadata?.chatType).toBeUndefined();
+  });
+});

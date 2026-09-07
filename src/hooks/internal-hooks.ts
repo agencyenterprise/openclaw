@@ -105,6 +105,27 @@ export type MessageSentHookEvent = InternalHookEvent & {
   context: MessageSentHookContext;
 };
 
+export type MessageDeletedHookContext = {
+  /** Channel identifier (for example "slack") */
+  channelId: string;
+  /** Provider account ID for multi-account setups */
+  accountId?: string;
+  /** Conversation/chat ID */
+  conversationId?: string;
+  /** Provider message id of the message that was deleted */
+  messageId: string;
+  /** Sender of the deleted message, when the provider reports it */
+  from?: string;
+  /** Additional provider-specific metadata (senderId, threadId, ...) */
+  metadata?: Record<string, unknown>;
+};
+
+export type MessageDeletedHookEvent = InternalHookEvent & {
+  type: "message";
+  action: "deleted";
+  context: MessageDeletedHookContext;
+};
+
 type MessageEnrichedBodyHookContext = {
   /** Sender identifier (e.g., phone number, user ID) */
   from?: string;
@@ -413,6 +434,17 @@ export function isMessageSentEvent(event: InternalHookEvent): event is MessageSe
     hasStringContextField(context, "channelId") &&
     hasBooleanContextField(context, "success")
   );
+}
+
+export function isMessageDeletedEvent(event: InternalHookEvent): event is MessageDeletedHookEvent {
+  if (!isHookEventTypeAndAction(event, "message", "deleted")) {
+    return false;
+  }
+  const context = getHookContext<MessageDeletedHookContext>(event);
+  if (!context) {
+    return false;
+  }
+  return hasStringContextField(context, "channelId") && hasStringContextField(context, "messageId");
 }
 
 export function isMessageTranscribedEvent(

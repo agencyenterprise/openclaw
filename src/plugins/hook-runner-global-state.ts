@@ -1,6 +1,7 @@
 import { expectDefined } from "@openclaw/normalization-core";
 // Internal state and composed-registry view for the global hook runner.
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import { listCoreHooks } from "./core-hooks.js";
 import type { GlobalHookRunnerRegistry } from "./hook-registry.types.js";
 import type { HookRunner } from "./hooks.js";
 import { isPluginRegistryRetired } from "./registry-lifecycle.js";
@@ -220,9 +221,16 @@ function composeLiveHookRegistry(
     hooks: sources.flatMap((registry, index) =>
       registry.hooks.filter((hook) => ownerSourceIndexByPluginId.get(hook.pluginId) === index),
     ),
-    typedHooks: sources.flatMap((registry, index) =>
-      registry.typedHooks.filter((hook) => ownerSourceIndexByPluginId.get(hook.pluginId) === index),
-    ),
+    // Core hooks (src/plugins/core-hooks.ts) belong to no plugin registry, so
+    // they are appended to every composed view and survive re-activation.
+    typedHooks: [
+      ...sources.flatMap((registry, index) =>
+        registry.typedHooks.filter(
+          (hook) => ownerSourceIndexByPluginId.get(hook.pluginId) === index,
+        ),
+      ),
+      ...listCoreHooks(),
+    ],
     plugins: sources.flatMap((registry, index) =>
       registry.plugins.filter((plugin) => ownerSourceIndexByPluginId.get(plugin.id) === index),
     ),

@@ -76,6 +76,12 @@ type CanonicalInboundMessageHookContext = {
   isGroup: boolean;
   groupId?: string;
   topicName?: string;
+  /** Whether the inbound message addressed the bot explicitly (mention or equivalent). */
+  wasMentioned?: boolean;
+  /** Channel-reported conversation kind, e.g. "direct" | "group" | "channel". */
+  chatType?: string;
+  /** Whether the channel reports the author as a bot/app rather than a person. */
+  senderIsBot?: boolean;
   trace?: DiagnosticTraceContext;
   callDepth?: number;
 };
@@ -207,6 +213,9 @@ export function deriveInboundMessageHookContext(
     isGroup,
     groupId: isGroup ? conversationId : undefined,
     topicName: ctx.TopicName,
+    wasMentioned: ctx.WasMentioned,
+    chatType: ctx.ChatType,
+    senderIsBot: ctx.SenderIsBot,
   };
 }
 
@@ -534,6 +543,9 @@ export function toInternalMessageReceivedContext(
       guildId: canonical.guildId,
       channelName: canonical.channelName,
       topicName: canonical.topicName,
+      wasMentioned: canonical.wasMentioned,
+      chatType: canonical.chatType,
+      senderIsBot: canonical.senderIsBot,
     },
   };
   if (context.metadata) {

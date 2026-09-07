@@ -287,6 +287,25 @@ export type PluginHookAgentContext = {
   senderExternalId?: string;
   /** Channel-owned sender/chat details. Plugins may augment the nested interfaces. */
   channelContext?: PluginHookChannelContext;
+  /** Facts about the inbound message that triggered a channel-originated turn. */
+  inboundMessage?: PluginHookInboundMessageContext;
+};
+
+/**
+ * Inbound message facts set by the reply pipeline from the channel context, so hooks
+ * can identify the triggering message without parsing the assembled prompt.
+ */
+export type PluginHookInboundMessageContext = {
+  /** Provider message id of the inbound message. */
+  messageId?: string;
+  /** Provider thread id (for example a Slack thread ts) when the message is in a thread. */
+  threadTs?: string;
+  /** Conversation/channel id the message arrived in. */
+  channel?: string;
+  /** Whether the channel reports the author as a bot/app rather than a person. */
+  senderIsBot?: boolean;
+  /** Raw message text as typed by the sender, before prompt envelope assembly. */
+  text?: string;
 };
 
 export type PluginHookContextWindowSource =

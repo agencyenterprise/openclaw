@@ -70,6 +70,7 @@ hook that never runs is diagnosable.
 | `message:transcribed`    | After audio transcription completes                        |
 | `message:preprocessed`   | After media and link preprocessing completes or is skipped |
 | `message:sent`           | Outbound send attempted (`context.success` has the result) |
+| `message:deleted`        | A message was deleted at the provider (Slack)              |
 
 ## Writing hooks
 
@@ -152,6 +153,8 @@ conversation) and for `session:compact:before` / `session:compact:after`
 **Message events** (`message:sent`): `context.to`, `context.content`, `context.success`, `context.channelId`, plus `context.error` when sending failed.
 
 **Message events** (`message:transcribed`): `context.transcript`, `context.from`, `context.channelId`, `context.mediaPath`.
+
+**Message events** (`message:deleted`): `context.channelId`, `context.messageId` (the provider id of the deleted message), `context.conversationId`, `context.from`, plus `context.metadata`. Slack emits it for the `message_deleted` subtype; the ask ledger consumes it to tombstone an obligation whose source message is gone, so a deleted message is never answered.
 
 **Message events** (`message:preprocessed`): `context.bodyForAgent` (final enriched body), `context.from`, `context.channelId`.
 
