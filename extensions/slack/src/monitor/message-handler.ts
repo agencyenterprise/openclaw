@@ -10,6 +10,7 @@ import {
   resolveExpiresAtMsFromDurationMs,
 } from "openclaw/plugin-sdk/number-runtime";
 import type { ResolvedSlackAccount } from "../accounts.js";
+import { postSlackMessageBestEffort } from "../client-delivery.js";
 import type { SlackSendIdentity } from "../send.js";
 import type { SlackMessageEvent } from "../types.js";
 import { stripSlackMentionsForCommandDetection } from "./commands.js";
@@ -70,14 +71,137 @@ function createSlackDispatchCompletion(): SlackDispatchCompletion {
 }
 
 const APP_MENTION_RETRY_TTL_MS = 60_000;
-const RETRYABLE_FLUSH_MAX_ATTEMPTS = 3;
-const RETRYABLE_FLUSH_RETRY_DELAY_MS = 1_000;
 const REPLY_SESSION_INIT_CONFLICT_MESSAGE_RE = /reply session initialization conflicted for \S+/u;
+const RESTART_RECOVERY_CLAIM_BUSY_MESSAGE_RE = /restart recovery claim busy for \S+/u;
+// A lost session-init compare-and-swap settles in milliseconds, so its budget stays short.
+const SESSION_INIT_CONFLICT_RETRY_DELAYS_MS = [1_000, 2_000, 4_000] as const;
+// A busy restart-recovery claim is held for as long as the turn that owns it runs, so this
+// budget has to outlast a real agent turn (~21 minutes). Giving up while the turn is still
+// running loses an inbound human message for good.
+const CLAIM_BUSY_RETRY_DELAYS_MS = [
+  1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 30_000, 60_000, 60_000, 60_000, 60_000, 60_000,
+  60_000, 60_000, 60_000, 60_000, 60_000, 60_000, 60_000, 60_000,
+] as const;
+const UNPROCESSED_INBOUND_NOTICE_TEXT =
+  "I could not process this message after repeated retries. Please resend it.";
+
+type QueuedSlackInboundEntry = {
+  message: SlackMessageEvent;
+  opts: QueuedSlackMessageOptions;
+};
+
+type SlackInboundRetryCause = "claim-busy" | "session-init-conflict";
+
+type SlackInboundRetryResult = {
+  /** Entries whose retry budget is spent; each one still owes its sender an answer. */
+  exhausted: readonly QueuedSlackInboundEntry[];
+  retryBudget: number;
+  scheduled: boolean;
+};
+
+const NO_SLACK_INBOUND_RETRY: SlackInboundRetryResult = {
+  exhausted: [],
+  retryBudget: 0,
+  scheduled: false,
+};
+
+/**
+ * Contention causes differ by how long they last, so they cannot share one retry budget.
+ * Both messages are load-bearing: they are the contract this classification reads.
+ */
+function classifySlackInboundRetryCause(error: unknown): SlackInboundRetryCause | undefined {
+  for (const candidate of collectErrorGraphCandidates(error, (current) => [
+    current.cause,
+    current.error,
+  ])) {
+    const message = formatErrorMessage(candidate);
+    if (RESTART_RECOVERY_CLAIM_BUSY_MESSAGE_RE.test(message)) {
+      return "claim-busy";
+    }
+    if (REPLY_SESSION_INIT_CONFLICT_MESSAGE_RE.test(message)) {
+      return "session-init-conflict";
+    }
+  }
+  return undefined;
+}
 
 function isRetryableSlackInboundError(error: unknown): boolean {
-  return collectErrorGraphCandidates(error, (current) => [current.cause, current.error]).some(
-    (candidate) => REPLY_SESSION_INIT_CONFLICT_MESSAGE_RE.test(formatErrorMessage(candidate)),
+  return classifySlackInboundRetryCause(error) !== undefined;
+}
+
+function resolveSlackInboundRetryDelays(cause: SlackInboundRetryCause): readonly number[] {
+  return cause === "claim-busy"
+    ? CLAIM_BUSY_RETRY_DELAYS_MS
+    : SESSION_INIT_CONFLICT_RETRY_DELAYS_MS;
+}
+
+/**
+ * Last-resort signal for an inbound message that never reached a turn. An ack reaction
+ * alone reads as acknowledgement, so the thread has to say it out loud.
+ */
+async function postUnprocessedSlackInboundNotice(params: {
+  ctx: SlackMonitorContext;
+  message: SlackMessageEvent;
+  attempts: number;
+  error: unknown;
+}): Promise<void> {
+  const { ctx, message } = params;
+  const channelId = message.channel;
+  const messageTs = message.ts;
+  // Log before posting so the failure is on record even if Slack rejects the notice.
+  ctx.runtime.error?.(
+    `slack inbound message ${channelId ?? "unknown"}/${messageTs ?? "unknown"} was not processed after ${params.attempts} retries: ${formatErrorMessage(params.error)}`,
   );
+  if (!channelId || !messageTs) {
+    return;
+  }
+  // A replay or another gateway may have run this message while the last attempt was
+  // unwinding. Never claim failure for a message that something did process.
+  if (
+    await hasSlackInboundMessageDelivery({
+      accountId: ctx.accountId,
+      channelId,
+      ts: messageTs,
+    })
+  ) {
+    return;
+  }
+  try {
+    await postSlackMessageBestEffort({
+      client: ctx.app.client,
+      channelId,
+      text: UNPROCESSED_INBOUND_NOTICE_TEXT,
+      threadTs: message.thread_ts ?? messageTs,
+    });
+  } catch (err) {
+    ctx.runtime.error?.(
+      `slack inbound unprocessed-message notice failed for ${channelId}/${messageTs}: ${formatErrorMessage(err)}`,
+    );
+  }
+}
+
+async function notifyUnprocessedSlackInboundEntries(params: {
+  ctx: SlackMonitorContext;
+  entries: readonly QueuedSlackInboundEntry[];
+  attempts: number;
+  error: unknown;
+}): Promise<void> {
+  // One notice per thread: a debounced batch is several messages in one conversation.
+  const noticedThreads = new Set<string>();
+  for (const entry of params.entries) {
+    const { message } = entry;
+    const threadKey = `${message.channel ?? ""}:${message.thread_ts ?? message.ts ?? ""}`;
+    if (noticedThreads.has(threadKey)) {
+      continue;
+    }
+    noticedThreads.add(threadKey);
+    await postUnprocessedSlackInboundNotice({
+      ctx: params.ctx,
+      message,
+      attempts: params.attempts,
+      error: params.error,
+    });
+  }
 }
 
 function shouldDebounceSlackMessage(message: SlackMessageEvent, cfg: SlackMonitorContext["cfg"]) {
@@ -110,10 +234,7 @@ export function createSlackMessageHandler(params: {
   onPrepared?: (prepared: PreparedSlackMessage) => void;
 }): SlackMessageHandler {
   const { ctx, account, trackEvent, onPrepared } = params;
-  const { debounceMs, debouncer } = createChannelInboundDebouncer<{
-    message: SlackMessageEvent;
-    opts: QueuedSlackMessageOptions;
-  }>({
+  const { debounceMs, debouncer } = createChannelInboundDebouncer<QueuedSlackInboundEntry>({
     cfg: ctx.cfg,
     channel: "slack",
     buildKey: (entry) =>
@@ -121,13 +242,16 @@ export function createSlackMessageHandler(params: {
     shouldDebounce: (entry) =>
       !entry.opts.eventScope && shouldDebounceSlackMessage(entry.message, ctx.cfg),
     onFlush: async (entries) => {
-      const retryEntries = (sourceError: unknown): boolean => {
-        if (
-          !isRetryableSlackInboundError(sourceError) ||
-          entries.some((entry) => entry.opts.eventScope)
-        ) {
-          return false;
+      const retryEntries = (sourceError: unknown): SlackInboundRetryResult => {
+        const cause = classifySlackInboundRetryCause(sourceError);
+        if (!cause || entries.some((entry) => entry.opts.eventScope)) {
+          return NO_SLACK_INBOUND_RETRY;
         }
+        const retryDelays = resolveSlackInboundRetryDelays(cause);
+        // An entry can be out of budget while another in the same batch still has some,
+        // so exhaustion is tracked per entry: a dropped one still owes its sender a reply.
+        const exhausted: QueuedSlackInboundEntry[] = [];
+        let priorAttempt = 0;
         const nextEntries = entries
           .map((entry) => {
             // Relay delivery owns retry until its dispatch completion is acknowledged.
@@ -136,9 +260,11 @@ export function createSlackMessageHandler(params: {
               return null;
             }
             const retryAttempt = entry.opts.retryAttempt ?? 0;
-            if (retryAttempt >= RETRYABLE_FLUSH_MAX_ATTEMPTS) {
+            if (retryAttempt >= retryDelays.length) {
+              exhausted.push(entry);
               return null;
             }
+            priorAttempt = Math.max(priorAttempt, retryAttempt);
             const { dispatchCompletion: _dispatchCompletion, ...retryOpts } = entry.opts;
             return {
               ...entry,
@@ -149,20 +275,27 @@ export function createSlackMessageHandler(params: {
             };
           })
           .filter((entry) => entry !== null);
+        const result = { exhausted, retryBudget: retryDelays.length };
         if (nextEntries.length === 0) {
-          return false;
+          return { ...result, scheduled: false };
         }
-        const retryTimer = setTimeout(() => {
-          for (const entry of nextEntries) {
-            // Re-enter ingress so a relay replay or another successful attempt wins
-            // through the normal delivery and seen-message gates before dispatch.
-            void enqueueSlackMessage(entry.message, entry.opts).catch((err: unknown) => {
-              ctx.runtime.error?.(`slack inbound retry enqueue failed: ${formatErrorMessage(err)}`);
-            });
-          }
-        }, RETRYABLE_FLUSH_RETRY_DELAY_MS);
+        const retryTimer = setTimeout(
+          () => {
+            for (const entry of nextEntries) {
+              // Re-enter ingress so a relay replay or another successful attempt wins
+              // through the normal delivery and seen-message gates before dispatch.
+              void enqueueSlackMessage(entry.message, entry.opts).catch((err: unknown) => {
+                ctx.runtime.error?.(
+                  `slack inbound retry enqueue failed: ${formatErrorMessage(err)}`,
+                );
+              });
+            }
+          },
+          // Escalate the wait so a long-running turn gets time to release its session claim.
+          retryDelays[priorAttempt] ?? retryDelays[0],
+        );
         retryTimer.unref?.();
-        return true;
+        return { ...result, scheduled: true };
       };
       const completions = entries
         .map((entry) => entry.opts.dispatchCompletion)
@@ -319,9 +452,20 @@ export function createSlackMessageHandler(params: {
           completion.resolve();
         }
       } catch (error) {
-        retryEntries(error);
+        const retry = retryEntries(error);
         for (const completion of completions) {
           completion.reject(error);
+        }
+        if (retry.exhausted.length > 0) {
+          // Retries are spent and no turn ever ran these messages. Say so in the thread; a
+          // swapped ack reaction alone is silence that looks like acknowledgement. Relay
+          // completions are already released, so a stalled notice cannot hold them.
+          await notifyUnprocessedSlackInboundEntries({
+            ctx,
+            entries: retry.exhausted,
+            attempts: retry.retryBudget,
+            error,
+          });
         }
         throw error;
       }

@@ -17,6 +17,19 @@ import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transc
 import type { DeliveryContext } from "../../utils/delivery-context.shared.js";
 import type { SourceReplyDeliveryMode } from "../get-reply-options.types.js";
 
+/**
+ * Raised when another in-flight turn already owns this session's restart-recovery
+ * claim. Contention is transient: the losing turn must retry until the active turn
+ * releases the claim, and an inbound human message must never be dropped for it.
+ * The message shape is load-bearing for channel retry classification.
+ */
+export class RestartRecoveryClaimBusyError extends Error {
+  constructor(sessionKey: string) {
+    super(`restart recovery claim busy for ${sessionKey}`);
+    this.name = "RestartRecoveryClaimBusyError";
+  }
+}
+
 type ReplyRestartRecoveryClaimController = {
   admitUserTurn: (
     recorder?: UserTurnTranscriptRecorder,
@@ -179,7 +192,9 @@ export function createReplyRestartRecoveryClaimController(params: {
           : null,
     );
     if (!persisted) {
-      throw new Error("restart recovery claim changed before agent adoption");
+      // A competing writer moved the entry between the expected-state snapshot and
+      // this compare-and-swap. Retrying rebuilds the snapshot against fresh state.
+      throw new RestartRecoveryClaimBusyError(options.sessionKey);
     }
     return persisted;
   };
@@ -302,7 +317,10 @@ export function createReplyRestartRecoveryClaimController(params: {
         entry.status === "running" ||
         entry.restartRecoveryDeliveryReceiptState === "terminal-pending")
     ) {
-      throw new Error("restart recovery claim changed before agent adoption");
+      // Another turn (CLI `agent --deliver`, cron, or a concurrent inbound) holds the
+      // claim right now. This is contention, not a lost turn: the caller must queue
+      // behind that turn and retry, never discard the message.
+      throw new RestartRecoveryClaimBusyError(params.sessionKey);
     }
     const retiredClaim = activeClaimRunId
       ? buildRestartRecoveryClaimCleanupPatch({
