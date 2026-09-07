@@ -11,8 +11,9 @@ const { messageQueueMock, messageAllowMock, inboundInfoSpy, recoveryLogMock } = 
   messageQueueMock: vi.fn(),
   messageAllowMock: vi.fn(),
   inboundInfoSpy: vi.fn(),
-  recoveryLogMock: vi.fn(() => true),
+  recoveryLogMock: vi.fn((..._args: unknown[]) => true),
 }));
+const triggerInternalHookMock = vi.hoisted(() => vi.fn(async (_event: unknown) => {}));
 
 vi.mock("openclaw/plugin-sdk/runtime-env", async (importOriginal) => {
   const actual = await importOriginal<typeof import("openclaw/plugin-sdk/runtime-env")>();
@@ -40,6 +41,13 @@ vi.mock("openclaw/plugin-sdk/system-event-runtime", () => ({
 vi.mock("openclaw/plugin-sdk/system-event-runtime.js", () => ({
   enqueueSystemEvent: (...args: unknown[]) => messageQueueMock(...args),
 }));
+vi.mock("openclaw/plugin-sdk/hook-runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/hook-runtime")>();
+  return {
+    ...actual,
+    triggerInternalHook: triggerInternalHookMock,
+  };
+});
 vi.mock("../inbound-recovery-log.js", () => ({
   appendSlackInboundRecoveryLog: (...args: unknown[]) => recoveryLogMock(...args),
 }));
@@ -119,6 +127,24 @@ function requireMessageHandler(handler: MessageHandler | null): MessageHandler {
 function resetMessageMocks(): void {
   messageQueueMock.mockClear();
   messageAllowMock.mockReset().mockResolvedValue([]);
+  triggerInternalHookMock.mockClear();
+}
+
+function internalHookEvents(): Array<{
+  type: string;
+  action: string;
+  sessionKey: string;
+  context: Record<string, unknown>;
+}> {
+  return triggerInternalHookMock.mock.calls.map(
+    ([event]) =>
+      event as {
+        type: string;
+        action: string;
+        sessionKey: string;
+        context: Record<string, unknown>;
+      },
+  );
 }
 
 beforeAll(async () => {
@@ -228,11 +254,13 @@ async function invokeRegisteredHandler(input: {
   overrides?: SlackSystemEventTestOverrides;
   event: Record<string, unknown>;
   body?: unknown;
+  context?: Record<string, unknown>;
 }) {
   const { handler, handleSlackMessage } = createHandlers(input.eventName, input.overrides);
   await requireMessageHandler(handler)({
     event: input.event,
     body: input.body ?? {},
+    ...(input.context ? { context: input.context } : {}),
   });
   return { handleSlackMessage };
 }
@@ -731,5 +759,135 @@ describe("registerSlackMessageEvents", () => {
     expect(inboundLogLines()).toEqual([
       "Inbound app_mention slack:T_TEST:channel:C123:user:unknown -> bot:U_BOT (channel, 14 chars)",
     ]);
+  });
+});
+
+describe("registerSlackMessageEvents message:deleted hook", () => {
+  it("reports the deleted message so ledger consumers can tombstone it", async () => {
+    await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: {
+        ...makeDeletedEvent(),
+        previous_message: { ts: "123.450", thread_ts: "123.000", user: "U1" },
+      },
+    });
+
+    expect(internalHookEvents()).toEqual([
+      expect.objectContaining({
+        type: "message",
+        action: "deleted",
+        sessionKey: "agent:main:main",
+        context: {
+          channelId: "slack",
+          conversationId: "D1",
+          messageId: "123.456",
+          from: "U1",
+          metadata: { senderId: "U1", threadId: "123.000" },
+        },
+      }),
+    ]);
+  });
+
+  it("keeps enqueuing the deletion system event alongside the hook", async () => {
+    await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: makeDeletedEvent(),
+    });
+
+    expect(messageQueueMock).toHaveBeenCalledTimes(1);
+    expect(internalHookEvents()).toHaveLength(1);
+  });
+
+  it("does not report edits as deletions", async () => {
+    await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: makeChangedEvent(),
+    });
+
+    expect(internalHookEvents()).toEqual([]);
+  });
+
+  it("does not report deletions Slack refuses to attribute to a channel", async () => {
+    await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: { ...makeDeletedEvent(), deleted_ts: undefined },
+    });
+
+    expect(internalHookEvents()).toEqual([]);
+  });
+});
+
+describe("registerSlackMessageEvents source ts", () => {
+  function firstHandledMessage(
+    handleSlackMessage: ReturnType<typeof vi.fn>,
+  ): Record<string, unknown> {
+    const call = handleSlackMessage.mock.calls[0];
+    if (!call) {
+      throw new Error("expected handleSlackMessage to be called");
+    }
+    return call[0] as Record<string, unknown>;
+  }
+
+  it("names the replayed message when Slack redelivers an unacked event", async () => {
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: { type: "message", channel: "D1", channel_type: "im", user: "U1", ts: "123.456" },
+      context: { retryNum: 1, retryReason: "timeout" },
+    });
+
+    expect(firstHandledMessage(handleSlackMessage).openclaw_source_ts).toBe("123.456");
+  });
+
+  it("leaves a first delivery as its own source", async () => {
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: { type: "message", channel: "D1", channel_type: "im", user: "U1", ts: "123.456" },
+      context: { retryNum: 0 },
+    });
+
+    expect(firstHandledMessage(handleSlackMessage).openclaw_source_ts).toBeUndefined();
+  });
+
+  it("names the replayed mention when Slack redelivers an app_mention", async () => {
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "app_mention",
+      overrides: { dmPolicy: "open", channelType: "channel" },
+      event: makeAppMentionEvent({ channel: "C123", channelType: "channel", ts: "123.456" }),
+      context: { retryNum: 2, retryReason: "http_error" },
+    });
+
+    expect(firstHandledMessage(handleSlackMessage).openclaw_source_ts).toBe("123.456");
+  });
+
+  it("names the edited message when an assistant DM edit re-enters as inbound", async () => {
+    const changed = makeAssistantChangedEvent();
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: {
+        ...changed,
+        previous_message: { ts: "123.400", user: "U_BOT" },
+      },
+    });
+
+    const handled = firstHandledMessage(handleSlackMessage);
+    expect(handled.ts).toBe("123.456");
+    expect(handled.openclaw_source_ts).toBe("123.400");
+  });
+
+  it("omits the source ts when an edit keeps the original ts", async () => {
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
+      event: makeAssistantChangedEvent(),
+    });
+
+    expect(firstHandledMessage(handleSlackMessage).openclaw_source_ts).toBeUndefined();
   });
 });

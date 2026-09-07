@@ -91,6 +91,6 @@ export type SlackMessageDeletedEvent = {
   subtype: "message_deleted";
   channel?: string;
   deleted_ts?: string;
-  previous_message?: { ts?: string; user?: string; bot_id?: string };
+  previous_message?: { ts?: string; thread_ts?: string; user?: string; bot_id?: string };
   event_ts?: string;
 };

@@ -19,6 +19,13 @@ import {
 } from "openclaw/plugin-sdk/hook-runtime";
 import { getGlobalHookRunner } from "openclaw/plugin-sdk/plugin-runtime";
 
+/**
+ * Sentinel `messageId` reported to the message-sent hooks when a threaded reply is
+ * dropped because Slack lost its parent message. The ask ledger records it as the
+ * ask's answer timestamp so the ask closes without a real Slack `ts`.
+ */
+export const SLACK_PARENT_DELETED_ANSWER_TS = "parent_deleted";
+
 type EmitSlackMessageSentHookParams = {
   /** Optional canonical session key. When set, the internal `message:sent` hook fires too. */
   sessionKeyForInternalHooks?: string;

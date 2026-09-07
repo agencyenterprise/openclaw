@@ -16,11 +16,13 @@ import {
   type ReplyPayload,
 } from "openclaw/plugin-sdk/reply-payload";
 import { createReplyReferencePlanner } from "openclaw/plugin-sdk/reply-reference";
-import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
+import { type RuntimeEnv, warn } from "openclaw/plugin-sdk/runtime-env";
 import { buildSlackBlocksFallbackText } from "../blocks-fallback.js";
+import { isSlackThreadNotFoundError } from "../errors.js";
 import { markdownToSlackMrkdwnChunks } from "../format.js";
 import { SLACK_TEXT_LIMIT } from "../limits.js";
-import { emitSlackMessageSentHooks } from "../message-sent-hook.js";
+import { readSlackReplyPresentationConfig } from "../markdown-presentation-config.js";
+import { emitSlackMessageSentHooks, SLACK_PARENT_DELETED_ANSWER_TS } from "../message-sent-hook.js";
 import {
   buildSlackNativeDataAccessibilityText,
   hasSlackNativeDataBlock,
@@ -152,6 +154,7 @@ export async function deliverReplies(params: {
     const materializeAuthoredText = !reply.hasMedia && hasSlackReplyStructuredContent(payload);
     const { authoredTextPlacement, segments } = resolveSlackReplyBlockResolution(payload, {
       materializeAuthoredText,
+      authoredMarkdownPresentation: readSlackReplyPresentationConfig(params.cfg, params.accountId),
     });
     if (!textRaw && !reply.hasMedia && segments.length === 0) {
       continue;
@@ -187,6 +190,24 @@ export async function deliverReplies(params: {
         content,
         success: false,
         error: formatErrorMessage(error),
+        isGroup: params.isGroup,
+        groupId: params.groupId,
+      });
+    };
+    // The reply never reached Slack, but the ask it answers is settled: report the
+    // sentinel answer timestamp so the ask ledger closes the ask instead of
+    // leaving it open for a parent message that no longer exists.
+    const emitParentDeleted = (content: string) => {
+      if (params.deferMessageSentHooks) {
+        return;
+      }
+      emitSlackMessageSentHooks({
+        sessionKeyForInternalHooks: params.sessionKeyForInternalHooks,
+        to: params.messageSentHookTarget ?? params.target,
+        accountId: params.accountId,
+        content,
+        success: true,
+        messageId: SLACK_PARENT_DELETED_ANSWER_TS,
         isGroup: params.isGroup,
         groupId: params.groupId,
       });
@@ -261,6 +282,18 @@ export async function deliverReplies(params: {
       }
     } catch (error) {
       const hookContent = hookParts.join("\n\n") || textRaw || spokenText || "";
+      if (threadTs && isSlackThreadNotFoundError(error)) {
+        // Slack deleted the thread parent (e.g. a message replayed on reconnect
+        // that the user had already removed). Retrying without thread_ts would
+        // leak the answer into the channel root, so drop the reply instead.
+        params.runtime.log?.(
+          warn(
+            `slack: dropped threaded reply because its parent message was deleted (channel=${params.target} thread_ts=${threadTs})`,
+          ),
+        );
+        emitParentDeleted(hookContent);
+        continue;
+      }
       emitFailed(hookContent, error);
       throw error;
     }

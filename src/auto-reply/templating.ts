@@ -137,6 +137,11 @@ export type MsgContext = {
   DedupeMessageSid?: string;
   /** Internal target for replacing an already-delivered source reply. */
   ReplaceMessageTs?: string;
+  /**
+   * Provider ts of the original message when this delivery is an edit or a
+   * redelivery of it. Absent when the delivery is its own source.
+   */
+  SourceTs?: string;
   MessageSids?: string[];
   MessageSidFirst?: string;
   MessageSidLast?: string;

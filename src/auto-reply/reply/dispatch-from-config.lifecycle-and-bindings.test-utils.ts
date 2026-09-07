@@ -165,6 +165,54 @@ describe("dispatchReplyFromConfig", () => {
     expect(internalHookMocks.triggerInternalHook).toHaveBeenCalledTimes(1);
   });
 
+  it("carries the original ts into the received hook for an edit or a redelivery", async () => {
+    setNoAbort();
+    const cfg = emptyConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "slack",
+      Surface: "slack",
+      SessionKey: "agent:main:main",
+      CommandBody: "hello",
+      MessageSid: "1788480000.000200",
+      SourceTs: "1788479206.951729",
+    });
+
+    const replyResolver = async () => ({ text: "hi" }) satisfies ReplyPayload;
+    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
+    const createHookCall = firstMockCall(
+      internalHookMocks.createInternalHookEvent,
+      "internal hook event",
+    ) as [unknown, unknown, unknown, { metadata?: Record<string, unknown> }] | undefined;
+    expect(createHookCall?.[1]).toBe("received");
+    expect(createHookCall?.[3]?.metadata?.sourceTs).toBe("1788479206.951729");
+    expect(createHookCall?.[3]?.metadata?.senderId).toBe(ctx.SenderId);
+  });
+
+  it("omits the source ts from the received hook when the delivery is its own source", async () => {
+    setNoAbort();
+    const cfg = emptyConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "slack",
+      Surface: "slack",
+      SessionKey: "agent:main:main",
+      CommandBody: "hello",
+      MessageSid: "1788480000.000200",
+    });
+
+    const replyResolver = async () => ({ text: "hi" }) satisfies ReplyPayload;
+    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
+    const createHookCall = firstMockCall(
+      internalHookMocks.createInternalHookEvent,
+      "internal hook event",
+    ) as [unknown, unknown, unknown, { metadata?: Record<string, unknown> }] | undefined;
+    expect(createHookCall?.[1]).toBe("received");
+    expect(createHookCall?.[3]?.metadata).not.toHaveProperty("sourceTs");
+  });
+
   it("skips internal message:received hook when session key is unavailable", async () => {
     setNoAbort();
     const cfg = emptyConfig;

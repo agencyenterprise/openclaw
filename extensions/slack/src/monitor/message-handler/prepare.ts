@@ -1602,6 +1602,7 @@ export async function prepareSlackMessage(params: {
     extra: {
       DedupeMessageSid: dedupeMessageId,
       ReplaceMessageTs: normalizeOptionalString(message.openclaw_replace_message_ts),
+      SourceTs: normalizeOptionalString(message.openclaw_source_ts),
       GroupSubject: isRoomish ? roomLabel : undefined,
       UntrustedContext: untrustedChannelMetadata ? [untrustedChannelMetadata] : undefined,
       TransportThreadId: directThreadRoutedToDmSession ? threadContext.messageThreadId : undefined,

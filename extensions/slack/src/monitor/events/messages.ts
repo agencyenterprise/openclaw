@@ -12,13 +12,14 @@ import {
   normalizeOptionalString as asString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { enqueueSystemEvent } from "openclaw/plugin-sdk/system-event-runtime";
+import { emitSlackMessageDeletedHook } from "../../message-deleted-hook.js";
 import type { SlackAppMentionEvent, SlackMessageEvent } from "../../types.js";
 import { normalizeSlackChannelType } from "../channel-type.js";
 import type { SlackMonitorContext } from "../context.js";
 import { resolveSlackEventScope, type SlackEventScope } from "../event-scope.js";
 import { appendSlackInboundRecoveryLog } from "../inbound-recovery-log.js";
 import type { SlackMessageHandler } from "../message-handler.js";
-import type { SlackMessageChangedEvent } from "../types.js";
+import type { SlackMessageChangedEvent, SlackMessageDeletedEvent } from "../types.js";
 import { resolveSlackMessageSubtypeHandler } from "./message-subtype-handlers.js";
 import { authorizeAndResolveSlackSystemEventContext } from "./system-event-context.js";
 
@@ -36,6 +37,31 @@ function formatSlackInboundLogLine(params: {
 }): string {
   const from = `slack:${params.workspaceId}:channel:${params.channelId}:user:${params.userId}`;
   return `Inbound app_mention ${from} -> bot:${params.botUserId} (${params.channelType}, ${params.bodyChars} chars)`;
+}
+
+/**
+ * Report a Slack deletion to the internal `message:deleted` hook so ledger-style
+ * consumers can tombstone the obligation the deleted message created.
+ */
+function emitSlackMessageDeletedForEvent(params: {
+  ctx: SlackMonitorContext;
+  event: SlackMessageDeletedEvent;
+  channelId?: string;
+  sessionKey: string;
+}): void {
+  const messageId = asString(params.event.deleted_ts);
+  if (!params.channelId || !messageId) {
+    return;
+  }
+  const previousMessage = params.event.previous_message;
+  emitSlackMessageDeletedHook({
+    sessionKey: params.sessionKey,
+    channelId: params.channelId,
+    accountId: params.ctx.accountId,
+    messageId,
+    from: asString(previousMessage?.user),
+    threadId: asString(previousMessage?.thread_ts),
+  });
 }
 
 type SlackAssistantMessageRecord = {
@@ -106,6 +132,23 @@ function isSelfAttributedMessageChange(params: {
   );
 }
 
+/**
+ * Slack redelivers an event it never got an ack for — a reconnect after an outage,
+ * or an ack timeout — with the same `ts` and `retry_attempt` >= 1. Such a delivery
+ * is not its own source, so name the original message it replays.
+ */
+function withSlackRedeliverySource(
+  message: SlackMessageEvent,
+  context: AllMiddlewareArgs["context"] | undefined,
+): SlackMessageEvent {
+  const retryNum = context?.retryNum ?? 0;
+  const sourceTs = asString(message.ts);
+  if (retryNum < 1 || !sourceTs || message.openclaw_source_ts) {
+    return message;
+  }
+  return { ...message, openclaw_source_ts: sourceTs };
+}
+
 function resolveAssistantMessageChangedInbound(params: {
   event: SlackMessageEvent;
   ctx: SlackMonitorContext;
@@ -137,13 +180,18 @@ function resolveAssistantMessageChangedInbound(params: {
     }
     return undefined;
   }
+  // An edit re-enters the pipeline under the edited message's ts; the ask it
+  // answers belongs to the message that was edited.
+  const inboundTs = asString(message.ts) ?? asString(changed.event_ts);
+  const originalTs = asString(changed.previous_message?.ts);
   return {
     type: "message",
     channel: changed.channel ?? params.event.channel,
     channel_type: "im",
     user: senderId,
     text: asString(message.text),
-    ts: asString(message.ts) ?? asString(changed.event_ts),
+    ts: inboundTs,
+    ...(originalTs && originalTs !== inboundTs ? { openclaw_source_ts: originalTs } : {}),
     thread_ts: asString(message.thread_ts),
     event_ts: changed.event_ts,
     assistant_thread:
@@ -206,7 +254,7 @@ export function registerSlackMessageEvents(params: {
         return;
       }
 
-      const message = event as SlackMessageEvent;
+      const message = withSlackRedeliverySource(event as SlackMessageEvent, context);
       // Subtype handlers do not enter the regular message pipeline. Observe any explicit
       // type here so edits and deletes share the same authoritative conversation cache.
       ctx.rememberSlackChannelType(message.channel, message.channel_type, eventScope);
@@ -223,7 +271,7 @@ export function registerSlackMessageEvents(params: {
         ctx,
       });
       if (assistantChangedInbound) {
-        await handleSlackMessage(assistantChangedInbound, {
+        await handleSlackMessage(withSlackRedeliverySource(assistantChangedInbound, context), {
           source: "message",
           ...(eventScope ? { eventScope, awaitDispatch: true } : {}),
         });
@@ -260,6 +308,14 @@ export function registerSlackMessageEvents(params: {
           sessionKey: ingressContext.sessionKey,
           contextKey: subtypeHandler.contextKey(message),
         });
+        if (subtypeHandler.subtype === "message_deleted") {
+          emitSlackMessageDeletedForEvent({
+            ctx,
+            event: message as SlackMessageDeletedEvent,
+            channelId,
+            sessionKey: ingressContext.sessionKey,
+          });
+        }
         return;
       }
 
@@ -341,11 +397,14 @@ export function registerSlackMessageEvents(params: {
           }),
         );
 
-        await handleSlackMessage(mention as unknown as SlackMessageEvent, {
-          source: "app_mention",
-          wasMentioned: true,
-          ...(eventScope ? { eventScope, awaitDispatch: true } : {}),
-        });
+        await handleSlackMessage(
+          withSlackRedeliverySource(mention as unknown as SlackMessageEvent, context),
+          {
+            source: "app_mention",
+            wasMentioned: true,
+            ...(eventScope ? { eventScope, awaitDispatch: true } : {}),
+          },
+        );
       } catch (err) {
         ctx.runtime.error?.(danger(`slack mention handler failed: ${formatErrorMessage(err)}`));
       }

@@ -1080,10 +1080,15 @@ async function dispatchReplyFromConfigInner(
     }
     if (ctx.SuppressMessageReceivedHooks !== true && sessionKey) {
       const messageReceivedHookContext = buildMessageReceivedHookContext();
+      const receivedContext = toInternalMessageReceivedContext(messageReceivedHookContext);
+      // Edits and redeliveries answer an obligation the original message already
+      // created, so ledger-style consumers need the original ts alongside this one.
+      const sourceTs = normalizeOptionalString(ctx.SourceTs);
       fireAndForgetHook(
         triggerInternalHook(
           createInternalHookEvent("message", "received", sessionKey, {
-            ...toInternalMessageReceivedContext(messageReceivedHookContext),
+            ...receivedContext,
+            ...(sourceTs ? { metadata: { ...receivedContext.metadata, sourceTs } } : {}),
             timestamp,
           }),
         ),

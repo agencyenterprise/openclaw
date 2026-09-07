@@ -59,6 +59,11 @@ export type SlackMessageEvent = {
   /** Internal-only target used to replace a reviewed bot answer in place. */
   openclaw_replace_message_ts?: string;
   /**
+   * Ts of the original message when this delivery is an edit or a redelivery of
+   * it. Absent when the delivery is its own source.
+   */
+  openclaw_source_ts?: string;
+  /**
    * Set by the thread_ts resolver when Slack supplied parent_user_id but the
    * parent thread timestamp could not be recovered.
    */
