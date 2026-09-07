@@ -1000,4 +1000,80 @@ describe("routeReply", () => {
       mirror: undefined,
     });
   });
+
+  // The obligation the delivered payload declares for the outbound-dedupe
+  // `message_sending` guard. Routing is the last place that knows which ask a
+  // reply answers, so the id has to ride on the payload from here.
+  describe("declared obligation metadata", () => {
+    const SLACK_THREAD_SESSION = "agent:main:slack:channel:c0a3c98hs48:thread:1788479558.561999";
+
+    it("declares the ask id of the message a Slack reply replies to", async () => {
+      await routeReply({
+        payload: { text: "the capture is on the pod", replyToId: "1788479206.951729" },
+        channel: "slack",
+        to: "channel:C0A3C98HS48",
+        sessionKey: SLACK_THREAD_SESSION,
+        cfg: {} as never,
+      });
+
+      expect(lastDeliveryPayload().hookMetadata).toEqual({
+        obligationId: "C0A3C98HS48:1788479206.951729",
+      });
+    });
+
+    // Regression for the 2026-09-04 mute in #fractal-ai-gateway: the session
+    // thread root was used as a stand-in ask id, so every ask in a long thread
+    // collapsed onto one obligation and the guard cancelled the second answer
+    // for the whole dedupe window.
+    it("declares nothing when the reply names no ask, instead of the session thread root", async () => {
+      await routeReply({
+        payload: { text: "still working on it" },
+        channel: "slack",
+        to: "channel:C0A3C98HS48",
+        sessionKey: SLACK_THREAD_SESSION,
+        cfg: {} as never,
+      });
+
+      expect(lastDeliveryPayload()).not.toHaveProperty("hookMetadata");
+    });
+
+    it("names the ask a later reply in the same thread answers, not the thread root", async () => {
+      const LONG_THREAD_SESSION = "agent:main:slack:channel:c0ahskbndb6:thread:1788473062.847669";
+      await routeReply({
+        payload: { text: "on the disposition result", replyToId: "1788503106.311259" },
+        channel: "slack",
+        to: "channel:C0AHSKBNDB6",
+        sessionKey: LONG_THREAD_SESSION,
+        cfg: {} as never,
+      });
+
+      expect(lastDeliveryPayload().hookMetadata).toEqual({
+        obligationId: "C0AHSKBNDB6:1788503106.311259",
+      });
+    });
+
+    it("declares nothing for a send that answers no identifiable ask", async () => {
+      await routeReply({
+        payload: { text: "[hcom-bridge] reconciliation required" },
+        channel: "slack",
+        to: "channel:C0A3C98HS48",
+        sessionKey: "agent:main:main",
+        cfg: {} as never,
+      });
+
+      expect(lastDeliveryPayload()).not.toHaveProperty("hookMetadata");
+    });
+
+    it("declares nothing outside Slack, where ask ids do not exist", async () => {
+      await routeReply({
+        payload: { text: "hello", replyToId: "1788479206.951729" },
+        channel: "telegram",
+        to: "chat-1",
+        sessionKey: SLACK_THREAD_SESSION,
+        cfg: {} as never,
+      });
+
+      expect(lastDeliveryPayload()).not.toHaveProperty("hookMetadata");
+    });
+  });
 });

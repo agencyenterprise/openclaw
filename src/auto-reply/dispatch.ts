@@ -11,6 +11,7 @@ import {
   measureDiagnosticsTimelineSpanSync,
 } from "../infra/diagnostics-timeline.js";
 import { isOutboundDeliveryError } from "../infra/outbound/deliver-types.js";
+import type { OutboundReplyPayload } from "../infra/outbound/payload-hook-metadata.js";
 import { logMessageReceived } from "../logging/diagnostic.js";
 import { hasOutboundReplyContent } from "../plugin-sdk/reply-payload.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
@@ -24,6 +25,7 @@ import { copyReplyPayloadMetadata, setReplyPayloadMetadata } from "./reply-paylo
 import type { CommandSessionMetadataChange } from "./reply/command-session-metadata.js";
 import { dispatchReplyFromConfig } from "./reply/dispatch-from-config.js";
 import type { DispatchFromConfigResult } from "./reply/dispatch-from-config.types.js";
+import { buildDispatchSendHookMetadata } from "./reply/dispatch-send-hook-metadata.js";
 import type {
   InternalGetReplyFromConfig,
   InternalGetReplyOptions,
@@ -370,18 +372,33 @@ function buildMessageSendingBeforeDeliver(
         return payload;
       }
 
+      const declared = (payload as OutboundReplyPayload).hookMetadata;
+      const hookMetadata = buildDispatchSendHookMetadata({
+        channelId: hookCtx.channelId,
+        replyTarget,
+        ...(finalized.SessionKey ? { sessionKey: finalized.SessionKey } : {}),
+        ...(payload.replyToId ? { replyToId: payload.replyToId } : {}),
+        ...(hookCtx.messageId ? { inboundMessageId: hookCtx.messageId } : {}),
+        ...(declared ? { declared } : {}),
+      });
+
       const result = await hookRunner.runMessageSending(
-        { content: payload.text, to: replyTarget },
+        { content: payload.text, to: replyTarget, metadata: { ...hookMetadata } },
         toPluginMessageContext(hookCtx),
       );
 
       if (result?.cancel) {
         return null;
       }
-      if (result?.content != null) {
-        return copyReplyPayloadMetadata(payload, { ...payload, text: result.content });
-      }
-      return payload;
+      // The declaration rides on the delivered payload because durable channel
+      // delivery runs `message_sending` again below here and has to land on the
+      // same send identity and the same obligation.
+      const delivered: OutboundReplyPayload = {
+        ...payload,
+        ...(result?.content != null ? { text: result.content } : {}),
+        hookMetadata,
+      };
+      return copyReplyPayloadMetadata(payload, delivered);
     },
   );
 }

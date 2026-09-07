@@ -266,6 +266,46 @@ async function runChunkedMatrixDelivery(params?: {
   return { sendMatrix, results };
 }
 
+async function deliverForMessageSendingHookMetadata(
+  payload: DeliverOutboundPayload,
+): Promise<Record<string, unknown>> {
+  hookMocks.runner.hasHooks.mockImplementation(
+    (hookName?: string) => hookName === "message_sending",
+  );
+  const sendText = vi.fn().mockResolvedValue({
+    channel: "matrix" as const,
+    messageId: "mx-hook-metadata",
+    roomId: "!room",
+  });
+  const sendMedia = vi.fn().mockResolvedValue({
+    channel: "matrix" as const,
+    messageId: "mx-hook-metadata-media",
+    roomId: "!room",
+  });
+  setActivePluginRegistry(
+    createTestRegistry([
+      {
+        pluginId: "matrix",
+        source: "test",
+        plugin: createOutboundTestPlugin({
+          id: "matrix",
+          outbound: { deliveryMode: "direct", sendText, sendMedia },
+        }),
+      },
+    ]),
+  );
+
+  await deliverOutboundPayloads({
+    cfg: {},
+    channel: "matrix",
+    to: "!room",
+    accountId: "acct-1",
+    payloads: [payload],
+  });
+
+  return requireMockCallArg(hookMocks.runner.runMessageSending, "message_sending hook");
+}
+
 async function deliverSingleMatrixForHookTest(params?: { sessionKey?: string }) {
   const sendMatrix = vi.fn().mockResolvedValue({ messageId: "m1", roomId: "!room:example" });
   await deliverOutboundPayloads({
@@ -5142,6 +5182,51 @@ describe("deliverOutboundPayloads", () => {
     };
     expect(ctx?.sessionKey).toBeUndefined();
     expect(ctx).not.toHaveProperty("sessionKey");
+  });
+
+  it("forwards payload-declared obligation metadata to the message_sending hook", async () => {
+    // The obligation half of outbound-dedupe reserves
+    // <channel>:<threadRootTs>:<obligationId>:v<responseVersion>. The canonical
+    // ask id is known by the reply path, not by delivery, so it can only reach
+    // the hook by riding on the payload. Key names are the hook's contract.
+    const event = await deliverForMessageSendingHookMetadata({
+      text: "hello",
+      hookMetadata: {
+        obligationId: "c09zz:1756900000.123456",
+        threadRootTs: "1756900000.123456",
+        responseVersion: 2,
+      },
+    });
+
+    expect(event.metadata).toMatchObject({
+      obligationId: "c09zz:1756900000.123456",
+      threadRootTs: "1756900000.123456",
+      responseVersion: 2,
+    });
+  });
+
+  it("keeps delivery-owned message_sending metadata when a payload declares its own", async () => {
+    const event = await deliverForMessageSendingHookMetadata({
+      text: "hello",
+      mediaUrls: ["https://example.com/a.png"],
+      hookMetadata: { obligationId: "c09zz:1756900000.123456" },
+    });
+
+    expect(event.metadata).toMatchObject({
+      channel: "matrix",
+      accountId: "acct-1",
+      mediaUrls: ["https://example.com/a.png"],
+    });
+  });
+
+  it("sends unchanged message_sending metadata for a payload that declares none", async () => {
+    const event = await deliverForMessageSendingHookMetadata({ text: "hello" });
+
+    expect(event.metadata).toEqual({
+      channel: "matrix",
+      accountId: "acct-1",
+      mediaUrls: [],
+    });
   });
 
   it("threads sessionKey into the message_sent hook context when session is provided", async () => {

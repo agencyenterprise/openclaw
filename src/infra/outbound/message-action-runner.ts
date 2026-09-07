@@ -17,6 +17,7 @@ import {
 } from "../../agents/tools/common.js";
 import type { SourceReplyDeliveryMode } from "../../auto-reply/get-reply-options.types.js";
 import type { ReplyPayload } from "../../auto-reply/reply-payload.js";
+import { resolveReplyObligationId } from "../../auto-reply/reply/reply-obligation.js";
 import { resolveResponsePrefixTemplate } from "../../auto-reply/reply/response-prefix-template.js";
 import { normalizeChatType, type ChatType } from "../../channels/chat-type.js";
 import type { InboundEventKind } from "../../channels/inbound-event/kind.js";
@@ -107,6 +108,7 @@ import {
   materializeMessagePresentationFallback,
 } from "./outbound-send-service.js";
 import { ensureOutboundSessionEntry, resolveOutboundSessionRoute } from "./outbound-session.js";
+import type { OutboundReplyPayload } from "./payload-hook-metadata.js";
 import {
   beginTerminalSourceReplyDelivery,
   cancelTerminalSourceReplyDelivery,
@@ -1252,6 +1254,47 @@ async function buildSendPayloadParts(params: {
 // `.test()` stays stateless; mirrors the variable shape in response-prefix-template.ts.
 const UNRESOLVED_PREFIX_VAR_PATTERN = /\{[a-zA-Z][a-zA-Z0-9.]*\}/;
 
+/**
+ * Names, on the outgoing payload, the ask this `message(action=send)` answers.
+ *
+ * Under `visibleReplies: "message_tool"` a tool send is the only way an answer
+ * reaches the channel, so it is the send that must declare the obligation the
+ * `outbound-dedupe` `message_sending` guard reserves. `replyToId` here must be
+ * the PRE-transport reply target: an implicit source reply carries the inbound
+ * ask ts, while the post-transport target has already been rewritten to the
+ * Slack thread root that every ask in the thread shares — deriving the id from
+ * the root makes each later answer look like a re-answer of the first.
+ *
+ * A caller that already declared an obligation keeps it.
+ */
+function declareSendObligationOnPayload(params: {
+  payload: ReplyPayload;
+  channel: ChannelId;
+  to: string;
+  sessionKey?: string;
+  replyToId?: string;
+  replyToIsExplicit: boolean;
+}): OutboundReplyPayload {
+  const payload: OutboundReplyPayload = params.payload;
+  if (payload.hookMetadata?.obligationId !== undefined) {
+    return payload;
+  }
+  const obligationId = resolveReplyObligationId({
+    channelId: params.channel,
+    to: params.to,
+    ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+    ...(params.replyToId
+      ? params.replyToIsExplicit
+        ? { replyToId: params.replyToId }
+        : { inboundMessageId: params.replyToId }
+      : {}),
+  });
+  if (!obligationId) {
+    return payload;
+  }
+  return { ...payload, hookMetadata: { ...payload.hookMetadata, obligationId } };
+}
+
 async function handleSendAction(ctx: ResolvedActionContext): Promise<MessageActionRunResult> {
   const {
     cfg,
@@ -1310,7 +1353,10 @@ async function handleSendAction(ctx: ResolvedActionContext): Promise<MessageActi
   }
 
   const replyToIsExplicit = Boolean(readStringParam(params, "replyTo"));
-  resolveAndApplyOutboundReplyToId(params, {
+  // Captured before `prepareOutboundMirrorRoute` runs the channel reply transport,
+  // which rewrites a Slack threaded reply onto the thread root. This value still
+  // names the single inbound ask, so it is what the obligation is derived from.
+  const preTransportReplyToId = resolveAndApplyOutboundReplyToId(params, {
     channel,
     toolContext: input.toolContext,
     matchesToolContextTarget: getChannelPlugin(channel)?.threading?.matchesToolContextTarget,
@@ -1408,6 +1454,15 @@ async function handleSendAction(ctx: ResolvedActionContext): Promise<MessageActi
     applySendPayloadPartsToActionParams(params, sendPayload);
   }
 
+  const deliveryPayload = declareSendObligationOnPayload({
+    payload: sendPayload.payload,
+    channel,
+    to,
+    ...(input.sessionKey ? { sessionKey: input.sessionKey } : {}),
+    ...(preTransportReplyToId ? { replyToId: preTransportReplyToId } : {}),
+    replyToIsExplicit,
+  });
+
   const send = await executeSendAction({
     ctx: {
       cfg,
@@ -1448,7 +1503,7 @@ async function handleSendAction(ctx: ResolvedActionContext): Promise<MessageActi
     },
     to,
     message: sendPayload.message,
-    payload: sendPayload.payload,
+    payload: deliveryPayload,
     mediaUrl: sendPayload.mediaUrl,
     mediaUrls: sendPayload.mediaUrls,
     buffer: readStringParam(params, "buffer", { trim: false }) ?? undefined,

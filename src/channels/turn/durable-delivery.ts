@@ -1,6 +1,5 @@
 // Durable final-reply delivery for inbound channel turns.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import type { ReplyPayload } from "../../auto-reply/reply-payload.js";
 import type { FinalizedMsgContext } from "../../auto-reply/templating.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { normalizeDeliverableOutboundChannel } from "../../infra/outbound/channel-resolution.js";
@@ -11,6 +10,7 @@ import {
   type OutboundDeliveryIntent,
   resolveOutboundDurableFinalDeliverySupport,
 } from "../../infra/outbound/deliver.js";
+import type { OutboundReplyPayload } from "../../infra/outbound/payload-hook-metadata.js";
 import { buildOutboundSessionContext } from "../../infra/outbound/session-context.js";
 import { deriveDurableFinalDeliveryRequirements } from "../message/capabilities.js";
 import { sendDurableMessageBatch } from "../message/send.js";
@@ -34,7 +34,12 @@ export type DurableInboundReplyDeliveryParams = DurableInboundReplyDeliveryOptio
   accountId?: string;
   agentId: string;
   ctxPayload: FinalizedMsgContext;
-  payload: ReplyPayload;
+  /**
+   * Carries `hookMetadata` through to `message_sending` in deliver.ts: the
+   * dispatcher declared the send's identity and obligation on the payload
+   * before delivery, and this is the only path that still holds that object.
+   */
+  payload: OutboundReplyPayload;
   info: ChannelDeliveryInfo;
 };
 

@@ -16,6 +16,7 @@ import { getLoadedChannelPlugin, normalizeChannelId } from "../../channels/plugi
 import { normalizeChatChannelId } from "../../channels/registry.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { formatErrorMessage } from "../../infra/errors.js";
+import type { OutboundReplyPayload } from "../../infra/outbound/payload-hook-metadata.js";
 import { buildOutboundSessionContext } from "../../infra/outbound/session-context.js";
 import { hasReplyPayloadContent } from "../../interactive/payload.js";
 import { normalizeAccountId } from "../../routing/account-id.js";
@@ -27,6 +28,7 @@ import type { OriginatingChannelType } from "../templating.js";
 import type { ReplyPayload } from "../types.js";
 import { normalizeReplyPayload } from "./normalize-reply.js";
 import type { ReplyDispatchKind } from "./reply-dispatcher.types.js";
+import { resolveReplyObligationId } from "./reply-obligation.js";
 import {
   formatBtwTextForExternalDelivery,
   shouldSuppressReasoningPayload,
@@ -253,9 +255,23 @@ export async function routeReply(params: RouteReplyParams): Promise<RouteReplyRe
     replyTransport && Object.hasOwn(replyTransport, "threadId")
       ? (replyTransport.threadId ?? null)
       : (threadId ?? null);
-  const deliveryPayload = {
+  // Declare the ask this reply answers so the outbound-dedupe message_sending
+  // guard reserves one answer per obligation. Only routing knows the id; below
+  // this call the payload is all delivery can see.
+  //
+  // The PRE-transport reply target is what names the ask: `resolvedReplyToId` has
+  // already been rewritten by Slack's reply transport to the thread root, and a
+  // thread root is shared by every ask in that thread.
+  const obligationId = resolveReplyObligationId({
+    channelId,
+    to,
+    ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+    ...(replyToId ? { replyToId } : {}),
+  });
+  const deliveryPayload: OutboundReplyPayload = {
     ...externalPayload,
     replyToId: resolvedReplyToId,
+    ...(obligationId ? { hookMetadata: { obligationId } } : {}),
   };
 
   try {

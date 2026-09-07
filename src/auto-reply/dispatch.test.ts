@@ -334,7 +334,10 @@ describe("withReplyDispatcher", () => {
       { kind: "final" },
     );
 
-    expect(payload).toEqual({ text: "sanitized reply" });
+    expect(payload).toEqual({
+      text: "sanitized reply",
+      hookMetadata: { sendNonce: expect.any(String) },
+    });
     const payloadWithMetadata = await dispatcherOptions.beforeDeliver(
       setReplyPayloadMetadata({ text: "original reply" }, { assistantMessageIndex: 3 }),
       { kind: "block" },
@@ -343,13 +346,156 @@ describe("withReplyDispatcher", () => {
       assistantMessageIndex: 3,
     });
     expect(runMessageSending).toHaveBeenCalledWith(
-      { content: "original reply", to: "whatsapp:+15551234567" },
+      {
+        content: "original reply",
+        to: "whatsapp:+15551234567",
+        metadata: { sendNonce: expect.any(String) },
+      },
       {
         channelId: "threads",
         accountId: "acct-1",
         conversationId: "conv-1",
       },
     );
+  });
+
+  it("names one send nonce per payload and carries it to delivery", async () => {
+    // Durable channel delivery runs `message_sending` a second time for this same
+    // payload, so the nonce has to reach it on the payload; without it the
+    // outbound-dedupe guard reads its own reservation as a duplicate and cancels.
+    const runMessageSending = vi.fn(
+      async (_event: { content: string; to: string; metadata?: Record<string, unknown> }) =>
+        undefined,
+    );
+    hoisted.getGlobalHookRunnerMock.mockReturnValue({
+      hasHooks: vi.fn((hookName?: string) => hookName === "message_sending"),
+      runMessageSending,
+    });
+    hoisted.createReplyDispatcherMock.mockReturnValueOnce(createDispatcher([]));
+    hoisted.dispatchReplyFromConfigMock.mockResolvedValueOnce({ text: "ok" });
+
+    await dispatchInboundMessageWithDispatcher({
+      ctx: buildTestCtx({ OriginatingTo: "space/AAA" }),
+      cfg: {} as OpenClawConfig,
+      dispatcherOptions: { deliver: async () => undefined },
+      replyResolver: async () => ({ text: "ok" }),
+    });
+
+    const beforeDeliver = requireReplyDispatcherOptions().beforeDeliver;
+    if (!beforeDeliver) {
+      throw new Error("expected beforeDeliver hook");
+    }
+    const first = (await beforeDeliver({ text: "first answer" }, { kind: "final" })) as {
+      hookMetadata?: { sendNonce?: string };
+    } | null;
+    const second = (await beforeDeliver({ text: "second answer" }, { kind: "final" })) as {
+      hookMetadata?: { sendNonce?: string };
+    } | null;
+
+    const firstNonce = first?.hookMetadata?.sendNonce;
+    const secondNonce = second?.hookMetadata?.sendNonce;
+    expect(firstNonce).toEqual(expect.any(String));
+    expect(secondNonce).toEqual(expect.any(String));
+    // One nonce per physical send: two payloads are two sends, not one.
+    expect(firstNonce).not.toBe(secondNonce);
+    // The hook saw exactly what the payload carries.
+    expect(runMessageSending.mock.calls[0]?.[0]).toMatchObject({
+      metadata: { sendNonce: firstNonce },
+    });
+  });
+
+  it("declares the ask a Slack dispatcher reply answers", async () => {
+    // Only the inbound context knows the ask id; below the dispatcher nothing can
+    // still derive it, so without this the obligation half of the outbound-dedupe
+    // guard never engages on the dispatcher path.
+    const runMessageSending = vi.fn(
+      async (_event: { content: string; to: string; metadata?: Record<string, unknown> }) =>
+        undefined,
+    );
+    hoisted.getGlobalHookRunnerMock.mockReturnValue({
+      hasHooks: vi.fn((hookName?: string) => hookName === "message_sending"),
+      runMessageSending,
+    });
+    hoisted.deriveInboundMessageHookContextMock.mockReturnValue({
+      channelId: "slack",
+      accountId: "acct-1",
+      conversationId: "channel:C0A3C98HS48",
+      isGroup: true,
+      to: "channel:C0A3C98HS48",
+    });
+    hoisted.createReplyDispatcherMock.mockReturnValueOnce(createDispatcher([]));
+    hoisted.dispatchReplyFromConfigMock.mockResolvedValueOnce({ text: "ok" });
+
+    await dispatchInboundMessageWithDispatcher({
+      ctx: buildTestCtx({
+        OriginatingTo: "channel:C0A3C98HS48",
+        SessionKey: "agent:main:slack:channel:c0a3c98hs48:thread:1788479558.561999",
+      }),
+      cfg: {} as OpenClawConfig,
+      dispatcherOptions: { deliver: async () => undefined },
+      replyResolver: async () => ({ text: "ok" }),
+    });
+
+    const beforeDeliver = requireReplyDispatcherOptions().beforeDeliver;
+    if (!beforeDeliver) {
+      throw new Error("expected beforeDeliver hook");
+    }
+    const delivered = (await beforeDeliver(
+      { text: "the capture is on the pod", replyToId: "1788479206.951729" },
+      { kind: "final" },
+    )) as { hookMetadata?: { obligationId?: string } } | null;
+
+    expect(delivered?.hookMetadata?.obligationId).toBe("C0A3C98HS48:1788479206.951729");
+    expect(runMessageSending.mock.calls[0]?.[0]).toMatchObject({
+      metadata: { obligationId: "C0A3C98HS48:1788479206.951729" },
+    });
+  });
+
+  it("names the ask from the inbound message, not the session thread root", async () => {
+    // The 2026-09-04 mute: three asks arrived in one long Slack thread, the
+    // payloads carried no replyToId, and the thread root stood in for all three
+    // ask ids. The second answer was then cancelled as a re-answer of the first.
+    const runMessageSending = vi.fn(
+      async (_event: { content: string; to: string; metadata?: Record<string, unknown> }) =>
+        undefined,
+    );
+    hoisted.getGlobalHookRunnerMock.mockReturnValue({
+      hasHooks: vi.fn((hookName?: string) => hookName === "message_sending"),
+      runMessageSending,
+    });
+    hoisted.deriveInboundMessageHookContextMock.mockReturnValue({
+      channelId: "slack",
+      accountId: "acct-1",
+      conversationId: "channel:C0AHSKBNDB6",
+      isGroup: true,
+      to: "channel:C0AHSKBNDB6",
+      messageId: "1788503106.311259",
+    });
+    hoisted.createReplyDispatcherMock.mockReturnValueOnce(createDispatcher([]));
+    hoisted.dispatchReplyFromConfigMock.mockResolvedValueOnce({ text: "ok" });
+
+    await dispatchInboundMessageWithDispatcher({
+      ctx: buildTestCtx({
+        OriginatingTo: "channel:C0AHSKBNDB6",
+        SessionKey: "agent:main:slack:channel:c0ahskbndb6:thread:1788473062.847669",
+      }),
+      cfg: {} as OpenClawConfig,
+      dispatcherOptions: { deliver: async () => undefined },
+      replyResolver: async () => ({ text: "ok" }),
+    });
+
+    const beforeDeliver = requireReplyDispatcherOptions().beforeDeliver;
+    if (!beforeDeliver) {
+      throw new Error("expected beforeDeliver hook");
+    }
+    const delivered = (await beforeDeliver(
+      { text: "on the disposition result" },
+      { kind: "final" },
+    )) as {
+      hookMetadata?: { obligationId?: string };
+    } | null;
+
+    expect(delivered?.hookMetadata?.obligationId).toBe("C0AHSKBNDB6:1788503106.311259");
   });
 
   it("runs reply_payload_sending hooks before inbound dispatcher delivery", async () => {
@@ -523,7 +669,10 @@ describe("withReplyDispatcher", () => {
       { kind: "final" },
     );
 
-    expect(payload).toEqual({ text: "sanitized plugin reply" });
+    expect(payload).toEqual({
+      text: "sanitized plugin reply",
+      hookMetadata: { sendNonce: expect.any(String) },
+    });
     expect(runReplyPayloadSending).toHaveBeenCalledWith(
       expect.objectContaining({
         payload: { text: "original reply" },
@@ -531,7 +680,11 @@ describe("withReplyDispatcher", () => {
       expect.anything(),
     );
     expect(runMessageSending).toHaveBeenCalledWith(
-      { content: "original reply + plugin", to: "telegram:chat-1" },
+      {
+        content: "original reply + plugin",
+        to: "telegram:chat-1",
+        metadata: { sendNonce: expect.any(String) },
+      },
       expect.objectContaining({ channelId: "threads" }),
     );
   });

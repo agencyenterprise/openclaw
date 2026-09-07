@@ -100,6 +100,11 @@ import {
   uniformOutboundAuditTerminals,
 } from "./outbound-audit.js";
 import {
+  toMessageSendingHookMetadata,
+  type OutboundPayloadHookMetadata,
+  type OutboundReplyPayload,
+} from "./payload-hook-metadata.js";
+import {
   createOutboundPayloadPlan,
   summarizeOutboundPayloadForTransport,
   type NormalizedOutboundPayload,
@@ -733,7 +738,7 @@ type DeliverOutboundPayloadsCoreParams = {
   channel: Exclude<OutboundChannel, "none">;
   to: string;
   accountId?: string;
-  payloads: ReplyPayload[];
+  payloads: OutboundReplyPayload[];
   replyToId?: string | null;
   replyToMode?: ReplyToMode;
   formatting?: OutboundDeliveryFormattingOptions;
@@ -1213,6 +1218,8 @@ async function applyMessageSendingHook(params: {
   enabled: boolean;
   payload: ReplyPayload;
   payloadSummary: NormalizedOutboundPayload;
+  /** Declared by the caller on the outbound payload, forwarded verbatim to the hook. */
+  declaredHookMetadata?: OutboundPayloadHookMetadata;
   to: string;
   channel: Exclude<OutboundChannel, "none">;
   accountId?: string;
@@ -1243,6 +1250,11 @@ async function applyMessageSendingHook(params: {
         replyToId: params.replyToId ?? undefined,
         threadId: params.threadId ?? undefined,
         metadata: {
+          // Declared payload metadata is merged under the delivery-owned keys:
+          // channel, accountId and mediaUrls describe what this send actually
+          // is, so a caller cannot redefine them and misreport the send to a
+          // hook that cancels on them.
+          ...toMessageSendingHookMetadata(params.declaredHookMetadata),
           channel: params.channel,
           accountId: params.accountId,
           mediaUrls: params.payloadSummary.mediaUrls,
@@ -2261,12 +2273,17 @@ async function deliverOutboundPayloadsCore(
       let deliveryPayload = replyHookResult.payload;
       payloadSummary = buildPayloadSummary(deliveryPayload);
 
+      // Read from the caller's payload: payload plan normalization rebuilds the
+      // delivery payload from known fields and drops the declaration.
+      const declaredHookMetadata = payloads[payloadIndex]?.hookMetadata;
+
       // Run message_sending plugin hook (may modify content or cancel)
       const hookResult = await applyMessageSendingHook({
         hookRunner,
         enabled: hasMessageSendingHooks,
         payload: deliveryPayload,
         payloadSummary,
+        declaredHookMetadata,
         to,
         channel,
         accountId,

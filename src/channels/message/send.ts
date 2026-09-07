@@ -16,6 +16,7 @@ import {
   type DeliverOutboundPayloadsParams,
   type OutboundDeliveryIntent,
 } from "../../infra/outbound/deliver.js";
+import type { OutboundReplyPayload } from "../../infra/outbound/payload-hook-metadata.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { createLiveMessageState, markLiveMessagePreviewUpdated } from "./live.js";
 import { createMessageReceiptFromOutboundResults } from "./receipt.js";
@@ -35,7 +36,10 @@ export type DurableMessageBatchSendParams = Omit<
   DeliverOutboundPayloadsParams,
   "abortSignal" | "onDeliveryIntent" | "payloads" | "queuePolicy"
 > & {
-  payloads: ReplyPayload[];
+  // Widened past ReplyPayload so a caller can declare `hookMetadata` on an
+  // inline payload literal. The rendered batch passes payload objects through by
+  // reference, so the declaration survives to `message_sending` in deliver.ts.
+  payloads: OutboundReplyPayload[];
   attempt?: number;
   signal?: AbortSignal;
   /** @deprecated Use `signal`. */
