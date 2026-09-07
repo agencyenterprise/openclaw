@@ -29,6 +29,35 @@
       "label": "Dreaming Model",
       "placeholder": "anthropic/claude-sonnet-4-6",
       "help": "Optional provider/model override for Dream Diary narrative subagent runs. Requires plugins.entries.memory-core.subagent.allowModelOverride."
+    },
+    "hindsight.enabled": {
+      "label": "Hindsight Recall",
+      "help": "Merge Hindsight long-term memory recall hits into memory_search results."
+    },
+    "hindsight.baseUrl": {
+      "label": "Hindsight URL",
+      "placeholder": "http://127.0.0.1:8888",
+      "help": "Base URL of the Hindsight API server."
+    },
+    "hindsight.bank": {
+      "label": "Hindsight Bank",
+      "placeholder": "openclaw",
+      "help": "Hindsight memory bank to recall from."
+    },
+    "hindsight.budget": {
+      "label": "Hindsight Budget",
+      "placeholder": "mid",
+      "help": "Recall effort: low, mid, or high."
+    },
+    "hindsight.timeoutMs": {
+      "label": "Hindsight Timeout (ms)",
+      "placeholder": "4000",
+      "help": "Per-request timeout; on timeout memory_search returns markdown hits only."
+    },
+    "hindsight.maxResults": {
+      "label": "Hindsight Max Results",
+      "placeholder": "8",
+      "help": "Upper bound on Hindsight hits merged into one memory_search."
     }
   },
   "configSchema": {
@@ -197,6 +226,39 @@
                 }
               }
             }
+          }
+        }
+      },
+      "hindsight": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "baseUrl": {
+            "type": "string",
+            "default": "http://127.0.0.1:8888"
+          },
+          "bank": {
+            "type": "string",
+            "default": "openclaw"
+          },
+          "budget": {
+            "type": "string",
+            "enum": ["low", "mid", "high"],
+            "default": "mid"
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 4000
+          },
+          "maxResults": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 8
           }
         }
       }

@@ -23,6 +23,20 @@ import {
   resolveMemoryDeepDreamingConfig,
 } from "openclaw/plugin-sdk/memory-core-host-status";
 import { asRecord } from "./dreaming-shared.js";
+import {
+  HINDSIGHT_PATH_PREFIX,
+  HindsightError,
+  isHindsightSearchResult,
+  mergeHindsightSearchResults,
+  parseHindsightMemoryId,
+  readHindsightMemory,
+  recallHindsightMemoriesSafely,
+  resolveHindsightConfig,
+  warnHindsightFailureThrottled,
+  type HindsightConfig,
+  type HindsightRecallOutcome,
+  type HindsightSearchResult,
+} from "./hindsight.js";
 import type { MemoryCoreAcquireLocalService } from "./memory/embedding-local-service.js";
 import {
   DEFAULT_MEMORY_SEARCH_TIMEOUT_MS,
@@ -32,6 +46,7 @@ import {
   type MemorySearchDeadlineAction,
   type MemorySearchDeadlineControlOptions,
 } from "./memory/search-deadline.js";
+import { mergeRankedStreamsByScore } from "./search-merge.js";
 import { filterMemorySearchHitsBySessionVisibility } from "./session-search-visibility.js";
 import { recordShortTermRecalls } from "./short-term-promotion.js";
 import {
@@ -169,34 +184,6 @@ function buildPausedMemoryIndexUnavailableResult(reason: string) {
   });
 }
 
-function mergeRankedMemorySearchToolStreams(
-  memoryResults: MemorySearchToolResult[],
-  supplementResults: MemorySearchToolResult[],
-): MemorySearchToolResult[] {
-  const merged: MemorySearchToolResult[] = [];
-  let memoryIndex = 0;
-  let supplementIndex = 0;
-  // Each backend owns its ranking. Memory scores intentionally omit some
-  // precedence facts, so compare only stream heads and never reorder a stream.
-  while (memoryIndex < memoryResults.length && supplementIndex < supplementResults.length) {
-    const memory = memoryResults[memoryIndex];
-    const supplement = supplementResults[supplementIndex];
-    if ((memory?.score ?? 0) >= (supplement?.score ?? 0)) {
-      if (memory) {
-        merged.push(memory);
-      }
-      memoryIndex += 1;
-    } else {
-      if (supplement) {
-        merged.push(supplement);
-      }
-      supplementIndex += 1;
-    }
-  }
-  merged.push(...memoryResults.slice(memoryIndex), ...supplementResults.slice(supplementIndex));
-  return merged;
-}
-
 function mergeMemorySearchCorpusResults(params: {
   memoryResults: MemorySearchToolResult[];
   supplementResults: MemorySearchToolResult[];
@@ -206,10 +193,7 @@ function mergeMemorySearchCorpusResults(params: {
   const memoryResults = params.memoryResults;
   const supplementResults = params.supplementResults;
   if (!params.balanceCorpora || memoryResults.length === 0 || supplementResults.length === 0) {
-    return mergeRankedMemorySearchToolStreams(memoryResults, supplementResults).slice(
-      0,
-      params.maxResults,
-    );
+    return mergeRankedStreamsByScore(memoryResults, supplementResults).slice(0, params.maxResults);
   }
 
   const perCorpusCap = Math.ceil(params.maxResults / 2);
@@ -228,10 +212,122 @@ function mergeMemorySearchCorpusResults(params: {
     }
   }
 
-  return mergeRankedMemorySearchToolStreams(
+  return mergeRankedStreamsByScore(
     memoryResults.slice(0, memoryTake),
     supplementResults.slice(0, supplementTake),
   ).slice(0, params.maxResults);
+}
+
+type MemorySearchUnavailableResult = ReturnType<typeof buildMemorySearchUnavailableResult>;
+
+type MarkdownSourceStatus = {
+  hits: number;
+  error?: string;
+  warning?: string;
+  action?: string;
+};
+
+type HindsightSourceStatus = {
+  enabled: boolean;
+  hits: number;
+  fetched?: number;
+  ms?: number;
+  error?: string;
+  code?: string;
+  abandoned?: true;
+};
+
+/** Provenance block returned on every memory_search payload. `hits` counts returned results. */
+type MemorySearchSources = {
+  markdown: MarkdownSourceStatus;
+  hindsight: HindsightSourceStatus;
+};
+
+/** A recall promise observed at creation so it can never reject unhandled. */
+type SettledHindsightRecall =
+  | { ok: true; outcome: HindsightRecallOutcome }
+  | { ok: false; error: unknown };
+
+function shouldQueryHindsight(requestedCorpus: string | undefined): boolean {
+  return requestedCorpus !== "wiki" && requestedCorpus !== "sessions";
+}
+
+function observeHindsightRecall(
+  recall: Promise<HindsightRecallOutcome>,
+): Promise<SettledHindsightRecall> {
+  return recall.then(
+    (outcome) => ({ ok: true, outcome }),
+    (error: unknown) => ({ ok: false, error }),
+  );
+}
+
+function countHindsightResults(results: readonly unknown[]): number {
+  return results.filter(isHindsightSearchResult).length;
+}
+
+function buildMemorySearchSources(params: {
+  results: readonly unknown[];
+  markdownFailure?: MemorySearchUnavailableResult;
+  hindsightConfig: HindsightConfig;
+  hindsight: HindsightRecallOutcome | undefined;
+}): MemorySearchSources {
+  const hindsightHits = countHindsightResults(params.results);
+  const markdown: MarkdownSourceStatus = params.markdownFailure
+    ? {
+        hits: 0,
+        error: params.markdownFailure.error,
+        warning: params.markdownFailure.warning,
+        action: params.markdownFailure.action,
+      }
+    : { hits: params.results.length - hindsightHits };
+  const hindsight: HindsightSourceStatus = params.hindsight
+    ? {
+        enabled: true,
+        hits: hindsightHits,
+        fetched: params.hindsight.fetched,
+        ms: params.hindsight.ms,
+        ...(params.hindsight.error ? { error: params.hindsight.error } : {}),
+        ...(params.hindsight.code ? { code: params.hindsight.code } : {}),
+        ...(params.hindsight.abandoned ? { abandoned: true } : {}),
+      }
+    : { enabled: params.hindsightConfig.enabled, hits: 0 };
+  return { markdown, hindsight };
+}
+
+async function readHindsightMemoryResult(params: {
+  cfg: OpenClawConfig;
+  relPath: string;
+  id: string;
+  callerSignal?: AbortSignal;
+}) {
+  const config = resolveHindsightConfig(params.cfg);
+  if (!config.enabled) {
+    return {
+      path: params.relPath,
+      text: "",
+      disabled: true,
+      code: "disabled",
+      error: "hindsight memory is disabled",
+    };
+  }
+  try {
+    return await readHindsightMemory({ config, id: params.id, callerSignal: params.callerSignal });
+  } catch (error) {
+    if (params.callerSignal?.aborted) {
+      throw resolveMemorySearchAbortError(params.callerSignal);
+    }
+    if (!(error instanceof HindsightError)) {
+      throw error;
+    }
+    warnHindsightFailureThrottled({ operation: "get", config, error });
+    return {
+      path: params.relPath,
+      text: "",
+      code: error.code,
+      error: error.message,
+      ...(error.code === "not_found" ? { notFound: true } : { unavailable: true }),
+    };
+  }
 }
 
 function isClosedMemoryStoreError(error: unknown): boolean {
@@ -439,7 +535,7 @@ export function createMemorySearchTool(options: {
     label: "Memory Search",
     name: "memory_search",
     description:
-      "Mandatory recall step: semantically search MEMORY.md + memory/*.md (and optional session transcripts) before answering questions about prior work, decisions, dates, people, preferences, or todos. Optional `corpus=wiki` or `corpus=all` also searches registered compiled-wiki supplements. `corpus=memory` restricts hits to indexed memory files (excludes session transcript chunks from ranking). `corpus=sessions` restricts hits to indexed session transcripts (same visibility rules as session history tools). If response has disabled=true, memory retrieval is unavailable; you must tell the user and include the warning/action guidance.",
+      "Mandatory recall step: semantically search MEMORY.md + memory/*.md (and optional session transcripts) before answering questions about prior work, decisions, dates, people, preferences, or todos. When Hindsight long-term memory is enabled, its hits (source=hindsight, path=hindsight:<id>) are merged into the results; read one in full with memory_get path=hindsight:<id>. Every response carries `sources` (provenance per backend: returned hit counts, `fetched` for Hindsight, plus any backend error). Optional `corpus=wiki` or `corpus=all` also searches registered compiled-wiki supplements. `corpus=memory` restricts hits to indexed memory files (excludes session transcript chunks from ranking). `corpus=sessions` restricts hits to indexed session transcripts (same visibility rules as session history tools). If response has disabled=true, memory retrieval is unavailable; you must tell the user and include the warning/action guidance.",
     parameters: MemorySearchSchema,
     execute:
       ({ cfg, agentId }) =>
@@ -492,12 +588,62 @@ export function createMemorySearchTool(options: {
             parentSignal: callerSignal,
             run: task,
           });
+        const hindsightConfig = resolveHindsightConfig(cfg);
+        const hindsightAbandon = new AbortController();
+        // Started before the markdown search so both backends run in parallel.
+        // Observed at creation: a rejection (caller cancellation) is never unhandled.
+        const hindsightRecall =
+          hindsightConfig.enabled && shouldQueryHindsight(requestedCorpus)
+            ? observeHindsightRecall(
+                recallHindsightMemoriesSafely({
+                  config: hindsightConfig,
+                  query,
+                  maxResults,
+                  cancellation: { callerSignal, abandonSignal: hindsightAbandon.signal },
+                }),
+              )
+            : undefined;
+        const throwIfCallerAborted = () => {
+          if (callerSignal?.aborted) {
+            throw resolveMemorySearchAbortError(callerSignal);
+          }
+        };
+        const settleHindsight = async (): Promise<HindsightRecallOutcome | undefined> => {
+          throwIfCallerAborted();
+          if (!hindsightRecall) {
+            return undefined;
+          }
+          const settled = await hindsightRecall;
+          throwIfCallerAborted();
+          if (!settled.ok) {
+            throw settled.error;
+          }
+          return settled.outcome;
+        };
+        // Silent cancellation for paths that will not use Hindsight hits.
+        const abandonHindsight = () => hindsightAbandon.abort();
+        const resolveMarkdownFailureResult = async (unavailable: MemorySearchUnavailableResult) => {
+          const hindsight = await settleHindsight();
+          const results = hindsight?.results ?? [];
+          const sources = buildMemorySearchSources({
+            results,
+            markdownFailure: unavailable,
+            hindsightConfig,
+            hindsight,
+          });
+          if (results.length === 0) {
+            return jsonResult({ ...unavailable, sources });
+          }
+          return jsonResult({ results, sources });
+        };
         const runMemorySearchTool = async () => {
           const toolStartedAt = Date.now();
           const shouldQuerySupplements = requestedCorpus === "wiki" || requestedCorpus === "all";
           const shouldQueryMemory = requestedCorpus !== "wiki" && !cooldown;
           if (cooldown && !shouldQuerySupplements) {
-            return jsonResult(buildMemorySearchUnavailableResult(cooldown.error));
+            return await resolveMarkdownFailureResult(
+              buildMemorySearchUnavailableResult(cooldown.error),
+            );
           }
           const memoryManagerPurpose = options.oneShotCliRun ? "cli" : undefined;
           const memoryManagersToClose = new Set<ActiveMemoryManagerContext["manager"]>();
@@ -540,7 +686,9 @@ export function createMemorySearchTool(options: {
                 cooldownKey,
                 memory.error ?? "memory search unavailable",
               );
-              return jsonResult(buildMemorySearchUnavailableResult(memory.error));
+              return await resolveMarkdownFailureResult(
+                buildMemorySearchUnavailableResult(memory.error),
+              );
             }
 
             const citationsMode = resolveMemoryCitationsMode(cfg);
@@ -732,7 +880,7 @@ export function createMemorySearchTool(options: {
                 };
               });
               if (pausedIndexIdentityReason) {
-                return jsonResult(
+                return await resolveMarkdownFailureResult(
                   buildPausedMemoryIndexUnavailableResult(pausedIndexIdentityReason),
                 );
               }
@@ -757,12 +905,21 @@ export function createMemorySearchTool(options: {
             // Wiki and memory scores use incomparable scales, so corpus=all first
             // balances candidate selection and then backfills any unused slots.
             const effectiveMax = Math.max(1, maxResults ?? 10);
-            const results = mergeMemorySearchCorpusResults({
+            const corpusResults = mergeMemorySearchCorpusResults({
               memoryResults: surfacedMemoryResults,
               supplementResults,
               maxResults: effectiveMax,
               balanceCorpora: requestedCorpus === "all",
             });
+            const hindsight = await settleHindsight();
+            const results: Array<MemorySearchToolResult | HindsightSearchResult> = hindsight
+              ? mergeHindsightSearchResults({
+                  markdownResults: corpusResults,
+                  hindsightResults: hindsight.results,
+                  maxResults: effectiveMax,
+                })
+              : corpusResults;
+            const sources = buildMemorySearchSources({ results, hindsightConfig, hindsight });
             if (searchDebug) {
               const finalToolMs = Math.max(0, Date.now() - toolStartedAt);
               searchDebug = {
@@ -779,6 +936,7 @@ export function createMemorySearchTool(options: {
               citations: citationsMode,
               mode: searchMode,
               debug: searchDebug,
+              sources,
             });
           } finally {
             cleanupStarted = true;
@@ -796,14 +954,22 @@ export function createMemorySearchTool(options: {
             throw resolveMemorySearchAbortError(callerSignal);
           }
           const unavailablePhase = failedUnavailablePhase ?? activeUnavailablePhase;
+          const markdownFailed = unavailablePhase === "memory";
           const shouldRecordCooldown =
-            requestedCorpus !== "wiki" &&
-            (requestedCorpus !== "all" || unavailablePhase === "memory");
+            requestedCorpus !== "wiki" && (requestedCorpus !== "all" || markdownFailed);
           const message = formatErrorMessage(error);
           if (shouldRecordCooldown) {
             recordMemorySearchToolCooldown(cooldownKey, message);
           }
-          return jsonResult(buildMemorySearchUnavailableResult(message));
+          // Only a markdown failure is worth waiting on Hindsight for; any
+          // other failure stops the recall now and uses what already arrived.
+          if (!markdownFailed) {
+            abandonHindsight();
+          }
+          return await resolveMarkdownFailureResult(buildMemorySearchUnavailableResult(message));
+        } finally {
+          // No-op when already settled; stops a recall no path will consume.
+          abandonHindsight();
         }
       },
   });
@@ -822,11 +988,11 @@ export function createMemoryGetTool(options: {
     label: "Memory Get",
     name: "memory_get",
     description:
-      "Safe exact excerpt read from MEMORY.md or memory/*.md. Defaults to a bounded excerpt when lines are omitted, includes truncation/continuation info when more content exists, and `corpus=wiki` reads from registered compiled-wiki supplements.",
+      "Safe exact excerpt read from MEMORY.md or memory/*.md. Defaults to a bounded excerpt when lines are omitted, includes truncation/continuation info when more content exists, and `corpus=wiki` reads from registered compiled-wiki supplements. `path=hindsight:<id>` returns the full text of a Hindsight memory surfaced by memory_search; on failure the payload carries `code` (disabled, not_found, timeout, http_<status>, parse_error, unreachable, id_mismatch).",
     parameters: MemoryGetSchema,
     execute:
       ({ cfg, agentId }) =>
-      async (_toolCallId, params) => {
+      async (_toolCallId, params, callerSignal) => {
         const rawParams = asToolParamsRecord(params);
         const relPath = readStringParam(rawParams, "path", { required: true });
         const from = readPositiveIntegerParam(rawParams, "from");
@@ -836,6 +1002,26 @@ export function createMemoryGetTool(options: {
           | "wiki"
           | "all"
           | undefined;
+        if (relPath.startsWith(HINDSIGHT_PATH_PREFIX)) {
+          const hindsightMemoryId = parseHindsightMemoryId(relPath);
+          if (!hindsightMemoryId) {
+            return jsonResult({
+              path: relPath,
+              text: "",
+              code: "parse_error",
+              unavailable: true,
+              error: "Hindsight path contains no memory id",
+            });
+          }
+          return jsonResult(
+            await readHindsightMemoryResult({
+              cfg,
+              relPath,
+              id: hindsightMemoryId,
+              callerSignal,
+            }),
+          );
+        }
         const { readAgentMemoryFile, resolveMemoryBackendConfig } = await loadMemoryToolRuntime();
         if (requestedCorpus === "wiki") {
           const supplement = await getSupplementMemoryReadResult({

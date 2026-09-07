@@ -405,6 +405,10 @@ describe("memory tools", () => {
       mode: undefined,
       model: undefined,
       provider: undefined,
+      sources: {
+        markdown: { hits: 1 },
+        hindsight: { enabled: false, hits: 0 },
+      },
     });
     expect(getMemorySearchManagerMockCalls()).toBe(0);
   });

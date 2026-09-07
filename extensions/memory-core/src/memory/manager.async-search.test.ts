@@ -1,6 +1,10 @@
 // Memory Core tests cover manager.async search plugin behavior.
 import { describe, expect, it, vi } from "vitest";
-import { awaitPendingManagerWork, startAsyncSearchSync } from "./manager-async-state.js";
+import {
+  awaitPendingManagerWork,
+  SEARCH_SYNC_WAIT_MS,
+  startAsyncSearchSync,
+} from "./manager-async-state.js";
 import { MemoryIndexManager } from "./manager.js";
 
 describe("memory search async sync", () => {
@@ -127,6 +131,76 @@ describe("memory search async sync", () => {
     });
 
     expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("stops waiting on a slow sync but still lets it finish and report failures", async () => {
+    vi.useFakeTimers();
+    try {
+      const onError = vi.fn();
+      const syncError = new Error("sync failed");
+      let failSync = () => {};
+      const syncMock = vi.fn(
+        async () =>
+          await new Promise<void>((_resolve, reject) => {
+            failSync = () => reject(syncError);
+          }),
+      );
+
+      let waited = false;
+      const pending = startAsyncSearchSync({
+        enabled: true,
+        dirty: true,
+        sessionsDirty: false,
+        sync: syncMock,
+        onError,
+      }).then(() => {
+        waited = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(SEARCH_SYNC_WAIT_MS - 1);
+      expect(waited).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(waited).toBe(true);
+      expect(onError).not.toHaveBeenCalled();
+
+      // The sync was never cancelled, so a later failure still reaches the handler.
+      failSync();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onError).toHaveBeenCalledWith(syncError);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns as soon as a sync inside the wait bound settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const syncMock = vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, SEARCH_SYNC_WAIT_MS / 2);
+        });
+      });
+
+      let waited = false;
+      const pending = startAsyncSearchSync({
+        enabled: true,
+        dirty: false,
+        sessionsDirty: true,
+        sync: syncMock,
+        onError: vi.fn(),
+      }).then(() => {
+        waited = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(SEARCH_SYNC_WAIT_MS / 2);
+      await pending;
+      expect(waited).toBe(true);
+      expect(syncMock).toHaveBeenCalledWith({ reason: "search" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("skips background search sync when search-triggered sync is disabled", async () => {

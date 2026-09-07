@@ -49,15 +49,15 @@ export function createAutoCitationsMemorySearchTool(agentSessionKey: string) {
   });
 }
 
-export function expectUnavailableMemorySearchDetails(
-  details: unknown,
-  params: {
-    error: string;
-    warning: string;
-    action: string;
-  },
-) {
-  expect(details).toEqual({
+type UnavailableMemorySearchParams = {
+  error: string;
+  warning: string;
+  action: string;
+};
+
+/** The bare payload produced by buildMemorySearchUnavailableResult. */
+export function buildExpectedUnavailableMemorySearchResult(params: UnavailableMemorySearchParams) {
+  return {
     results: [],
     disabled: true,
     unavailable: true,
@@ -68,6 +68,25 @@ export function expectUnavailableMemorySearchDetails(
       warning: params.warning,
       action: params.action,
       error: params.error,
+    },
+  };
+}
+
+/** The tool payload: the bare unavailable result plus per-backend `sources`. */
+export function expectUnavailableMemorySearchDetails(
+  details: unknown,
+  params: UnavailableMemorySearchParams,
+) {
+  expect(details).toEqual({
+    ...buildExpectedUnavailableMemorySearchResult(params),
+    sources: {
+      markdown: {
+        hits: 0,
+        error: params.error,
+        warning: params.warning,
+        action: params.action,
+      },
+      hindsight: { enabled: false, hits: 0 },
     },
   });
 }

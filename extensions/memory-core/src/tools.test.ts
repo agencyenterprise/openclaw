@@ -31,6 +31,7 @@ import {
 } from "./tools.shared.js";
 import {
   asOpenClawConfig,
+  buildExpectedUnavailableMemorySearchResult,
   createMemorySearchToolOrThrow,
   expectUnavailableMemorySearchDetails,
 } from "./tools.test-helpers.js";
@@ -282,11 +283,13 @@ describe("memory_search unavailable payloads", () => {
       action: "custom action",
     });
 
-    expectUnavailableMemorySearchDetails(result, {
-      error: "missing node:sqlite",
-      warning: "custom warning",
-      action: "custom action",
-    });
+    expect(result).toEqual(
+      buildExpectedUnavailableMemorySearchResult({
+        error: "missing node:sqlite",
+        warning: "custom warning",
+        action: "custom action",
+      }),
+    );
   });
 
   it("returns explicit unavailable metadata for non-quota failures", async () => {
