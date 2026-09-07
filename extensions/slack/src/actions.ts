@@ -8,6 +8,7 @@ import { resolveSlackAccount } from "./accounts.js";
 import type { SlackAuthoredTextPlacement } from "./authored-text.js";
 import { buildSlackBlocksFallbackText } from "./blocks-fallback.js";
 import { validateSlackBlocksArray } from "./blocks-input.js";
+import { stripHcomBridgeHarnessText, stripHcomBridgeHarnessTextDeep } from "./bridge-marker.js";
 import { createSlackLookupClient, getSlackWriteClient } from "./client.js";
 import { buildSlackEditTextPayload } from "./edit-text.js";
 import { SLACK_EDIT_TEXT_LIMIT } from "./limits.js";
@@ -355,8 +356,13 @@ export async function editSlackMessage(
   opts: SlackActionClientOpts & { blocks?: (Block | KnownBlock)[] } = {},
 ) {
   const client = await getClient(opts, "write");
-  const blocks = opts.blocks == null ? undefined : validateSlackBlocksArray(opts.blocks);
-  const editText = buildSlackEditTextPayload(content, blocks);
+  // An edit is a Slack send too, and chat.update does not go through
+  // buildSlackPostMessagePayload (see bridge-marker.ts).
+  const blocks =
+    opts.blocks == null
+      ? undefined
+      : stripHcomBridgeHarnessTextDeep(validateSlackBlocksArray(opts.blocks));
+  const editText = buildSlackEditTextPayload(stripHcomBridgeHarnessText(content), blocks);
   const hasNativeData = hasSlackNativeDataBlock(blocks);
   const nativeFallbackText = hasNativeData
     ? appendSlackNativeDataFallbackText(editText, blocks)

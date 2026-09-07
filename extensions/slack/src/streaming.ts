@@ -15,6 +15,7 @@ import type { AnyChunk, MessageMetadata } from "@slack/types";
 import type { WebClient } from "@slack/web-api";
 import type { ChatStreamer } from "@slack/web-api/dist/chat-stream.js";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
+import { stripHcomBridgeHarnessText, stripHcomBridgeHarnessTextDeep } from "./bridge-marker.js";
 import type { SlackSendIdentity } from "./send.js";
 
 // ---------------------------------------------------------------------------
@@ -191,7 +192,11 @@ export async function startSlackStream(
  * Append markdown text to an active Slack stream.
  */
 export async function appendSlackStream(params: AppendSlackStreamParams): Promise<void> {
-  const { session, text, chunks } = params;
+  // A stream frame is a Slack send too, and it does not go through
+  // buildSlackPostMessagePayload (see bridge-marker.ts).
+  const { session } = params;
+  const text = params.text ? stripHcomBridgeHarnessText(params.text) : params.text;
+  const chunks = params.chunks ? stripHcomBridgeHarnessTextDeep(params.chunks) : params.chunks;
 
   if (session.stopped) {
     logVerbose("slack-stream: attempted to append to a stopped stream, ignoring");
@@ -268,7 +273,9 @@ type StopSlackStreamResult = {
 export async function stopSlackStream(
   params: StopSlackStreamParams,
 ): Promise<StopSlackStreamResult> {
-  const { session, text, chunks, metadata } = params;
+  const { session, metadata } = params;
+  const text = params.text ? stripHcomBridgeHarnessText(params.text) : params.text;
+  const chunks = params.chunks ? stripHcomBridgeHarnessTextDeep(params.chunks) : params.chunks;
 
   if (session.stopped) {
     logVerbose("slack-stream: stream already stopped, ignoring duplicate stop");
