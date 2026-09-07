@@ -1432,6 +1432,7 @@ Batches rapid text-only messages from the same sender into a single agent turn. 
 
 - `messages.messagePrefix`: prefix text prepended to inbound user messages before they reach the agent runtime. Use sparingly for channel context markers.
 - `messages.visibleReplies`: controls visible source replies across direct, group, and channel conversations (`"message_tool"` requires `message(action=send)` for visible output; `"automatic"` posts normal replies as before).
+- `messages.autoDeliverPrivateFinal`: delivers the assistant final text to the source chat when a `"message_tool"` turn wrote a substantive reply but never called `message(action=send)` (default `true`; set `false` to fall back to the one-shot recovery re-prompt).
 - `messages.usageTemplate` / `messages.responseUsage`: custom `/usage` footer template and default per-reply usage mode (`off | tokens | full`, plus legacy `on` alias for `tokens`).
 - `messages.groupChat.mentionPatterns` / `historyLimit`: group-message mention triggers and history window sizing.
 - `messages.suppressToolErrors`: when `true`, suppresses `⚠️` tool-error warnings shown to the user (the agent still sees errors in context and can retry). Default: `false`.

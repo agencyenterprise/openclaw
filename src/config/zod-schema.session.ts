@@ -151,6 +151,7 @@ export const MessagesSchema = z
   .object({
     messagePrefix: z.string().optional(),
     visibleReplies: VisibleRepliesSchema.optional(),
+    autoDeliverPrivateFinal: z.boolean().optional(),
     responsePrefix: z.string().optional(),
     usageTemplate: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
     responseUsage: z

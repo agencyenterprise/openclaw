@@ -112,6 +112,15 @@ export type MessagesConfig = {
    */
   visibleReplies?: "automatic" | "message_tool";
   /**
+   * Delivers the assistant's own final text to the source chat when a
+   * message-tool-only turn produced a substantive reply but never called
+   * `message(action=send)`.
+   *
+   * Default: true. Set false to fall back to the one-shot recovery re-prompt
+   * that asks the model to deliver the reply itself.
+   */
+  autoDeliverPrivateFinal?: boolean;
+  /**
    * Prefix auto-added to all outbound replies.
    *
    * - string: explicit prefix (may include template variables)

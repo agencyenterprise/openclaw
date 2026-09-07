@@ -1012,6 +1012,7 @@ export const FIELD_LABELS: Record<string, string> = {
   messages: "Messages",
   "messages.messagePrefix": "Inbound Message Prefix",
   "messages.visibleReplies": "Visible Replies",
+  "messages.autoDeliverPrivateFinal": "Auto-Deliver Private Final",
   "messages.responsePrefix": "Outbound Response Prefix",
   "messages.usageTemplate": "Usage Footer Template",
   "messages.responseUsage": "Default Usage Footer Mode",

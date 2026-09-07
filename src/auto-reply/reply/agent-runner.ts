@@ -167,8 +167,10 @@ import { incrementRunCompactionCount, persistRunSessionUsage } from "./session-r
 import { resolveSourceReplyVisibilityPolicy } from "./source-reply-delivery-mode.js";
 import { buildChannelSourceTurnId, readChannelSourceTurnId } from "./source-turn-id.js";
 import {
+  buildAutoDeliveredPrivateFinalPayload,
   buildStrandedReplyDeliveryFailurePayload,
   buildStrandedReplyRetryFollowupRun,
+  shouldAutoDeliverStrandedPrivateFinal,
 } from "./stranded-reply-recovery.js";
 import { createTypingSignaler } from "./typing-mode.js";
 import type { TypingController } from "./typing.js";
@@ -2880,6 +2882,23 @@ export async function runReplyAgent(params: {
       if (isStrandedReply || retryMissingSourceDelivery) {
         if (isStrandedReplyRetryRun) {
           finalPayloads = [...finalPayloads, buildStrandedReplyDeliveryFailurePayload()];
+        } else if (
+          shouldAutoDeliverStrandedPrivateFinal({
+            cfg,
+            isStrandedReply,
+            isStrandedReplyRetryRun,
+            isHeartbeat,
+            isRoomEvent,
+          })
+        ) {
+          // The model already wrote the answer and only missed the delivery tool,
+          // so send that exact text instead of spending a turn re-prompting for it.
+          // The marked copy is appended (not the original payloads) because those
+          // also carry verbose/status/usage metadata that must stay private.
+          finalPayloads = [
+            ...finalPayloads,
+            buildAutoDeliveredPrivateFinalPayload(assistantFinalText),
+          ];
         } else {
           const retryEnqueued = enqueueFollowupRun(
             queueKey,

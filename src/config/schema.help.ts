@@ -1973,6 +1973,8 @@ export const FIELD_HELP: Record<string, string> = {
     "Prefix text prepended to inbound user messages before they are handed to the agent runtime. Use this sparingly for channel context markers and keep it stable across sessions.",
   "messages.visibleReplies":
     'Controls visible source replies across direct, group, and channel conversations. "message_tool" requires message(action=send) for visible output and keeps normal final text private. "automatic" posts normal replies as before.',
+  "messages.autoDeliverPrivateFinal":
+    'Delivers the assistant final text to the source chat when a "message_tool" turn wrote a substantive reply but never called message(action=send). Default: true. Set false to fall back to the one-shot recovery re-prompt that asks the model to deliver the reply itself.',
   "messages.responsePrefix":
     "Prefix text prepended to outbound assistant replies before sending to channels. Use for lightweight branding/context tags and avoid long prefixes that reduce content density.",
   "messages.usageTemplate":
