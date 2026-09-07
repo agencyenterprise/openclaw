@@ -124,6 +124,13 @@ const BotLoopProtectionSchema = z
     cooldownSeconds: z.number().int().positive().optional(),
   })
   .strict();
+const SlackReplyPresentationSchema = z
+  .object({
+    mode: z.enum(["structured-only", "always", "never"]).optional(),
+    maxVisibleChars: z.number().int().positive().optional(),
+    maxListItems: z.number().int().positive().optional(),
+  })
+  .strict();
 
 const TelegramErrorPolicySchema = z.enum(["always", "once", "silent"]).optional();
 const TelegramCommandNamePattern = /^[a-z0-9_]{1,32}$/;
@@ -1062,6 +1069,7 @@ const SlackAccountSchema = z
     responsePrefix: z.string().optional(),
     ackReaction: z.string().optional(),
     typingReaction: z.string().optional(),
+    presentation: SlackReplyPresentationSchema.optional(),
   })
   .strict()
   .superRefine(() => {

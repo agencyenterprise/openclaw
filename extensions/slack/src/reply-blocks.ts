@@ -22,6 +22,10 @@ import {
 } from "./blocks-render.js";
 import { markdownToSlackMrkdwnChunks } from "./format.js";
 import {
+  renderSlackMarkdownPresentation,
+  type SlackReplyPresentationSettings,
+} from "./markdown-presentation.js";
+import {
   appendSlackNativeDataFallbackText,
   buildSlackNativeDataAccessibilityText,
   hasSlackNativeDataBlock,
@@ -144,6 +148,7 @@ type SlackReplyRenderPlan =
 export function resolveSlackReplyRenderPlan(
   payload: ReplyPayload,
   text = payload.text,
+  options: { authoredMarkdownPresentation?: Partial<SlackReplyPresentationSettings> } = {},
 ): SlackReplyRenderPlan {
   const hasStructuredContent = hasSlackReplyStructuredContent(payload);
   // Live preview/streaming still consumes this compact plan shape. Derive it
@@ -151,7 +156,10 @@ export function resolveSlackReplyRenderPlan(
   // without a second renderer.
   const resolution = resolveSlackReplyBlockResolution(
     { ...payload, text },
-    { materializeAuthoredText: hasStructuredContent },
+    {
+      materializeAuthoredText: hasStructuredContent,
+      authoredMarkdownPresentation: options.authoredMarkdownPresentation,
+    },
   );
   const messages = resolveSlackReplyDeliveryMessages({
     authoredTextPlacement: resolution.authoredTextPlacement,
@@ -424,9 +432,31 @@ function subtractMirroredSlackControlRows(params: {
  * Resolve reply content into transport-order segments. Each blocks segment is
  * one Slack message; text segments carry complete fallback content between it.
  */
+function buildSlackAuthoredMarkdownBlocks(
+  payload: ReplyPayload,
+  presentation: Partial<SlackReplyPresentationSettings>,
+): SlackBlock[] {
+  const text = normalizeOptionalString(payload.text);
+  if (!text) {
+    return [];
+  }
+  const rendered = renderSlackMarkdownPresentation(text, presentation, (error) => {
+    // Never let a layout failure block a send; ship the reply as plain text.
+    console.warn("slack: Markdown presentation render failed, sending plain text", error);
+  });
+  return rendered?.mode === "blocks" ? rendered.blocks : [];
+}
+
 export function resolveSlackReplyBlockResolution(
   payload: ReplyPayload,
-  options: { materializeAuthoredText?: boolean } = {},
+  options: {
+    materializeAuthoredText?: boolean;
+    /**
+     * Render an ordinary Markdown reply as Block Kit. Opt-in so structure
+     * probes and streaming decisions keep seeing plain replies as unstructured.
+     */
+    authoredMarkdownPresentation?: Partial<SlackReplyPresentationSettings>;
+  } = {},
 ): SlackReplyBlockResolution {
   const segments: SlackReplyBlockSegment[] = [];
   const channelBlocks = readSlackChannelBlocks(payload);
@@ -481,6 +511,16 @@ export function resolveSlackReplyBlockResolution(
       presentationBlocks: renderedPresentationBlocks,
     }),
   );
+  if (segments.length === 0 && options.authoredMarkdownPresentation) {
+    const markdownBlocks = buildSlackAuthoredMarkdownBlocks(
+      payload,
+      options.authoredMarkdownPresentation,
+    );
+    // Placement stays "outside-blocks" so the full reply is the top-level
+    // `text`: Slack shows only the blocks, but notifications and search keep
+    // the complete answer even when the budget trimmed the rendered body.
+    appendBlockSegment(segments, markdownBlocks);
+  }
   const renderedTextFragments = segments.flatMap((segment) => {
     if (segment.kind === "text") {
       return [segment.text];

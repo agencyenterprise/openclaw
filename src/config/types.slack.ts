@@ -180,6 +180,22 @@ export type SlackAppMessageTriggerConfig = {
   textPattern?: string;
 };
 
+/** How a Slack reply is laid out. */
+export type SlackReplyPresentationMode = "structured-only" | "always" | "never";
+
+/** Block Kit presentation controls for rendered Slack replies. */
+export type SlackReplyPresentationConfig = {
+  /**
+   * "structured-only" (default) renders Block Kit only when the reply has
+   * structure; "always" renders every reply; "never" keeps plain mrkdwn.
+   */
+  mode?: SlackReplyPresentationMode;
+  /** Maximum visible characters across all rendered blocks. Default: 2500. */
+  maxVisibleChars?: number;
+  /** Maximum numbered-list items kept before the remainder moves to a context block. Default: 5. */
+  maxListItems?: number;
+};
+
 export type SlackAccountConfig = {
   /** Optional display name for this account (used in CLI/UI lists). */
   name?: string;
@@ -298,6 +314,8 @@ export type SlackAccountConfig = {
   ackReaction?: string;
   /** Reaction emoji added while processing a reply (e.g. "hourglass_flowing_sand"). Removed when done. Useful as a typing indicator fallback when assistant mode is not enabled. */
   typingReaction?: string;
+  /** Block Kit presentation controls for rendered replies. */
+  presentation?: SlackReplyPresentationConfig;
 };
 
 export type SlackConfig = {

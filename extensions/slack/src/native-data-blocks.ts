@@ -10,6 +10,7 @@ import {
   renderSlackDataVisualizationFallbackText,
   renderSlackDataVisualizationMrkdwnFallbackText,
 } from "./data-visualization.js";
+import { readSlackApiErrorCode } from "./errors.js";
 
 export const SLACK_MALFORMED_NATIVE_DATA_FALLBACK =
   "Slack could not render this chart or table data.";
@@ -35,18 +36,7 @@ export function stripSlackNativeDataBlocks<T>(blocks?: readonly T[]): T[] {
 
 /** Match Slack's Web API and response_url `invalid_blocks` error shapes. */
 export function isSlackInvalidBlocksError(error: unknown): boolean {
-  const record = asRecord(error);
-  const rawData = record?.data;
-  const data = asRecord(rawData);
-  const rawResponseData = asRecord(record?.response)?.data;
-  const responseData = asRecord(rawResponseData);
-  const code =
-    data?.error ??
-    (typeof rawData === "string" ? rawData : undefined) ??
-    responseData?.error ??
-    (typeof rawResponseData === "string" ? rawResponseData : undefined) ??
-    record?.error;
-  return typeof code === "string" && code.trim().toLowerCase() === "invalid_blocks";
+  return readSlackApiErrorCode(error) === "invalid_blocks";
 }
 
 /** Extract a complete accessible summary from a supported native data block. */

@@ -1,6 +1,6 @@
 // Slack tests cover errors plugin behavior.
 import { describe, expect, it } from "vitest";
-import { formatSlackError } from "./errors.js";
+import { formatSlackError, isSlackThreadNotFoundError } from "./errors.js";
 
 describe("formatSlackError", () => {
   it("formats missing and unserializable values with fallback text", () => {
@@ -74,5 +74,22 @@ describe("formatSlackError", () => {
     expect(formatted).not.toContain(token);
     expect(formatted).toContain("Authorization: Bearer xoxb-1…cdef");
     expect(formatted).toContain("token xoxb-1…cdef lacked scope");
+  });
+});
+
+describe("isSlackThreadNotFoundError", () => {
+  it("matches Slack's Web API and response_url thread_not_found shapes", () => {
+    expect(isSlackThreadNotFoundError({ data: { error: "thread_not_found" } })).toBe(true);
+    expect(isSlackThreadNotFoundError({ data: "thread_not_found" })).toBe(true);
+    expect(isSlackThreadNotFoundError({ response: { data: { error: "THREAD_NOT_FOUND" } } })).toBe(
+      true,
+    );
+    expect(isSlackThreadNotFoundError({ error: "thread_not_found" })).toBe(true);
+  });
+
+  it("ignores unrelated errors and bare messages", () => {
+    expect(isSlackThreadNotFoundError({ data: { error: "ratelimited" } })).toBe(false);
+    expect(isSlackThreadNotFoundError(new Error("thread_not_found"))).toBe(false);
+    expect(isSlackThreadNotFoundError(undefined)).toBe(false);
   });
 });

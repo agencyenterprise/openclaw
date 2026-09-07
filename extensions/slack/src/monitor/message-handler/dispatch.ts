@@ -65,6 +65,7 @@ import {
   isSlackInteractiveRepliesEnabled,
 } from "../../interactive-replies.js";
 import { SLACK_TEXT_LIMIT } from "../../limits.js";
+import { readSlackReplyPresentationConfig } from "../../markdown-presentation-config.js";
 import { emitSlackMessageSentHooks } from "../../message-sent-hook.js";
 import {
   buildSlackProgressDraftBlocks,
@@ -991,7 +992,11 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
       return;
     }
     const reply = resolveSendableOutboundReplyParts(params.payload);
-    const renderPlan = resolveSlackReplyRenderPlan(params.payload);
+    // A structured Markdown reply renders as Block Kit, so it must leave the
+    // streaming path and go through the normal block delivery instead.
+    const renderPlan = resolveSlackReplyRenderPlan(params.payload, undefined, {
+      authoredMarkdownPresentation: readSlackReplyPresentationConfig(cfg, account.accountId),
+    });
     const plannedBlocks =
       renderPlan.mode === "single" ? renderPlan.blocks : renderPlan.blockPart?.blocks;
     if (

@@ -154,3 +154,28 @@ export function formatSlackError(error: unknown, fallback = NO_ERROR_DETAIL): st
   }
   return safeStringify(error) ?? fallback;
 }
+
+/**
+ * Read Slack's API error code from a Web API rejection or a `response_url` body.
+ * Both shapes carry the code under `data`/`response.data` (object or bare string),
+ * and older response bodies expose it directly as `error`.
+ */
+export function readSlackApiErrorCode(error: unknown): string | undefined {
+  if (!isRecord(error)) {
+    return undefined;
+  }
+  const rawData = error.data;
+  const rawResponseData = isRecord(error.response) ? error.response.data : undefined;
+  const code =
+    (isRecord(rawData) ? rawData.error : undefined) ??
+    (typeof rawData === "string" ? rawData : undefined) ??
+    (isRecord(rawResponseData) ? rawResponseData.error : undefined) ??
+    (typeof rawResponseData === "string" ? rawResponseData : undefined) ??
+    error.error;
+  return typeof code === "string" ? code.trim().toLowerCase() || undefined : undefined;
+}
+
+/** Slack rejects a threaded post with `thread_not_found` once its parent message is gone. */
+export function isSlackThreadNotFoundError(error: unknown): boolean {
+  return readSlackApiErrorCode(error) === "thread_not_found";
+}
