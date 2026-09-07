@@ -462,4 +462,57 @@ describe("runAgentTurnWithFallback: CLI session routing", () => {
     expect(result.runResult.meta?.agentMeta?.clearCliSessionBinding).toBeUndefined();
     expect(activeSessionStore.main.cliSessionBindings?.["codex-cli"]).toBeUndefined();
   });
+  it("passes the inbound author facts to CLI backends exactly like the embedded branch", async () => {
+    const sessionCtx = {
+      Provider: "slack",
+      MessageSid: "1786591970.000100",
+      SenderIsBot: false,
+      RawBody: "How did we decide to route the ARP spoofing prompt last week?",
+    } as unknown as TemplateContext;
+    const inboundFacts = {
+      senderIsBot: false,
+      inboundBody: "How did we decide to route the ARP spoofing prompt last week?",
+    };
+    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+
+    state.runEmbeddedAgentMock.mockResolvedValueOnce({ payloads: [{ text: "final" }], meta: {} });
+    const embedded = await runAgentTurnWithFallback(
+      createMinimalRunAgentTurnParams({ sessionCtx }),
+    );
+
+    state.isCliProviderMock.mockReturnValue(true);
+    state.runCliAgentMock.mockResolvedValueOnce({ payloads: [{ text: "final" }], meta: {} });
+    const cli = await runAgentTurnWithFallback(createMinimalRunAgentTurnParams({ sessionCtx }));
+
+    expect([embedded.kind, cli.kind]).toEqual(["success", "success"]);
+    expectMockCallArgFields(state.runEmbeddedAgentMock, 0, "embedded run params", inboundFacts);
+    expectMockCallArgFields(state.runCliAgentMock, 0, "CLI run params", inboundFacts);
+  });
+
+  it("prefers the queued run's inbound author facts over the live session context", async () => {
+    state.isCliProviderMock.mockReturnValue(true);
+    state.runCliAgentMock.mockResolvedValueOnce({ payloads: [{ text: "final" }], meta: {} });
+    const followupRun = createFollowupRun();
+    followupRun.senderIsBot = true;
+    followupRun.inboundBody = "the queued question";
+
+    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+    const result = await runAgentTurnWithFallback(
+      createMinimalRunAgentTurnParams({
+        followupRun,
+        sessionCtx: {
+          Provider: "slack",
+          MessageSid: "msg",
+          SenderIsBot: false,
+          RawBody: "the live turn text",
+        } as unknown as TemplateContext,
+      }),
+    );
+
+    expect(result.kind).toBe("success");
+    expectMockCallArgFields(state.runCliAgentMock, 0, "CLI run params", {
+      senderIsBot: true,
+      inboundBody: "the queued question",
+    });
+  });
 });

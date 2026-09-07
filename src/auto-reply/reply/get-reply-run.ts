@@ -1551,6 +1551,9 @@ export async function runPreparedReply(
       normalizeOptionalString(sessionCtx.NativeChannelId) ??
       normalizeOptionalString(sessionCtx.ChatId),
     originatingChatType: replyRoute.chatType,
+    ...(typeof sessionCtx.SenderIsBot === "boolean" ? { senderIsBot: sessionCtx.SenderIsBot } : {}),
+    inboundBody:
+      normalizeOptionalString(sessionCtx.RawBody) ?? normalizeOptionalString(sessionCtx.Body),
     run: {
       agentId,
       agentDir,

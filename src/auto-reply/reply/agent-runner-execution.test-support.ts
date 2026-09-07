@@ -161,7 +161,34 @@ vi.mock("./current-turn-images.js", () => ({
   resolveCurrentTurnImages: (params: unknown) => state.resolveCurrentTurnImagesMock(params),
 }));
 
+type InboundFactsSessionCtx = {
+  SenderIsBot?: unknown;
+  RawBody?: unknown;
+  Body?: unknown;
+};
+
+/**
+ * Mirrors buildInboundMessageRunFields in agent-runner-utils.ts. The factory below
+ * replaces that whole module, so both branches must read the inbound-author facts
+ * here the same way production does - an omitted export reaches production code as
+ * undefined and throws mid-run, and a stub that returns nothing silently drops the
+ * facts the hooks then never see.
+ */
+function readInboundMessageRunFields(sessionCtx: InboundFactsSessionCtx): {
+  senderIsBot?: boolean;
+  inboundBody?: string;
+} {
+  const text = [sessionCtx.RawBody, sessionCtx.Body].find(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  );
+  return {
+    ...(typeof sessionCtx.SenderIsBot === "boolean" ? { senderIsBot: sessionCtx.SenderIsBot } : {}),
+    inboundBody: text,
+  };
+}
+
 vi.mock("./agent-runner-utils.js", () => ({
+  buildInboundMessageRunFields: readInboundMessageRunFields,
   buildEmbeddedRunExecutionParams: (params: {
     provider: string;
     model: string;
@@ -179,7 +206,7 @@ vi.mock("./agent-runner-utils.js", () => ({
       originatingAccountId?: string;
       originatingChatType?: string;
     };
-    sessionCtx: { AccountId?: string; ChatType?: string };
+    sessionCtx: { AccountId?: string; ChatType?: string } & InboundFactsSessionCtx;
   }) => ({
     embeddedContext: {
       messageProvider: params.replyRoute?.originatingChannel,
@@ -190,6 +217,7 @@ vi.mock("./agent-runner-utils.js", () => ({
         params.run.agentAccountId,
       chatType:
         params.replyRoute?.originatingChatType ?? params.sessionCtx.ChatType ?? params.run.chatType,
+      ...readInboundMessageRunFields(params.sessionCtx),
     },
     senderContext: {},
     runBaseParams: {

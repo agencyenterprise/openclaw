@@ -27,6 +27,7 @@ import {
 import type { AgentTurnParams } from "./agent-runner-execution.types.js";
 import type { createAgentTurnPresentation } from "./agent-runner-presentation.js";
 import type { AgentTurnTimingTracker } from "./agent-runner-turn-timing.js";
+import { buildInboundMessageRunFields } from "./agent-runner-utils.js";
 import { shouldBridgeCliPreambleEvents } from "./get-reply.types.js";
 import { hasInboundAudio } from "./inbound-media.js";
 import { resolveOriginMessageProvider } from "./origin-routing.js";
@@ -110,6 +111,9 @@ export async function runCliFallbackCandidate(params: {
   const cliCurrentMessageId = isRestartSentinelContinuation
     ? turn.sessionCtx.ReplyToId
     : (turn.sessionCtx.MessageSidFull ?? turn.sessionCtx.MessageSid);
+  // The queued run carries the inbound author facts; a live turn only has the
+  // session context the embedded branch reads, so fall back to it.
+  const cliInboundMessage = buildInboundMessageRunFields(turn.sessionCtx);
   const cliToolSummaryTracker = createCliToolSummaryTracker({
     detailMode: turn.toolProgressDetail,
     shouldEmitToolResult: turn.shouldEmitToolResult,
@@ -304,6 +308,8 @@ export async function runCliFallbackCandidate(params: {
             channelContext: turn.followupRun.run.channelContext,
             currentThreadTs: cliCurrentThreadId != null ? String(cliCurrentThreadId) : undefined,
             currentMessageId: cliCurrentMessageId,
+            senderIsBot: turn.followupRun.senderIsBot ?? cliInboundMessage.senderIsBot,
+            inboundBody: turn.followupRun.inboundBody ?? cliInboundMessage.inboundBody,
             currentInboundAudio: hasInboundAudio(turn.sessionCtx),
             agentAccountId: turn.followupRun.run.agentAccountId,
             senderIsOwner: turn.followupRun.run.senderIsOwner,

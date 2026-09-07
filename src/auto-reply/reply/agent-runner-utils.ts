@@ -294,6 +294,23 @@ function buildEmbeddedContextFromTemplate(params: {
       hasRepliedRef: params.hasRepliedRef,
     }),
     currentInboundAudio: hasInboundAudio(sessionCtx),
+    ...buildInboundMessageRunFields(sessionCtx),
+  };
+}
+
+/**
+ * Inbound-author facts hooks read instead of parsing the assembled prompt. The
+ * embedded and CLI branches share this so a run cannot reach a hook with one
+ * branch's view of who wrote the message and the other's text.
+ */
+export function buildInboundMessageRunFields(sessionCtx: TemplateContext): {
+  senderIsBot?: boolean;
+  inboundBody?: string;
+} {
+  return {
+    ...(typeof sessionCtx.SenderIsBot === "boolean" ? { senderIsBot: sessionCtx.SenderIsBot } : {}),
+    inboundBody:
+      normalizeOptionalString(sessionCtx.RawBody) ?? normalizeOptionalString(sessionCtx.Body),
   };
 }
 

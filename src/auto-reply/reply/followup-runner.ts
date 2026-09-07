@@ -1355,6 +1355,8 @@ export function createFollowupRunner(params: {
                             ? String(queued.originatingThreadId)
                             : undefined,
                         currentMessageId: followupCurrentMessageId,
+                        senderIsBot: queued.senderIsBot,
+                        inboundBody: queued.inboundBody,
                         agentAccountId: run.agentAccountId,
                         senderIsOwner: run.senderIsOwner,
                         disableTools: opts?.disableTools,
@@ -1419,6 +1421,8 @@ export function createFollowupRunner(params: {
                     ? String(queued.originatingThreadId)
                     : undefined,
                 currentMessageId: followupCurrentMessageId,
+                senderIsBot: queued.senderIsBot,
+                inboundBody: queued.inboundBody,
                 groupId: run.groupId,
                 groupChannel: run.groupChannel,
                 groupSpace: run.groupSpace,

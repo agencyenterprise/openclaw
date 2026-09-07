@@ -131,6 +131,10 @@ export type RunEmbeddedAgentParams = {
   currentReplaceMessageTs?: string;
   /** True when the current inbound turn carried audio media. */
   currentInboundAudio?: boolean;
+  /** Whether the channel reports the inbound author as a bot/app. */
+  senderIsBot?: boolean;
+  /** Raw inbound message text as typed by the sender (before prompt assembly). */
+  inboundBody?: string;
   /** Reply-to mode for Slack auto-threading. */
   replyToMode?: "off" | "first" | "all" | "batched";
   /** Mutable ref to track if a reply was sent (for "first" mode). */

@@ -157,6 +157,10 @@ export type RunCliAgentParams = {
   channelContext?: PluginHookChannelContext;
   currentThreadTs?: string;
   currentMessageId?: string | number;
+  /** Whether the channel reports the inbound author as a bot/app. */
+  senderIsBot?: boolean;
+  /** Raw inbound message text as typed by the sender (before prompt assembly). */
+  inboundBody?: string;
   currentInboundAudio?: boolean;
   agentAccountId?: string;
   /** Sender identity for channel-originated runs when available. */

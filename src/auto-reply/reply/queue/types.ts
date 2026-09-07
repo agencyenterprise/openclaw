@@ -110,6 +110,10 @@ export type FollowupRun = {
   originatingReplyToMode?: ReplyToMode;
   /** Chat type for context-aware threading (e.g., DM vs channel). */
   originatingChatType?: string;
+  /** Whether the channel reports the inbound author as a bot/app. */
+  senderIsBot?: boolean;
+  /** Raw inbound message text as typed by the sender (before prompt assembly). */
+  inboundBody?: string;
   run: {
     agentId: string;
     agentDir: string;

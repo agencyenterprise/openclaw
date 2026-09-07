@@ -194,6 +194,8 @@ export async function dispatchEmbeddedRunAttempt(input: {
     currentMessageId: params.currentMessageId,
     currentReplaceMessageTs: params.currentReplaceMessageTs,
     currentInboundAudio: params.currentInboundAudio,
+    senderIsBot: params.senderIsBot,
+    inboundBody: params.inboundBody,
     replyToMode: params.replyToMode,
     hasRepliedRef: params.hasRepliedRef,
     sessionFile: runtime.sessionFile,
