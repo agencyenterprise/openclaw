@@ -36,8 +36,9 @@ import { validateSlackBlocksArray } from "./blocks-input.js";
 import {
   extractHcomBridgeMarker,
   findHcomBridgeMarkerDeep,
+  findJobReceiptsDeep,
   stripHcomBridgeHarnessTextDeep,
-  withHcomBridgeMarkerMetadata,
+  withHarnessReceiptMetadata,
 } from "./bridge-marker.js";
 import {
   postSlackMessageBestEffort,
@@ -962,9 +963,10 @@ export async function sendMessageSlack(
   message: string,
   opts: SlackSendOpts,
 ): Promise<SlackSendResult> {
-  // The hcom bridge marker proves delivery through message metadata, never
-  // through visible text (bridge-marker.ts). Take it out of the text and the
-  // blocks first, so nothing downstream can render it into a human-facing post.
+  // Harness bookkeeping — the hcom bridge marker, and a job's terminal
+  // receipts — proves delivery through message metadata, never through visible
+  // text (bridge-marker.ts). Take it out of the text and the blocks first, so
+  // nothing downstream can render it into a human-facing post.
   const { text: markerFreeMessage, marker: textMarker } = extractHcomBridgeMarker(message);
   const normalizedMessage = normalizeOptionalString(markerFreeMessage) ?? "";
   const trimmedMessage =
@@ -994,6 +996,9 @@ export async function sendMessageSlack(
   }
   const authoredBlocks = opts.blocks == null ? undefined : validateSlackBlocksArray(opts.blocks);
   const hcomBridgeMarker = textMarker ?? findHcomBridgeMarkerDeep(authoredBlocks);
+  // Read the receipts off the original message and the authored blocks, before
+  // either has been stripped.
+  const jobReceipts = [...findJobReceiptsDeep(message), ...findJobReceiptsDeep(authoredBlocks)];
   const blocks = authoredBlocks ? stripHcomBridgeHarnessTextDeep(authoredBlocks) : undefined;
   if (!normalizedMessage && !opts.mediaUrl && !blocks) {
     throw new Error("Slack send requires text, blocks, or media");
@@ -1014,9 +1019,12 @@ export async function sendMessageSlack(
     threadTs: opts.threadTs,
     ...(enterpriseDelivery ? { teamId: enterpriseDelivery.teamId } : {}),
   });
-  const markedOpts = hcomBridgeMarker
-    ? { ...opts, metadata: withHcomBridgeMarkerMetadata(opts.metadata, hcomBridgeMarker) }
-    : opts;
+  const harnessMetadata = withHarnessReceiptMetadata(opts.metadata, {
+    marker: hcomBridgeMarker,
+    jobReceipts,
+  });
+  const markedOpts =
+    harnessMetadata === opts.metadata ? opts : { ...opts, metadata: harnessMetadata };
   const queuedOpts = enterpriseDelivery
     ? Object.freeze({ ...markedOpts, client: enterpriseDelivery.client })
     : markedOpts;
