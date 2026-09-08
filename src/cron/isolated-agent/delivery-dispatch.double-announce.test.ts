@@ -156,6 +156,7 @@ import {
 } from "../../infra/outbound/outbound-session.js";
 import { buildOutboundSessionContext } from "../../infra/outbound/session-context.js";
 import { enqueueSystemEvent } from "../../infra/system-events.js";
+import type { CronJob } from "../types.js";
 import {
   dispatchCronDelivery,
   queueCronMessageToolDeliveryAwareness,
@@ -2280,8 +2281,24 @@ describe("dispatchCronDelivery — double-announce guard", () => {
     });
   });
 
-  it("keeps unresolved message-tool delivery out of delivered status", async () => {
-    const params = makeBaseParams({ synthesizedText: "hello from cron" });
+  const UNRESOLVED_TARGET_ERROR = "sessionKey is required to resolve delivery.channel=last";
+  const SLACK_TARGET_REQUIRED_ERROR =
+    "Delivering to Slack requires target <channelId|user:ID|channel:ID>";
+
+  function makeUnresolvedTargetParams(
+    overrides: {
+      delivery?: CronJob["delivery"];
+      error?: string;
+      postedViaMessageTool?: boolean;
+    } = {},
+  ) {
+    const params = makeBaseParams({
+      synthesizedText: "hello from cron",
+      sessionTarget: "session:5df3a816",
+    });
+    if (overrides.delivery) {
+      params.job = { ...params.job, delivery: overrides.delivery };
+    }
     params.resolvedDelivery = {
       ok: false,
       channel: undefined,
@@ -2289,20 +2306,67 @@ describe("dispatchCronDelivery — double-announce guard", () => {
       accountId: undefined,
       threadId: undefined,
       mode: "implicit",
-      error: new Error("sessionKey is required to resolve delivery.channel=last"),
+      error: new Error(overrides.error ?? UNRESOLVED_TARGET_ERROR),
     };
+    const postedViaMessageTool = overrides.postedViaMessageTool !== false;
     params.sourceDeliveryOutcome = {
-      visibleDeliveries: [
-        {
-          via: "message_tool",
-          target: { tool: "message", provider: "messagechat", to: "123" },
-          verifiedTarget: false,
-        },
-      ],
+      visibleDeliveries: postedViaMessageTool
+        ? [
+            {
+              via: "message_tool",
+              target: {
+                tool: "message",
+                provider: "slack",
+                to: "channel:c0ahskbndb6",
+                threadId: "1788473062.847669",
+              },
+              verifiedTarget: false,
+            },
+          ]
+        : [],
       verifiedMessageToolDelivery: false,
       satisfiesSourceDelivery: false,
-      unverifiedMessageToolDelivery: true,
+      unverifiedMessageToolDelivery: postedViaMessageTool,
     };
+    return params;
+  }
+
+  it("counts a message-tool post as delivery when the job named no cron target", async () => {
+    // Regression: an isolated cron job whose payload tells the agent to post its
+    // line in a Slack thread was recorded as a delivery-target error on every
+    // run, because a thread is not expressible as a cron delivery target and the
+    // inherited "last" route resolves to no concrete recipient.
+    const params = makeUnresolvedTargetParams({ error: SLACK_TARGET_REQUIRED_ERROR });
+
+    const state = await dispatchCronDelivery(params);
+
+    expect(deliverOutboundPayloads).not.toHaveBeenCalled();
+    expect(state.delivered).toBe(true);
+    // No direct delivery was attempted, so the run trace must not claim a fallback.
+    expect(state.deliveryAttempted).toBe(false);
+    expect(state.deliveryError).toBeUndefined();
+    expectResultFields(state.result, {
+      status: "ok",
+      delivered: true,
+      deliveryAttempted: false,
+    });
+    expect(state.result?.error).toBeUndefined();
+  });
+
+  it('counts a message-tool post as delivery for delivery.mode "none"', async () => {
+    const params = makeUnresolvedTargetParams({
+      delivery: { mode: "none", channel: "last" },
+      error: SLACK_TARGET_REQUIRED_ERROR,
+    });
+
+    const state = await dispatchCronDelivery(params);
+
+    expect(state.delivered).toBe(true);
+    expectResultFields(state.result, { status: "ok", delivered: true });
+  });
+
+  it("keeps the delivery-target error when the run posted nothing", async () => {
+    const params = makeUnresolvedTargetParams({ postedViaMessageTool: false });
 
     const state = await dispatchCronDelivery(params);
 
@@ -2314,9 +2378,25 @@ describe("dispatchCronDelivery — double-announce guard", () => {
       errorKind: "delivery-target",
       deliveryAttempted: false,
     });
-    expect(state.result?.error).toContain(
-      "sessionKey is required to resolve delivery.channel=last",
-    );
+    expect(state.result?.error).toContain(UNRESOLVED_TARGET_ERROR);
+  });
+
+  it("keeps the delivery-target error when the job named an explicit target", async () => {
+    const params = makeUnresolvedTargetParams({
+      delivery: { mode: "announce", channel: "telegram", to: "123456" },
+    });
+
+    const state = await dispatchCronDelivery(params);
+
+    expect(deliverOutboundPayloads).not.toHaveBeenCalled();
+    expect(state.delivered).toBe(false);
+    expect(state.deliveryAttempted).toBe(false);
+    expectResultFields(state.result, {
+      status: "error",
+      errorKind: "delivery-target",
+      deliveryAttempted: false,
+    });
+    expect(state.result?.error).toContain(UNRESOLVED_TARGET_ERROR);
     expect(state.result?.error).toContain(
       "the agent used the message tool, but OpenClaw could not verify",
     );

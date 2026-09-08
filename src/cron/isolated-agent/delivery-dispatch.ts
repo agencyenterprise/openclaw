@@ -48,6 +48,7 @@ import {
 import { beginSessionWorkAdmission } from "../../sessions/session-lifecycle-admission.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { shouldAttemptTtsPayload } from "../../tts/tts-config.js";
+import { hasExplicitCronDeliveryTarget, resolveCronDeliveryPlan } from "../delivery-plan.js";
 import { createCronExecutionId } from "../run-id.js";
 import { hasScheduledNextRunAtMs } from "../service/jobs.js";
 import type { CronJob, CronRunTelemetry } from "../types.js";
@@ -998,6 +999,23 @@ async function retryTransientDirectCronDelivery<T>(params: {
     sleep: async (delayMs) => await sleepWithAbort(delayMs, params.signal),
   });
 }
+/**
+ * Returns whether the agent's own message-tool sends stand in for cron delivery.
+ *
+ * A job that names no delivery target of its own has nothing for a message-tool
+ * send to match: `channel: "last"` is an inherited hint, not a destination.
+ * When such a run posted through the message tool (a Slack thread, for one, is not
+ * expressible as a cron delivery target), the output already reached a human, so
+ * an unresolvable target is not a run failure. A job that named a concrete
+ * target keeps the refusal, and a run that posted nothing keeps it too.
+ */
+function messageToolDeliveryCoversUnresolvedTarget(params: DispatchCronDeliveryParams): boolean {
+  return (
+    params.sourceDeliveryOutcome.visibleDeliveries.length > 0 &&
+    !hasExplicitCronDeliveryTarget(resolveCronDeliveryPlan(params.job))
+  );
+}
+
 /** Dispatches cron run output through verified message-tool or direct delivery paths. */
 export async function dispatchCronDelivery(
   params: DispatchCronDeliveryParams,
@@ -1542,6 +1560,19 @@ export async function dispatchCronDelivery(
       // returning — otherwise the one-shot session leaks. Safe no-op for
       // non-deleteAfterRun / non-cron sessions (see cleanupDirectCronSession).
       await cleanupDirectCronSessionIfNeeded();
+      if (messageToolDeliveryCoversUnresolvedTarget(params)) {
+        delivered = true;
+        return buildDeliveryState(
+          params.withRunSession({
+            status: "ok",
+            summary,
+            outputText,
+            delivered,
+            deliveryAttempted,
+            ...params.telemetry,
+          }),
+        );
+      }
       if (!params.deliveryBestEffort) {
         return buildDeliveryState(failDeliveryTarget(params.resolvedDelivery.error.message));
       }
