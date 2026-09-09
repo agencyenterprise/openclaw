@@ -846,6 +846,8 @@ export const FIELD_HELP: Record<string, string> = {
     "When true (default), backgrounded exec sessions on exit and node exec lifecycle events enqueue a system event and request a heartbeat.",
   "tools.exec.notifyOnExitEmptySuccess":
     "When true, successful backgrounded exec exits with empty output still enqueue a completion system event (default: false).",
+  "tools.exec.approvalsDisabled":
+    "Declare that this deployment has no exec approver (default: false). When true, exec never consults the approvals store: no lock, no file read, no authorization commit. exec-approvals.json stops being a kill switch and can neither deny a command nor block one. Set it only when nothing can answer an approval prompt; otherwise leave it unset and tighten tools.exec.security instead.",
   "tools.exec.pathPrepend": "Directories to prepend to PATH for exec runs (gateway/sandbox).",
   "tools.exec.safeBins":
     "Allow stdin-only safe binaries to run without explicit allowlist entries.",

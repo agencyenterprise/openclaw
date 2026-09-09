@@ -124,25 +124,32 @@ Local shortcut for the same intent, on the local machine only:
 openclaw exec-policy preset yolo
 ```
 
-## When no approver exists, exec skips the approvals store
+## Declaring that a deployment has no approver
 
-Exec does not read the approvals store, and does not take its lock, when both
-of these hold:
+Set `tools.exec.approvalsDisabled: true` when nothing can answer an exec
+approval prompt. Exec then never consults the approvals store: no lock, no file
+read, and no authorization commit.
 
-- the requested policy already resolves to `security: "full"` with `ask: "off"`, and
-- nothing can receive an approval request: `approvals.exec.enabled` is not `true`,
-  and every configured channel sets `channels.<id>.execApprovals.enabled: false`.
+```bash
+openclaw config set tools.exec.approvalsDisabled true
+```
 
-In that configuration nobody can answer a prompt and `full` already permits every
-command, so the store cannot change the outcome. Letting it fail a command would
-be an outage with no security benefit: on 2026-09-08 a lock file left behind by a
-restarting gateway blocked every exec for five hours.
+It can also be set per agent at `agents.list[].tools.exec.approvalsDisabled`,
+which wins over the global value.
 
-The consequence is explicit: **with no approver configured, `exec-approvals.json`
-is not a kill switch.** To put the store back on the decision path, either
-configure an approver (`channels.<id>.execApprovals.enabled: true`, or
-`approvals.exec.enabled: true`) or tighten `tools.exec.security` below `full`.
-Either one restores the locked read and the store's ability to deny.
+The consequence is explicit: **with the flag set, `exec-approvals.json` is not a
+kill switch.** It can neither deny a command nor block one when its lock is
+stuck. Leave the flag unset and tighten `tools.exec.security` instead when the
+store must keep its say. On 2026-09-08 a lock file left behind by a restarting
+gateway blocked every exec for over six hours on a host where nothing could
+approve anything; this flag is how an operator declares that situation away.
+
+The bypass is never inferred from the rest of the config. Static config cannot
+see a channel configured through environment variables, the approvals socket,
+paired devices, or connected operator clients, so guessing would skip approvals
+that should have been enforced. The gateway does warn once at startup when
+approvals are left enabled while nothing in config can deliver a request, but
+that warning is a diagnostic and changes no behavior.
 
 When the store _is_ consulted, an abandoned lock no longer wedges exec: a lock
 whose recorded owner is dead, or which never recorded an owner and is older than

@@ -312,6 +312,7 @@ export const FIELD_LABELS: Record<string, string> = {
   "tools.subagents.tools": "Subagent Tool Allow/Deny Policy",
   "tools.sandbox": "Sandbox Tool Policy",
   "tools.sandbox.tools": "Sandbox Tool Allow/Deny Policy",
+  "tools.exec.approvalsDisabled": "Exec Approvals Disabled",
   "tools.exec.pathPrepend": "Exec PATH Prepend",
   "tools.exec.safeBins": "Exec Safe Bins",
   "tools.exec.strictInlineEval": "Require Inline-Eval Approval",

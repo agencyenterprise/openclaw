@@ -320,6 +320,17 @@ export type ExecToolConfig = {
   security?: "deny" | "allowlist" | "full";
   /** Exec ask mode (default: off). */
   ask?: "off" | "on-miss" | "always";
+  /**
+   * Declare that this deployment has no exec approver (default: false).
+   *
+   * When true the exec path never consults the approvals store: no lock, no
+   * file read, and no authorization commit. `exec-approvals.json` stops being
+   * a kill switch, so the store can neither deny a command nor block one when
+   * its lock is stuck. Set it only where nothing can answer an approval
+   * prompt; leave it unset and tighten `security` if the store must keep its
+   * say.
+   */
+  approvalsDisabled?: boolean;
   /** Default node binding for exec.host=node (node id/name). */
   node?: string;
   /** Directories to prepend to PATH when running exec (gateway/sandbox). */

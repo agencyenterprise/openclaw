@@ -12,7 +12,6 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { normalizeChatChannelId } from "../channels/ids.js";
-import { hasExecApprovalDelivery } from "../infra/exec-approval-availability.js";
 import {
   type ExecAsk,
   type ExecHost,
@@ -1307,6 +1306,17 @@ function resolveExecReviewerDefaults(params: { defaults?: ExecToolDefaults; agen
   return agentExec?.reviewer ?? cfg?.tools?.exec?.reviewer;
 }
 
+function resolveExecApprovalsDisabled(params: {
+  defaults?: ExecToolDefaults;
+  agentId?: string;
+}): boolean {
+  const cfg = params.defaults?.config;
+  const agentExec = params.agentId
+    ? cfg?.agents?.list?.find((entry) => normalizeAgentId(entry.id) === params.agentId)?.tools?.exec
+    : undefined;
+  return (agentExec?.approvalsDisabled ?? cfg?.tools?.exec?.approvalsDisabled) === true;
+}
+
 function resolveNotifyOnExitEmptySuccess(defaults?: ExecToolDefaults): boolean {
   if (typeof defaults?.notifyOnExitEmptySuccess === "boolean") {
     return defaults.notifyOnExitEmptySuccess;
@@ -1685,15 +1695,14 @@ export function createExecTool(
         security: configuredSecurity,
         ask: defaults?.ask ?? "off",
       });
-      // Deployment policy: when config already resolves exec to security "full"
-      // with ask "off" and no surface can receive an approval request, the
-      // approvals store has no say in this decision. Reading it could then only
-      // fail an exec that nothing was ever going to gate, so the exec path does
-      // not touch the store at all - no lock, no file read.
-      const approvalsCanGateExec =
-        modePolicy.security !== "full" ||
-        modePolicy.ask !== "off" ||
-        hasExecApprovalDelivery(defaults?.config);
+      // Deployment opt-out. tools.exec.approvalsDisabled is the operator
+      // declaring that nothing can answer an approval prompt here, so the
+      // approvals store has no say in the decision and reading it could only
+      // fail an exec that nothing was ever going to gate. The bypass is never
+      // inferred: static config cannot see env-configured channels, the
+      // approvals socket, paired devices or connected operator clients, and
+      // guessing wrong would skip an approval that should have been enforced.
+      const approvalsCanGateExec = !resolveExecApprovalsDisabled({ defaults, agentId });
       const approvalPolicy =
         host === "sandbox" || !approvalsCanGateExec
           ? undefined

@@ -1,8 +1,10 @@
 // Gateway auxiliary method handlers.
 // Wires reload, secrets, exec approval, and plugin approval RPC handlers.
 import { randomUUID } from "node:crypto";
+import { getRuntimeConfig } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { isTruthyEnvValue } from "../infra/env.js";
+import { warnWhenExecApprovalsCannotBeDelivered } from "../infra/exec-approval-availability.js";
 import { createExecApprovalForwarder } from "../infra/exec-approval-forwarder.js";
 import {
   type ExecApprovalDecision,
@@ -146,6 +148,10 @@ export function createGatewayAuxHandlers(params: {
     resolveExecApprovalRequestAllowedDecisions,
   );
   const execApprovalForwarder = createExecApprovalForwarder();
+  warnWhenExecApprovalsCannotBeDelivered({
+    cfg: getRuntimeConfig(),
+    warn: (message) => params.log.warn?.(message),
+  });
   const execApprovalIosPushDelivery = createExecApprovalIosPushDelivery({ log: params.log });
   const loadExecApprovalHandlers = createLazyPromise(
     () =>

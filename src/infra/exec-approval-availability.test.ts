@@ -3,7 +3,10 @@
 // evidence that the operator turned channel approvals off - never on absence.
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { hasExecApprovalDelivery } from "./exec-approval-availability.js";
+import {
+  hasExecApprovalDelivery,
+  warnWhenExecApprovalsCannotBeDelivered,
+} from "./exec-approval-availability.js";
 
 function config(value: unknown): OpenClawConfig {
   return value as OpenClawConfig;
@@ -141,6 +144,50 @@ describe("hasExecApprovalDelivery", () => {
           },
         }),
       ),
+    ).toBe(false);
+  });
+});
+
+describe("warnWhenExecApprovalsCannotBeDelivered", () => {
+  function capture(cfg: unknown): { warned: boolean; messages: string[] } {
+    const messages: string[] = [];
+    const warned = warnWhenExecApprovalsCannotBeDelivered({
+      cfg: config(cfg),
+      warn: (message) => messages.push(message),
+    });
+    return { warned, messages };
+  }
+
+  it("warns when approvals stay enabled but nothing in config can deliver them", () => {
+    const result = capture({
+      channels: { slack: { botToken: "xoxb", execApprovals: { enabled: false } } },
+    });
+    expect(result.warned).toBe(true);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toContain("tools.exec.approvalsDisabled");
+  });
+
+  it("stays quiet once the operator has declared there is no approver", () => {
+    expect(
+      capture({
+        tools: { exec: { approvalsDisabled: true } },
+        channels: { slack: { botToken: "xoxb", execApprovals: { enabled: false } } },
+      }).warned,
+    ).toBe(false);
+  });
+
+  it("stays quiet when an approver can deliver", () => {
+    expect(capture({ channels: { slack: { botToken: "xoxb" } } }).warned).toBe(false);
+  });
+
+  it("stays quiet when config is unavailable", () => {
+    expect(
+      warnWhenExecApprovalsCannotBeDelivered({
+        cfg: undefined,
+        warn: () => {
+          throw new Error("must not warn without config");
+        },
+      }),
     ).toBe(false);
   });
 });

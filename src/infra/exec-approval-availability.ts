@@ -43,14 +43,12 @@ function channelCanDeliverExecApprovals(channel: unknown): boolean {
  * that config already resolved to "full" with ask "off" - and a store that
  * cannot change the decision must never be able to block the command.
  *
- * Answering false is an authorization decision, so it is only returned on
- * positive evidence that the operator turned channel approvals off. Missing
- * configuration is never such evidence: paired devices, the approvals socket
- * and connected operator clients are runtime state no config read can see.
- *
- * Known gap: a channel configured purely through environment variables has no
- * `channels.<id>` entry, so it is invisible here. It is only reachable when
- * some other channel carries an explicit `execApprovals.enabled: false`.
+ * This is a diagnostic, not an authorization decision. It reads static config
+ * only, and static config cannot see a channel configured through environment
+ * variables, the approvals socket, paired devices, or connected operator
+ * clients - so a false here means "nothing in config can deliver", never
+ * "nothing can deliver". The exec path must not bypass the approvals store on
+ * this answer; only an explicit `tools.exec.approvalsDisabled` does that.
  */
 export function hasExecApprovalDelivery(cfg: OpenClawConfig | undefined): boolean {
   if (!cfg) {
@@ -77,4 +75,35 @@ function hasExplicitExecApprovalsDisable(channel: Record<string, unknown>): bool
   }
   const accounts = isRecord(channel.accounts) ? Object.values(channel.accounts) : [];
   return accounts.some((account) => isRecord(account) && execApprovalsExplicitlyDisabled(account));
+}
+
+/**
+ * Warn once per gateway start when exec approvals are left enabled while
+ * nothing in config can deliver a request. Without this the deployment looks
+ * gated but every prompt would go unanswered until it timed out, which is the
+ * state that made a stuck approvals lock look like a policy denial.
+ *
+ * Returns whether it warned, so callers and tests can assert on it.
+ */
+export function warnWhenExecApprovalsCannotBeDelivered(params: {
+  cfg: OpenClawConfig | undefined;
+  warn: (message: string) => void;
+}): boolean {
+  if (params.cfg?.tools?.exec?.approvalsDisabled === true) {
+    // The operator already declared there is no approver.
+    return false;
+  }
+  if (hasExecApprovalDelivery(params.cfg)) {
+    return false;
+  }
+  params.warn(
+    [
+      "exec approvals are enabled but nothing in config can deliver an approval request:",
+      "approvals.exec.enabled is unset and every configured channel disables execApprovals.",
+      "An exec that asks for approval will go unanswered until it times out.",
+      "Configure an approver, tighten tools.exec.security, or set",
+      "tools.exec.approvalsDisabled: true to declare that this deployment has no approver.",
+    ].join(" "),
+  );
+  return true;
 }
