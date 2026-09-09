@@ -57,6 +57,7 @@ import { danger, logVerbose, shouldLogVerbose, sleep } from "openclaw/plugin-sdk
 import { resolvePinnedMainDmOwnerFromAllowlist } from "openclaw/plugin-sdk/security-runtime";
 import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { reactSlackMessage, removeSlackReaction } from "../../actions.js";
+import { withHarnessReceiptMetadata } from "../../bridge-marker.js";
 import { createSlackDraftStream } from "../../draft-stream.js";
 import { formatSlackError } from "../../errors.js";
 import { normalizeSlackOutboundText } from "../../format.js";
@@ -820,6 +821,11 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
     if (!fallbackText) {
       return false;
     }
+    // Every frame's harness tokens were stripped out of pendingText, so this
+    // send cannot re-derive them from its own text (see bridge-marker.ts). The
+    // stream collected them, and this post is now the delivery the bridge has
+    // to be able to verify, so hand them over.
+    const fallbackMetadata = withHarnessReceiptMetadata(slackMessageMetadata, session.harness);
     try {
       await deliverReplies({
         cfg: ctx.cfg,
@@ -833,7 +839,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
         replyThreadTs: session.threadTs,
         replyToMode: replyDeliveryMode,
         ...(slackIdentity ? { identity: slackIdentity } : {}),
-        ...(slackMessageMetadata ? { metadata: slackMessageMetadata } : {}),
+        ...(fallbackMetadata ? { metadata: fallbackMetadata } : {}),
         ...messageSentDeliveryHookContext,
         deferMessageSentHooks: true,
         ...(prepared.eventScope ? { eventScope: prepared.eventScope } : {}),
@@ -1322,6 +1328,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
             text: previewFinalText,
             ...(slackBlocks?.length ? { blocks: slackBlocks } : {}),
             threadTs: finalThreadTs,
+            ...(slackMessageMetadata ? { metadata: slackMessageMetadata } : {}),
           });
         } catch (err) {
           logVerbose(
@@ -1411,6 +1418,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
             text: edit.text,
             ...(edit.blocks?.length ? { blocks: edit.blocks } : {}),
             threadTs: edit.threadTs,
+            ...(slackMessageMetadata ? { metadata: slackMessageMetadata } : {}),
           });
           if (!ttsSupplement) {
             emitSlackMessageSentHooks({
@@ -1755,6 +1763,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
         client: slackClient,
         token,
         accountId: account.accountId,
+        ...(slackMessageMetadata ? { metadata: slackMessageMetadata } : {}),
         ...params,
       });
       progressReceiptCollapsed = true;

@@ -4,6 +4,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 const FINAL_REPLY_TEXT = "final answer";
 const THREAD_TS = "thread-1";
 const SAME_TEXT = "same reply";
+const BRIDGE_MARKER = "[hcom-bridge-marker:0652b747fef6:35642:52876d49cb1e]";
 
 const createSlackDraftStreamMock = vi.fn();
 const deliverRepliesMock = vi.fn(
@@ -23,6 +24,7 @@ const startSlackStreamMock = vi.fn(async () => ({
   stopped: false,
   delivered: true,
   pendingText: "",
+  harness: { jobReceipts: [] },
 }));
 const stopSlackStreamMock = vi.fn(async (_params?: unknown) => ({}) as { messageId?: string });
 const emitSlackMessageSentHooksMock = vi.fn(() => {});
@@ -968,8 +970,10 @@ vi.mock("../../streaming.js", () => ({
     delivered: boolean;
     pendingText: string;
     stopped: boolean;
+    harness: { marker?: string; jobReceipts: string[] };
   }) => {
     session.pendingText = "";
+    session.harness = { jobReceipts: [] };
     session.stopped = !session.delivered;
   },
   SlackStreamNotDeliveredError: TestSlackStreamNotDeliveredError,
@@ -1436,6 +1440,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: true,
       pendingText: "",
+      harness: { jobReceipts: [] },
     });
     appendSlackStreamMock.mockResolvedValue(undefined);
     stopSlackStreamMock.mockResolvedValue({});
@@ -2739,6 +2744,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: true,
       pendingText: "",
+      harness: { jobReceipts: [] },
     });
     stopSlackStreamMock.mockResolvedValueOnce({ messageId: "171234.567" });
 
@@ -2813,6 +2819,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: true,
       pendingText: "",
+      harness: { jobReceipts: [] },
     });
     stopSlackStreamMock.mockResolvedValueOnce({ messageId: "171234.890" });
 
@@ -2842,6 +2849,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: false,
       pendingText: FINAL_REPLY_TEXT,
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     stopSlackStreamMock.mockRejectedValueOnce(
@@ -2869,6 +2877,42 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     ).not.toHaveProperty("messageId");
   });
 
+  it("carries the stream's collected harness receipts on the fallback send", async () => {
+    // appendSlackStream stripped the marker out of pendingText, so the
+    // fallback post can only prove delivery if the stream hands its receipts
+    // over (see bridge-marker.ts).
+    mockedNativeStreaming = true;
+    const session = {
+      channel: "C123",
+      threadTs: THREAD_TS,
+      stopped: false,
+      delivered: false,
+      pendingText: FINAL_REPLY_TEXT,
+      harness: { marker: BRIDGE_MARKER, jobReceipts: [] },
+    };
+    startSlackStreamMock.mockResolvedValueOnce(session);
+    stopSlackStreamMock.mockRejectedValueOnce(
+      new TestSlackStreamNotDeliveredError(FINAL_REPLY_TEXT, "user_not_found"),
+    );
+    deliverRepliesMock.mockResolvedValueOnce({
+      messageId: "171234.903",
+      channelId: "C123",
+    });
+
+    await dispatchPreparedSlackMessage(createPreparedSlackMessage());
+
+    expect(deliverRepliesMock).toHaveBeenCalledTimes(1);
+    const params = requireRecord(
+      requireMockCall(deliverRepliesMock, 0, "fallback deliver replies")[0],
+      "fallback deliver replies params",
+    );
+    expect(params.metadata).toEqual({
+      event_type: "hcom_bridge_marker",
+      event_payload: { hcom_bridge_marker: BRIDGE_MARKER },
+    });
+    expect(JSON.stringify(params.replies)).not.toContain("hcom-bridge-marker");
+  });
+
   it("emits message_sent for a tool-only stream fallback", async () => {
     mockedNativeStreaming = true;
     mockedDispatchSequence = [{ kind: "tool", payload: { text: "tool output" } }];
@@ -2878,6 +2922,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: false,
       pendingText: "tool output",
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     stopSlackStreamMock.mockRejectedValueOnce(
@@ -2917,6 +2962,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: true,
       pendingText: "",
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     appendSlackStreamMock.mockImplementationOnce(async () => {
@@ -2955,6 +3001,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: true,
       pendingText: "",
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     appendSlackStreamMock
@@ -3005,6 +3052,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: true,
       pendingText: "",
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     appendSlackStreamMock
@@ -3060,6 +3108,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: false,
       pendingText: "first buffered",
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     appendSlackStreamMock.mockImplementationOnce(async () => {
@@ -3097,6 +3146,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: false,
       pendingText: "first tool",
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     appendSlackStreamMock.mockImplementationOnce(async () => {
@@ -3134,6 +3184,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: false,
       pendingText: "buffered final",
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     appendSlackStreamMock
@@ -3181,6 +3232,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: false,
       pendingText: "first buffered",
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     appendSlackStreamMock.mockImplementationOnce(async () => {
@@ -3556,6 +3608,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: true,
       pendingText: "",
+      harness: { jobReceipts: [] },
     };
     const secondSession = { ...firstSession };
     startSlackStreamMock.mockResolvedValueOnce(firstSession).mockResolvedValueOnce(secondSession);
@@ -3622,6 +3675,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: true,
       pendingText: "",
+      harness: { jobReceipts: [] },
     };
     const secondSession = { ...firstSession };
     startSlackStreamMock.mockResolvedValueOnce(firstSession).mockResolvedValueOnce(secondSession);
@@ -4967,6 +5021,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: false,
       pendingText: FINAL_REPLY_TEXT,
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     stopSlackStreamMock.mockRejectedValueOnce(
@@ -4989,6 +5044,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: false,
       pendingText: FINAL_REPLY_TEXT,
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     stopSlackStreamMock.mockRejectedValueOnce(
@@ -5019,6 +5075,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: true,
       pendingText: "buffered tail",
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     stopSlackStreamMock.mockRejectedValueOnce(
@@ -5054,6 +5111,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: false,
       pendingText: "first buffered",
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     appendSlackStreamMock.mockImplementationOnce(async () => {
@@ -5082,6 +5140,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: false,
       pendingText: oversized,
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     stopSlackStreamMock.mockRejectedValueOnce(
@@ -5108,6 +5167,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       stopped: false,
       delivered: false,
       pendingText: "first buffered",
+      harness: { jobReceipts: [] },
     };
     startSlackStreamMock.mockResolvedValueOnce(session);
     // Non-benign error (plain Error, NOT SlackStreamNotDeliveredError).

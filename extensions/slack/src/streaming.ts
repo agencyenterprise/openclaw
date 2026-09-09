@@ -420,6 +420,9 @@ export function markSlackStreamFallbackDelivered(session: SlackStreamSession): v
   // @slack/web-api 7.16.0 retains its private buffer after a failed flush.
   // Clear fallback-owned text before retrying stop(), or the SDK resends it.
   (session.streamer as unknown as { buffer: string }).buffer = "";
+  // The fallback post carries the proof for this text now, so a later stop()
+  // must not attach the same receipts to the native stream as well.
+  session.harness = { jobReceipts: [] };
   // A visible native stream still needs stop() to leave streaming state. If no
   // native call succeeded, there is no Slack stream to finalize.
   session.stopped = !nativeStreamWasStarted;

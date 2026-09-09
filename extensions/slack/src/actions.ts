@@ -1,4 +1,5 @@
 // Slack plugin module implements actions behavior.
+import type { MessageMetadata } from "@slack/types";
 import type { Block, KnownBlock, WebClient } from "@slack/web-api";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { requireRuntimeConfig } from "openclaw/plugin-sdk/plugin-config-runtime";
@@ -358,20 +359,27 @@ export async function editSlackMessage(
   channelId: string,
   messageId: string,
   content: string,
-  opts: SlackActionClientOpts & { blocks?: (Block | KnownBlock)[] } = {},
+  opts: SlackActionClientOpts & {
+    blocks?: (Block | KnownBlock)[];
+    /**
+     * Metadata the message being edited was posted with. chat.update replaces
+     * a message's metadata rather than merging into it, so a caller that owns
+     * the original post has to hand it back here to keep it.
+     */
+    metadata?: MessageMetadata;
+  } = {},
 ) {
   const client = await getClient(opts, "write");
   // An edit is a Slack send too, and chat.update does not go through
   // buildSlackPostMessagePayload (see bridge-marker.ts). Stripping alone would
   // leave the bridge nothing to verify: chat.update retains only the metadata
   // of the post being edited, and the token an edit carries is the editing
-  // turn's own, so it has to be re-attached here or it is gone. Attaching
-  // replaces that metadata wholesale — Slack offers no merge, and reading it
-  // back would cost another call — which is why an edit carrying no harness
-  // token sends no `metadata` field at all and leaves in place whatever the
-  // message already had.
+  // turn's own, so it has to be re-attached here or it is gone. Sending any
+  // metadata replaces the message's own wholesale, so the tokens are merged
+  // into what the caller says the message already carries; an edit with
+  // neither sends no `metadata` field and leaves that metadata untouched.
   const harnessMetadata = withHarnessReceiptMetadata(
-    undefined,
+    opts.metadata,
     collectHarnessReceipts(content, opts.blocks),
   );
   const blocks =

@@ -1,4 +1,5 @@
 // Slack plugin module implements preview finalize behavior.
+import type { MessageMetadata } from "@slack/types";
 import type { Block, KnownBlock, WebClient } from "@slack/web-api";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { editSlackMessage } from "../../actions.js";
@@ -164,6 +165,8 @@ export async function finalizeSlackPreviewEdit(params: {
   text: string;
   blocks?: (Block | KnownBlock)[];
   threadTs?: string;
+  /** Metadata the previewed message was posted with; chat.update replaces it. */
+  metadata?: MessageMetadata;
 }): Promise<void> {
   try {
     await editSlackMessage(params.channelId, params.messageId, params.text, {
@@ -171,6 +174,7 @@ export async function finalizeSlackPreviewEdit(params: {
       accountId: params.accountId,
       client: params.client,
       ...(params.blocks?.length ? { blocks: params.blocks } : {}),
+      ...(params.metadata ? { metadata: params.metadata } : {}),
     });
   } catch (err) {
     try {

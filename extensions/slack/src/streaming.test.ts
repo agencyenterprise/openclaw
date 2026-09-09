@@ -372,6 +372,21 @@ describe("stopSlackStream finalize error handling", () => {
     expect(alreadyDelivered.stopped).toBe(false);
   });
 
+  it("hands collected receipts to the fallback so stop() cannot attach them twice", async () => {
+    const stopImpl = vi.fn(async () => ({ ok: true }));
+    const session = makeSession({ stopImpl });
+    await appendSlackStream({ session, text: "[hcom-bridge-marker:abc:1:def]" });
+    expect(session.harness.marker).toBe("[hcom-bridge-marker:abc:1:def]");
+
+    markSlackStreamFallbackDelivered(session);
+
+    // The fallback send owns the proof for this text now.
+    expect(session.harness).toEqual({ jobReceipts: [] });
+    session.stopped = false;
+    await stopSlackStream({ session });
+    expect(stopImpl).toHaveBeenCalledWith(undefined);
+  });
+
   it("clears the SDK buffer before finalizing an already-visible fallback stream", async () => {
     const startStream = vi.fn(async () => ({ ok: true, ts: "1700000000.500300" }));
     const stopStream = vi.fn(async () => ({ ok: true, ts: "1700000000.500300" }));

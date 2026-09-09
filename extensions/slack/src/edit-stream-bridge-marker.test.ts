@@ -105,6 +105,40 @@ describe("editSlackMessage", () => {
     });
   });
 
+  it("merges a marker into the metadata the edited message already carried", async () => {
+    const client = createSlackEditTestClient();
+    await editSlackMessage("C0AHSKBNDB6", "1788473999.000100", `Sweep finished. ${MARKER}`, {
+      client: client as never,
+      metadata: {
+        event_type: "assistant_thread_context",
+        event_payload: { channel_id: "C0AHSKBNDB6", team_id: "T099" },
+      },
+    });
+    // chat.update replaces metadata wholesale, so attaching the proof has to
+    // carry the message's own payload across instead of erasing it.
+    expect(editUpdate(client).metadata).toEqual({
+      event_type: "assistant_thread_context",
+      event_payload: {
+        channel_id: "C0AHSKBNDB6",
+        team_id: "T099",
+        hcom_bridge_marker: MARKER,
+      },
+    });
+  });
+
+  it("keeps the metadata it was handed for an edit with no harness token", async () => {
+    const client = createSlackEditTestClient();
+    const metadata = {
+      event_type: "assistant_thread_context",
+      event_payload: { channel_id: "C0AHSKBNDB6" },
+    };
+    await editSlackMessage("C0AHSKBNDB6", "1788473999.000100", "Sweep finished.", {
+      client: client as never,
+      metadata,
+    });
+    expect(editUpdate(client).metadata).toEqual(metadata);
+  });
+
   it("sends no metadata field for an edit that carries no harness token", async () => {
     const client = createSlackEditTestClient();
     await editSlackMessage("C0AHSKBNDB6", "1788473999.000100", "Sweep finished.", {
