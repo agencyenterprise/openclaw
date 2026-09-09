@@ -826,6 +826,13 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
     // stream collected them, and this post is now the delivery the bridge has
     // to be able to verify, so hand them over.
     const fallbackMetadata = withHarnessReceiptMetadata(slackMessageMetadata, session.harness);
+    // Known limit: ownership of that proof is delivery-shaped, not
+    // frame-shaped, and this hand-off is only as precise as one awaited call.
+    // deliverReplies can split the text over several posts, which then each
+    // carry this same metadata, and a throw after Slack already accepted a
+    // post leaves the receipts on the session, so a retry can attach them
+    // again. Making it exactly-once needs per-message receipt ownership --
+    // a design change rather than a wider metadata object.
     try {
       await deliverReplies({
         cfg: ctx.cfg,

@@ -11,6 +11,7 @@ type DraftWarnFn = NonNullable<DraftStreamParams["warn"]>;
 type MockCalls<TArgs extends readonly unknown[]> = { mock: { calls: TArgs[] } };
 
 const TEST_CFG = {};
+const MARKER = "[hcom-bridge-marker:0652b747fef6:35642:52876d49cb1e]";
 
 function mockCalls<TArgs extends readonly unknown[]>(fn: unknown): TArgs[] {
   return (fn as MockCalls<TArgs>).mock.calls;
@@ -33,6 +34,7 @@ function createDraftStreamHarness(
     send?: DraftSendFn;
     edit?: DraftEditFn;
     eventScope?: DraftStreamParams["eventScope"];
+    metadata?: DraftStreamParams["metadata"];
     remove?: DraftRemoveFn;
     warn?: DraftWarnFn;
   } = {},
@@ -48,6 +50,7 @@ function createDraftStreamHarness(
     throttleMs: 250,
     maxChars: params.maxChars,
     eventScope: params.eventScope,
+    metadata: params.metadata,
     send,
     edit,
     remove,
@@ -72,6 +75,34 @@ describe("createSlackDraftStream", () => {
       token: "xoxb-test",
       accountId: undefined,
     });
+  });
+
+  it("keeps a marker the preview was posted with after the text drops it", async () => {
+    const { stream, send, edit } = createDraftStreamHarness({
+      metadata: {
+        event_type: "assistant_thread_context",
+        event_payload: { channel_id: "C123" },
+      },
+    });
+
+    // A composed preview can drop a line it showed before, so the marker is in
+    // the posted frame and gone from the edited one.
+    stream.update(`working on it ${MARKER}`);
+    await stream.flush();
+    stream.update("final answer");
+    await stream.flush();
+
+    const posted = {
+      event_type: "assistant_thread_context",
+      event_payload: { channel_id: "C123", hcom_bridge_marker: MARKER },
+    };
+    const sendCall = mockCalls<Parameters<DraftSendFn>>(send)[0];
+    expect((sendCall?.[2] as { metadata?: unknown } | undefined)?.metadata).toEqual(posted);
+    // chat.update replaces metadata, so the edit has to re-send the proof the
+    // message already carries even though its own text no longer holds it.
+    const editCall = mockCalls<Parameters<DraftEditFn>>(edit)[0];
+    expect(editCall?.[2]).toBe("final answer");
+    expect((editCall?.[3] as { metadata?: unknown } | undefined)?.metadata).toEqual(posted);
   });
 
   it("uses the enterprise event client for draft writes", async () => {
