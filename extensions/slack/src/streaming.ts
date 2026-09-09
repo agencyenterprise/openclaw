@@ -15,7 +15,12 @@ import type { AnyChunk, MessageMetadata } from "@slack/types";
 import type { WebClient } from "@slack/web-api";
 import type { ChatStreamer } from "@slack/web-api/dist/chat-stream.js";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
-import { stripHcomBridgeHarnessText, stripHcomBridgeHarnessTextDeep } from "./bridge-marker.js";
+import {
+  collectHarnessReceipts,
+  stripHcomBridgeHarnessText,
+  stripHcomBridgeHarnessTextDeep,
+  withHarnessReceiptMetadata,
+} from "./bridge-marker.js";
 import type { SlackSendIdentity } from "./send.js";
 
 // ---------------------------------------------------------------------------
@@ -40,6 +45,12 @@ export type SlackStreamSession = {
   delivered: boolean;
   /** Text accepted by the SDK but not yet acknowledged by Slack. */
   pendingText: string;
+  /**
+   * Harness tokens the frames of this stream carried. `chat.appendStream` takes
+   * no metadata, so tokens stripped out of a frame's visible text accumulate
+   * here until `chat.stopStream` can attach them as the bridge's proof.
+   */
+  harness: { marker?: string; jobReceipts: string[] };
 };
 
 type StartSlackStreamParams = {
@@ -102,6 +113,29 @@ export class SlackStreamNotDeliveredError extends Error {
   }
 }
 
+/**
+ * Takes one stream frame on its way to Slack: the harness tokens it carries are
+ * recorded on the session for `chat.stopStream` to attach as metadata, and
+ * removed from the text and chunks a human will see. The one place a stream
+ * frame is stripped — start, append and stop all route their payload here.
+ */
+function takeStreamFrame(
+  session: SlackStreamSession,
+  frame: { text?: string; chunks?: AnyChunk[] },
+): { text?: string; chunks?: AnyChunk[] } {
+  const seen = collectHarnessReceipts(frame.text, frame.chunks);
+  if (seen.marker && !session.harness.marker) {
+    session.harness.marker = seen.marker;
+  }
+  if (seen.jobReceipts?.length) {
+    session.harness.jobReceipts.push(...seen.jobReceipts);
+  }
+  return {
+    text: frame.text ? stripHcomBridgeHarnessText(frame.text) : frame.text,
+    chunks: frame.chunks ? stripHcomBridgeHarnessTextDeep(frame.chunks) : frame.chunks,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Stream lifecycle
 // ---------------------------------------------------------------------------
@@ -117,8 +151,7 @@ export class SlackStreamNotDeliveredError extends Error {
 export async function startSlackStream(
   params: StartSlackStreamParams,
 ): Promise<SlackStreamSession> {
-  const { client, channel, threadTs, text, chunks, taskDisplayMode, teamId, userId, identity } =
-    params;
+  const { client, channel, threadTs, taskDisplayMode, teamId, userId, identity } = params;
   const identityPayload = identity?.iconUrl
     ? { ...(identity.username ? { username: identity.username } : {}), icon_url: identity.iconUrl }
     : identity?.iconEmoji
@@ -150,7 +183,10 @@ export async function startSlackStream(
     stopped: false,
     delivered: false,
     pendingText: "",
+    harness: { jobReceipts: [] },
   };
+  // The opening frame is a Slack send like any other (see bridge-marker.ts).
+  const { text, chunks } = takeStreamFrame(session, params);
 
   if (text || chunks?.length) {
     if (text) {
@@ -192,17 +228,15 @@ export async function startSlackStream(
  * Append markdown text to an active Slack stream.
  */
 export async function appendSlackStream(params: AppendSlackStreamParams): Promise<void> {
-  // A stream frame is a Slack send too, and it does not go through
-  // buildSlackPostMessagePayload (see bridge-marker.ts).
   const { session } = params;
-  const text = params.text ? stripHcomBridgeHarnessText(params.text) : params.text;
-  const chunks = params.chunks ? stripHcomBridgeHarnessTextDeep(params.chunks) : params.chunks;
-
   if (session.stopped) {
     logVerbose("slack-stream: attempted to append to a stopped stream, ignoring");
     return;
   }
 
+  // A stream frame is a Slack send too, and it does not go through
+  // buildSlackPostMessagePayload (see bridge-marker.ts).
+  const { text, chunks } = takeStreamFrame(session, params);
   if (!text && !chunks?.length) {
     return;
   }
@@ -274,13 +308,16 @@ export async function stopSlackStream(
   params: StopSlackStreamParams,
 ): Promise<StopSlackStreamResult> {
   const { session, metadata } = params;
-  const text = params.text ? stripHcomBridgeHarnessText(params.text) : params.text;
-  const chunks = params.chunks ? stripHcomBridgeHarnessTextDeep(params.chunks) : params.chunks;
-
   if (session.stopped) {
     logVerbose("slack-stream: stream already stopped, ignoring duplicate stop");
     return {};
   }
+
+  const { text, chunks } = takeStreamFrame(session, params);
+  // chat.stopStream is the only call in the stream lifecycle that takes
+  // metadata, so it is the one chance to attach the proof that every frame's
+  // visible text was stripped of.
+  const stopMetadata = withHarnessReceiptMetadata(metadata, session.harness);
 
   session.stopped = true;
   if (text) {
@@ -295,11 +332,11 @@ export async function stopSlackStream(
 
   try {
     const stopResponse = await session.streamer.stop(
-      text || chunks?.length || metadata
+      text || chunks?.length || stopMetadata
         ? {
             ...(text ? { markdown_text: text } : {}),
             ...(chunks?.length ? { chunks } : {}),
-            ...(metadata ? { metadata } : {}),
+            ...(stopMetadata ? { metadata: stopMetadata } : {}),
           }
         : undefined,
     );

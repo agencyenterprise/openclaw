@@ -8,7 +8,12 @@ import { resolveSlackAccount } from "./accounts.js";
 import type { SlackAuthoredTextPlacement } from "./authored-text.js";
 import { buildSlackBlocksFallbackText } from "./blocks-fallback.js";
 import { validateSlackBlocksArray } from "./blocks-input.js";
-import { stripHcomBridgeHarnessText, stripHcomBridgeHarnessTextDeep } from "./bridge-marker.js";
+import {
+  collectHarnessReceipts,
+  stripHcomBridgeHarnessText,
+  stripHcomBridgeHarnessTextDeep,
+  withHarnessReceiptMetadata,
+} from "./bridge-marker.js";
 import { createSlackLookupClient, getSlackWriteClient } from "./client.js";
 import { buildSlackEditTextPayload } from "./edit-text.js";
 import { SLACK_EDIT_TEXT_LIMIT } from "./limits.js";
@@ -357,7 +362,18 @@ export async function editSlackMessage(
 ) {
   const client = await getClient(opts, "write");
   // An edit is a Slack send too, and chat.update does not go through
-  // buildSlackPostMessagePayload (see bridge-marker.ts).
+  // buildSlackPostMessagePayload (see bridge-marker.ts). Stripping alone would
+  // leave the bridge nothing to verify: chat.update retains only the metadata
+  // of the post being edited, and the token an edit carries is the editing
+  // turn's own, so it has to be re-attached here or it is gone. Attaching
+  // replaces that metadata wholesale — Slack offers no merge, and reading it
+  // back would cost another call — which is why an edit carrying no harness
+  // token sends no `metadata` field at all and leaves in place whatever the
+  // message already had.
+  const harnessMetadata = withHarnessReceiptMetadata(
+    undefined,
+    collectHarnessReceipts(content, opts.blocks),
+  );
   const blocks =
     opts.blocks == null
       ? undefined
@@ -380,6 +396,7 @@ export async function editSlackMessage(
     ts: messageId,
     text,
     ...(blocks ? { blocks } : {}),
+    ...(harnessMetadata ? { metadata: harnessMetadata } : {}),
   };
   try {
     await client.chat.update(update);
@@ -427,6 +444,7 @@ export async function editSlackMessage(
       ts: messageId,
       text: fallbackText,
       ...(fallback.blocks ? { blocks: fallback.blocks } : {}),
+      ...(harnessMetadata ? { metadata: harnessMetadata } : {}),
     });
   }
 }

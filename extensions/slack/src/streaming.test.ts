@@ -24,6 +24,7 @@ function makeSession(params: { appendImpl?: AppendImpl; stopImpl?: StopImpl }): 
     stopped: false,
     delivered: false,
     pendingText: "",
+    harness: { jobReceipts: [] },
   };
 }
 
@@ -284,6 +285,7 @@ describe("stopSlackStream finalize error handling", () => {
       stopped: true,
       delivered: false,
       pendingText: "",
+      harness: { jobReceipts: [] },
     };
     await expect(stopSlackStream({ session })).resolves.toEqual({});
     expect(stop).not.toHaveBeenCalled();
@@ -396,6 +398,7 @@ describe("stopSlackStream finalize error handling", () => {
       stopped: false,
       delivered: false,
       pendingText: "",
+      harness: { jobReceipts: [] },
     };
 
     await appendSlackStream({ session, text: "already visible" });

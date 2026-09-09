@@ -228,6 +228,26 @@ export type HarnessReceipts = {
 type MetadataPayloadValue = MessageMetadata["event_payload"][string];
 
 /**
+ * Every harness token the values of one Slack write carry — its text, its
+ * Block Kit payload, a stream frame — read in order, before anything has been
+ * stripped. Pair it with `withHarnessReceiptMetadata`: a `chat.update` or a
+ * `chat.stopStream` that only strips leaves the bridge with no proof the post
+ * it is looking for was ever made.
+ */
+export function collectHarnessReceipts(...values: readonly unknown[]): HarnessReceipts {
+  let marker: string | undefined;
+  const jobReceipts: string[] = [];
+  for (const value of values) {
+    marker = marker ?? findHcomBridgeMarkerDeep(value);
+    jobReceipts.push(...findJobReceiptsDeep(value));
+  }
+  return {
+    ...(marker ? { marker } : {}),
+    ...(jobReceipts.length ? { jobReceipts } : {}),
+  };
+}
+
+/**
  * Attaches the harness tokens a send carried to its metadata, keeping whatever
  * metadata the send already declared — including that metadata's `event_type`,
  * which is how the marker rides along with another feature's payload. Job
