@@ -54,6 +54,53 @@ export function isPidDefinitelyDead(pid: number): boolean {
   return isZombieProcess(pid);
 }
 
+// comm is truncated to 15 bytes, so match on a substring rather than equality.
+const LOCK_OWNER_RUNTIME_PATTERN = /node|openclaw/i;
+
+function readProcField(pid: number, field: "comm" | "cmdline"): string | null {
+  try {
+    const raw = fsSync.readFileSync(`/proc/${pid}/${field}`, "utf8");
+    const text = field === "cmdline" ? raw.replaceAll("\0", " ").trim() : raw.trim();
+    return text.length > 0 ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether a live pid provably belongs to something other than an OpenClaw
+ * runtime of this user - the signature of pid reuse behind a recorded lock
+ * owner. Only positive proof returns true: an unreadable process, a pid this
+ * process cannot classify, or a non-Linux host all report false so callers
+ * keep treating the owner as a live holder.
+ */
+export function isForeignRuntimeOwnerPid(pid: number): boolean {
+  if (!isValidPid(pid) || pid === process.pid || process.platform !== "linux") {
+    return false;
+  }
+  let ownerUid: number;
+  try {
+    ownerUid = fsSync.statSync(`/proc/${pid}`).uid;
+  } catch {
+    return false;
+  }
+  const selfUid = process.getuid?.();
+  if (selfUid !== undefined && ownerUid !== selfUid) {
+    // The state directory is this user's; another user's process holding its
+    // lock means the recorded pid was reused, not that the owner is live.
+    return true;
+  }
+  const comm = readProcField(pid, "comm");
+  if (comm !== null && LOCK_OWNER_RUNTIME_PATTERN.test(comm)) {
+    return false;
+  }
+  const cmdline = readProcField(pid, "cmdline");
+  if (cmdline === null) {
+    return false;
+  }
+  return !LOCK_OWNER_RUNTIME_PATTERN.test(cmdline);
+}
+
 function getDarwinProcessStartTime(pid: number): number | null {
   try {
     const startedAt = childProcess

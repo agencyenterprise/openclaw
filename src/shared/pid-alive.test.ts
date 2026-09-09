@@ -6,6 +6,7 @@ import { withMockedPlatform } from "../test-utils/vitest-spies.js";
 import {
   getFileLockProcessStartTime,
   getProcessStartTime,
+  isForeignRuntimeOwnerPid,
   isPidAlive,
   isPidDefinitelyDead,
 } from "./pid-alive.js";
@@ -198,5 +199,53 @@ describe("process start times", () => {
     expect(getProcessStartTime(Number.NaN)).toBeNull();
     expect(getProcessStartTime(Number.POSITIVE_INFINITY)).toBeNull();
     expect(getFileLockProcessStartTime(0)).toBeNull();
+  });
+});
+
+describe("isForeignRuntimeOwnerPid", () => {
+  it("never reports this process as foreign", () => {
+    expect(isForeignRuntimeOwnerPid(process.pid)).toBe(false);
+  });
+
+  it("does not report a live node process of this user as foreign", () => {
+    const child = childProcess.spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+      stdio: "ignore",
+    });
+    try {
+      expect(child.pid).toBeGreaterThan(0);
+      expect(isForeignRuntimeOwnerPid(child.pid as number)).toBe(false);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  it("reports a live non-runtime process of this user as foreign", () => {
+    if (process.platform !== "linux") {
+      return;
+    }
+    const child = childProcess.spawn("/bin/sleep", ["30"], { stdio: "ignore" });
+    try {
+      expect(child.pid).toBeGreaterThan(0);
+      // Give the child time to exec so /proc reflects sleep, not the fork.
+      const deadline = Date.now() + 2_000;
+      let foreign = false;
+      while (Date.now() < deadline) {
+        foreign = isForeignRuntimeOwnerPid(child.pid as number);
+        if (foreign) {
+          break;
+        }
+      }
+      expect(foreign).toBe(true);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  it("returns false for invalid pids and on unsupported platforms", () => {
+    expect(isForeignRuntimeOwnerPid(0)).toBe(false);
+    expect(isForeignRuntimeOwnerPid(-1)).toBe(false);
+    return withMockedPlatform("win32", async () => {
+      expect(isForeignRuntimeOwnerPid(1)).toBe(false);
+    });
   });
 });

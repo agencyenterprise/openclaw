@@ -38,7 +38,11 @@ import {
   hasPosixLoginStartupBeforeInlineCommand,
   POSIX_INLINE_COMMAND_FLAGS,
 } from "./shell-inline-command.js";
-import { isAbandonedOwnerlessLock, isLockOwnerDefinitelyStale } from "./stale-lock-file.js";
+import {
+  isAbandonedOwnerlessLock,
+  isLockOwnerDefinitelyStale,
+  isStuckLockOwner,
+} from "./stale-lock-file.js";
 export * from "./exec-approvals-analysis.js";
 export * from "./exec-approvals-allowlist.js";
 export type { ExecApprovalPolicySnapshot } from "./exec-approval-policy-snapshot.js";
@@ -344,6 +348,10 @@ const EXEC_APPROVALS_SYNC_LOCK_RETRY_MS = 20;
 // for the microseconds between its create and its payload write, so past this
 // window it was abandoned and nobody will ever release it.
 const EXEC_APPROVALS_OWNERLESS_LOCK_GRACE_MS = 3_000;
+// Ceiling on how long any owner can plausibly hold this lock. Every holder does
+// one guarded read or one atomic rewrite and releases, so a recorded owner that
+// has not restamped the sidecar in ten minutes is not coming back.
+const EXEC_APPROVALS_LOCK_HOLD_CEILING_MS = 600_000;
 // One reclaim per acquisition. A second EEXIST after a successful reclaim means
 // a live peer took the lock, which is contention to wait on, not staleness.
 const EXEC_APPROVALS_LOCK_RECLAIMS_PER_ACQUIRE = 1;
@@ -1185,8 +1193,9 @@ export class ExecApprovalsBusyError extends Error {
 
 /**
  * Load approvals for an exec decision. Identical to loadExecApprovals except
- * that lock contention raises ExecApprovalsBusyError instead of silently
- * failing closed; malformed or unreadable state still fails closed.
+ * that it never blocks on contention and raises ExecApprovalsBusyError instead
+ * of silently failing closed; malformed or unreadable state still fails closed.
+ * Prefer loadExecApprovalsForExecWithRetry, which owns the waiting.
  */
 export function loadExecApprovalsForExec(): ExecApprovalsFile {
   const filePath = resolveExecApprovalsPath();
@@ -1195,8 +1204,13 @@ export function loadExecApprovalsForExec(): ExecApprovalsFile {
     if (cached) {
       return cached;
     }
-    return withExecApprovalsReadLockSync(filePath, () =>
-      loadExecApprovalsUnlockedWithCache(filePath),
+    // One attempt, no blocking sleep. Waiting for a peer is the async
+    // wrapper's job; spinning here would stall the whole gateway event loop
+    // once per retry, which is the opposite of what a retry is for.
+    return withExecApprovalsReadLockSync(
+      filePath,
+      () => loadExecApprovalsUnlockedWithCache(filePath),
+      { retries: 0 },
     );
   } catch (err) {
     const code = (err as { code?: unknown }).code;
@@ -1211,7 +1225,8 @@ export function loadExecApprovalsForExec(): ExecApprovalsFile {
 
 // Backoff schedule for exec-path lock contention, ~6s total across 8 attempts.
 // A peer holds this lock only for one atomic rewrite, so a store that is still
-// locked after the budget is stuck, not contended.
+// locked after the budget is stuck, not contended. Every wait here is a timer,
+// never a blocking sleep: the gateway keeps serving other sessions throughout.
 const EXEC_APPROVALS_BUSY_RETRY_DELAYS_MS = [0, 25, 75, 200, 500, 1_200, 2_000, 2_000] as const;
 
 function sleepExecApprovalsRetry(delayMs: number): Promise<void> {
@@ -1270,6 +1285,12 @@ export async function loadExecApprovalsAsync(): Promise<ExecApprovalsFile> {
   }
 }
 
+/** Retry budget for one synchronous acquisition. */
+type ExecApprovalsSyncLockOptions = {
+  /** Contention retries, each costing a blocking sleep. 0 means one attempt. */
+  retries?: number;
+};
+
 type ExecApprovalsSyncLock = {
   descriptor: number;
   lockPath: string;
@@ -1322,15 +1343,17 @@ function readExecApprovalsLockState(lockPath: string): ExecApprovalsLockState {
     typeof payload?.pid === "number" && Number.isInteger(payload.pid) && payload.pid > 0
       ? payload.pid
       : null;
+  const ageMs = Date.now() - stat.mtimeMs;
   return {
     ownerPid,
     reclaimable:
       isLockOwnerDefinitelyStale({ payload }) ||
       isAbandonedOwnerlessLock({
         payload,
-        ageMs: Date.now() - stat.mtimeMs,
+        ageMs,
         graceMs: EXEC_APPROVALS_OWNERLESS_LOCK_GRACE_MS,
-      }),
+      }) ||
+      isStuckLockOwner({ payload, ageMs, maxHoldMs: EXEC_APPROVALS_LOCK_HOLD_CEILING_MS }),
     identity: { device: stat.dev, inode: stat.ino, mtimeMs: stat.mtimeMs },
   };
 }
@@ -1367,10 +1390,20 @@ function removeOwnedExecApprovalsLock(
 /**
  * Unlink a sidecar only while it is still the exact file that was judged
  * reclaimable. A fresh owner publishes a new inode, so the identity recheck
- * keeps a reclaim from deleting a live holder's lock. The residual race is a
- * fresh owner substituted between the recheck and the unlink; its worst case
- * is two writers doing atomic temp+rename saves, which resolves to
- * last-writer-wins on metadata and can never tear the policy itself.
+ * rejects the common case of a live holder's lock.
+ *
+ * KNOWN RESIDUAL RACE, accepted deliberately. The pathname is not pinned
+ * between the lstat and the unlink, and POSIX offers no compare-and-unlink, so
+ * a fresh owner substituted in that window is removed anyway: both it and this
+ * caller then believe they hold the lock. Writers save with temp+rename, so
+ * the file can never tear, but serialization is lost - a concurrent save can
+ * resurrect a revoked entry or drop a tightened default on last-writer-wins.
+ * The window is one lstat wide and is only reachable once a lock has already
+ * been judged reclaimable (dead owner, abandoned owner-less sidecar, or a
+ * holder past its ceiling), which is the same exposure the pre-existing
+ * dead-owner reclaim already carried. Closing it properly needs a different
+ * protocol - an advisory lock on a stable inode, or rename-based ownership
+ * transfer - not a tighter check here.
  */
 function reclaimExecApprovalsLock(lockPath: string, state: ExecApprovalsLockState): boolean {
   if (!state.identity) {
@@ -1445,7 +1478,11 @@ function createExecApprovalsLockFileInPlaceSync(lockPath: string, raw: string): 
   return descriptor;
 }
 
-function acquireExecApprovalsLockSync(filePath: string): ExecApprovalsSyncLock {
+function acquireExecApprovalsLockSync(
+  filePath: string,
+  options?: ExecApprovalsSyncLockOptions,
+): ExecApprovalsSyncLock {
+  const maxRetries = options?.retries ?? EXEC_APPROVALS_SYNC_LOCK_RETRIES;
   const normalizedTarget = resolveCanonicalExecApprovalsTarget(filePath);
   const lockPath = `${normalizedTarget}.lock`;
   const payload: Record<string, unknown> = {
@@ -1459,7 +1496,10 @@ function acquireExecApprovalsLockSync(filePath: string): ExecApprovalsSyncLock {
   }
   const raw = `${JSON.stringify(payload, null, 2)}\n`;
   let reclaims = 0;
-  for (let attempt = 0; attempt <= EXEC_APPROVALS_SYNC_LOCK_RETRIES; attempt += 1) {
+  let retries = 0;
+  // Terminates: reclaims and retries are both bounded, and every other path
+  // either returns the lock or throws.
+  for (;;) {
     let descriptor: number;
     try {
       descriptor = createExecApprovalsLockFileSync(lockPath, raw);
@@ -1491,7 +1531,8 @@ function acquireExecApprovalsLockSync(filePath: string): ExecApprovalsSyncLock {
           lockPath,
         });
       }
-      if (attempt < EXEC_APPROVALS_SYNC_LOCK_RETRIES) {
+      if (retries < maxRetries) {
+        retries += 1;
         sleepExecApprovalsSyncLockRetry();
         continue;
       }
@@ -1509,11 +1550,10 @@ function acquireExecApprovalsLockSync(filePath: string): ExecApprovalsSyncLock {
     }
     return { descriptor, lockPath, device: stat.dev, inode: stat.ino, raw };
   }
-  throw new Error(`Failed to acquire exec approvals lock: ${lockPath}`);
 }
 
-function withExecApprovalsLockSync<T>(fn: () => T): T {
-  const lock = acquireExecApprovalsLockSync(resolveExecApprovalsPath());
+function withExecApprovalsLockSync<T>(fn: () => T, options?: ExecApprovalsSyncLockOptions): T {
+  const lock = acquireExecApprovalsLockSync(resolveExecApprovalsPath(), options);
   try {
     return fn();
   } finally {
@@ -1522,9 +1562,13 @@ function withExecApprovalsLockSync<T>(fn: () => T): T {
   }
 }
 
-function withExecApprovalsReadLockSync<T>(filePath: string, fn: () => T): T {
+function withExecApprovalsReadLockSync<T>(
+  filePath: string,
+  fn: () => T,
+  options?: ExecApprovalsSyncLockOptions,
+): T {
   if (!isExecApprovalsTargetMissing(filePath) || !isExecApprovalsLockMissing(filePath)) {
-    return withExecApprovalsLockSync(fn);
+    return withExecApprovalsLockSync(fn, options);
   }
   // Avoid creating a missing state directory for an uncontended read. Recheck
   // after reading: a writer can create the lock or target between the probes.
@@ -1533,7 +1577,7 @@ function withExecApprovalsReadLockSync<T>(filePath: string, fn: () => T): T {
   // A writer that finishes after the lock probe must make the target visible.
   return isExecApprovalsLockMissing(filePath) && isExecApprovalsTargetMissing(filePath)
     ? result
-    : withExecApprovalsLockSync(fn);
+    : withExecApprovalsLockSync(fn, options);
 }
 
 function saveExecApprovalsUnlocked(file: ExecApprovalsFile): void {
