@@ -144,10 +144,13 @@ configure an approver (`channels.<id>.execApprovals.enabled: true`, or
 `approvals.exec.enabled: true`) or tighten `tools.exec.security` below `full`.
 Either one restores the locked read and the store's ability to deny.
 
-When the store _is_ consulted, it can no longer wedge exec: a lock whose owner is
-dead, or which never recorded an owner and is older than a few seconds, is
-reclaimed automatically, and contention is retried with backoff before any error
-reaches the agent.
+When the store _is_ consulted, an abandoned lock no longer wedges exec: a lock
+whose recorded owner is dead, or which never recorded an owner and is older than
+a few seconds, is reclaimed automatically, and contention is retried with backoff
+before any error reaches the agent. A lock whose payload names a process that is
+still alive is never reclaimed - if such a holder hangs, exec keeps failing until
+the holder exits or an operator intervenes, so check `fuser` on the lock path
+before removing it.
 
 ## Allowlist helpers
 

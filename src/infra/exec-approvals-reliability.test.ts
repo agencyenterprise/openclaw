@@ -185,8 +185,9 @@ describe("exec approvals reliability", () => {
     );
     expect(error).toBeInstanceOf(ExecApprovalsBusyError);
     const message = (error as Error).message;
-    expect(message).toContain("Retrying cannot clear it");
+    expect(message).toContain("further retries from here will not clear it");
     expect(message).toContain("3 attempts");
+    expect(message).toContain("Stop retrying exec");
     expect(message).not.toContain("retry the command");
     fs.rmSync(lockPathForApprovals(), { force: true });
   });

@@ -1158,10 +1158,11 @@ function describeExecApprovalsBusy(
   return [
     `exec approvals store stayed locked through ${retry.attempts} attempts over`,
     `${Math.round(retry.elapsedMs / 100) / 10}s (${lockPath}).`,
-    "Retrying cannot clear it - this is a stuck lock file on the gateway host,",
-    "not a denied approval and not a policy decision.",
-    "Stop retrying exec for this reason, continue with work that does not need it,",
-    `and tell the operator to remove ${lockPath}.`,
+    "This is a lock file on the gateway host, not a denied approval and not a",
+    "policy decision, and further retries from here will not clear it.",
+    "Stop retrying exec for this reason and continue with work that does not",
+    "need it. Report the path to the operator, who can check for a live holder",
+    `(fuser ${lockPath}) before removing it.`,
   ].join(" ");
 }
 
@@ -1401,19 +1402,45 @@ function reclaimExecApprovalsLock(lockPath: string, state: ExecApprovalsLockStat
  */
 function createExecApprovalsLockFileSync(lockPath: string, raw: string): number {
   const tempPath = `${lockPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-  const descriptor = fs.openSync(tempPath, "wx", 0o600);
+  let descriptor: number;
+  try {
+    descriptor = fs.openSync(tempPath, "wx", 0o600);
+  } catch {
+    // Cannot stage a payload here; fall back rather than fail every acquire.
+    return createExecApprovalsLockFileInPlaceSync(lockPath, raw);
+  }
   try {
     fs.writeFileSync(descriptor, raw, "utf8");
     fs.linkSync(tempPath, lockPath);
+    return descriptor;
   } catch (err) {
     fs.closeSync(descriptor);
-    throw err;
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      throw err;
+    }
+    // Hard links are not universal: some filesystems and MAC policies refuse
+    // link() while honouring exclusive create. Losing the atomic publish is
+    // worse than the pre-fix window, but failing every acquire is worse still,
+    // and the abandoned-sidecar reclaim recovers what this window can strand.
+    return createExecApprovalsLockFileInPlaceSync(lockPath, raw);
   } finally {
     try {
       fs.rmSync(tempPath, { force: true });
     } catch {
       // Best-effort cleanup; the linked sidecar is the file that matters.
     }
+  }
+}
+
+/** Exclusive-create fallback that is briefly visible without its payload. */
+function createExecApprovalsLockFileInPlaceSync(lockPath: string, raw: string): number {
+  const descriptor = fs.openSync(lockPath, "wx", 0o600);
+  try {
+    fs.writeFileSync(descriptor, raw, "utf8");
+  } catch (err) {
+    fs.closeSync(descriptor);
+    fs.rmSync(lockPath, { force: true });
+    throw err;
   }
   return descriptor;
 }
