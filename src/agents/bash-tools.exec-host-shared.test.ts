@@ -394,6 +394,48 @@ describe("resolveExecHostApprovalContext", () => {
     expect(result.hostAsk).toBe("always");
   });
 
+  it("never touches the approvals store when nothing can gate the exec", async () => {
+    mocks.resolveExecApprovals.mockClear();
+    mocks.resolveExecApprovals.mockRejectedValue(
+      new Error("approvals store must not be consulted"),
+    );
+
+    const result = await resolveExecHostApprovalContext({
+      agentId: "agent-main",
+      security: "full",
+      ask: "off",
+      host: "gateway",
+      approvalsCanGate: false,
+    });
+
+    expect(mocks.resolveExecApprovals).not.toHaveBeenCalled();
+    expect(result.hostSecurity).toBe("full");
+    expect(result.hostAsk).toBe("off");
+    expect(result.approvals.allowlist).toEqual([]);
+  });
+
+  it("still consults the approvals store when an approver exists", async () => {
+    mocks.resolveExecApprovals.mockClear();
+    mocks.resolveExecApprovals.mockResolvedValue({
+      defaults: { security: "deny", ask: "off", askFallback: "deny", autoAllowSkills: false },
+      agent: { security: "allowlist", ask: "off", askFallback: "deny", autoAllowSkills: false },
+      allowlist: [],
+      file: { version: 1, agents: {} },
+      hash: "approvals-hash",
+    });
+
+    const result = await resolveExecHostApprovalContext({
+      agentId: "agent-main",
+      security: "full",
+      ask: "off",
+      host: "gateway",
+      approvalsCanGate: true,
+    });
+
+    expect(mocks.resolveExecApprovals).toHaveBeenCalledTimes(1);
+    expect(result.hostSecurity).toBe("allowlist");
+  });
+
   it("clamps askFallback to the effective host security", async () => {
     mocks.resolveExecApprovals.mockResolvedValue({
       defaults: {

@@ -38,7 +38,7 @@ import {
   hasPosixLoginStartupBeforeInlineCommand,
   POSIX_INLINE_COMMAND_FLAGS,
 } from "./shell-inline-command.js";
-import { isLockOwnerDefinitelyStale } from "./stale-lock-file.js";
+import { isAbandonedOwnerlessLock, isLockOwnerDefinitelyStale } from "./stale-lock-file.js";
 export * from "./exec-approvals-analysis.js";
 export * from "./exec-approvals-allowlist.js";
 export type { ExecApprovalPolicySnapshot } from "./exec-approval-policy-snapshot.js";
@@ -338,6 +338,15 @@ function getExecApprovalsProcessStartTime(): number | null {
 }
 const EXEC_APPROVALS_SYNC_LOCK_RETRIES = 10;
 const EXEC_APPROVALS_SYNC_LOCK_RETRY_MS = 20;
+// A sidecar written by this process names its owner before it becomes visible,
+// but one left by an older build, by the async lock layer, or by a writer that
+// died mid-create can be owner-less. A sidecar is only legitimately owner-less
+// for the microseconds between its create and its payload write, so past this
+// window it was abandoned and nobody will ever release it.
+const EXEC_APPROVALS_OWNERLESS_LOCK_GRACE_MS = 3_000;
+// One reclaim per acquisition. A second EEXIST after a successful reclaim means
+// a live peer took the lock, which is contention to wait on, not staleness.
+const EXEC_APPROVALS_LOCK_RECLAIMS_PER_ACQUIRE = 1;
 
 // Skip persisting lastUsedAt/lastUsedCommand refreshes for allowlist entries
 // stamped within this window. Every skipped refresh is one less exclusive-lock
@@ -1134,20 +1143,42 @@ export function loadExecApprovals(): ExecApprovalsFile {
   }
 }
 
+/** Retry detail attached to a busy error that survived the exec retry budget. */
+export type ExecApprovalsBusyRetryInfo = { attempts: number; elapsedMs: number };
+
+function describeExecApprovalsBusy(
+  lockPath: string,
+  retry: ExecApprovalsBusyRetryInfo | undefined,
+): string {
+  if (!retry) {
+    return `exec approvals store is busy (another process holds ${lockPath})`;
+  }
+  // Never phrase this as "retry": the agent that read the old wording retried
+  // for five hours against a lock nothing was ever going to release.
+  return [
+    `exec approvals store stayed locked through ${retry.attempts} attempts over`,
+    `${Math.round(retry.elapsedMs / 100) / 10}s (${lockPath}).`,
+    "Retrying cannot clear it - this is a stuck lock file on the gateway host,",
+    "not a denied approval and not a policy decision.",
+    "Stop retrying exec for this reason, continue with work that does not need it,",
+    `and tell the operator to remove ${lockPath}.`,
+  ].join(" ");
+}
+
 /**
  * The approvals store being briefly locked by another process is a transient
  * condition, not a policy decision. Callers that report errors to an agent
  * should surface this instead of a fail-closed "security=deny", which reads
- * as a deliberate lockdown and makes agents stand down instead of retrying.
+ * as a deliberate lockdown. Prefer loadExecApprovalsForExecWithRetry so the
+ * transient case is absorbed here rather than handed to the agent.
  */
 export class ExecApprovalsBusyError extends Error {
   readonly code = "exec_approvals_busy";
-  constructor(lockPath: string) {
-    super(
-      `exec approvals store is busy (another process holds ${lockPath}); ` +
-        "this is transient - retry the command",
-    );
+  readonly lockPath: string;
+  constructor(lockPath: string, retry?: ExecApprovalsBusyRetryInfo) {
+    super(describeExecApprovalsBusy(lockPath, retry));
     this.name = "ExecApprovalsBusyError";
+    this.lockPath = lockPath;
   }
 }
 
@@ -1175,6 +1206,50 @@ export function loadExecApprovalsForExec(): ExecApprovalsFile {
     }
     return createFailClosedExecApprovalsFallback();
   }
+}
+
+// Backoff schedule for exec-path lock contention, ~6s total across 8 attempts.
+// A peer holds this lock only for one atomic rewrite, so a store that is still
+// locked after the budget is stuck, not contended.
+const EXEC_APPROVALS_BUSY_RETRY_DELAYS_MS = [0, 25, 75, 200, 500, 1_200, 2_000, 2_000] as const;
+
+function sleepExecApprovalsRetry(delayMs: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, delayMs).unref?.();
+  });
+}
+
+/**
+ * Exec entry point for the approvals store: absorbs transient lock contention
+ * instead of turning it into a command failure. Only a store that stays locked
+ * for the whole budget reaches the caller, and it says so in terms that do not
+ * invite another retry.
+ */
+export async function loadExecApprovalsForExecWithRetry(options?: {
+  /** Backoff schedule to use instead of the default exec budget. */
+  retryDelaysMs?: readonly number[];
+}): Promise<ExecApprovalsFile> {
+  const startedAtMs = Date.now();
+  let lockPath = `${resolveExecApprovalsPath()}.lock`;
+  let attempts = 0;
+  for (const delayMs of options?.retryDelaysMs ?? EXEC_APPROVALS_BUSY_RETRY_DELAYS_MS) {
+    if (delayMs > 0) {
+      await sleepExecApprovalsRetry(delayMs);
+    }
+    attempts += 1;
+    try {
+      return loadExecApprovalsForExec();
+    } catch (err) {
+      if (!(err instanceof ExecApprovalsBusyError)) {
+        throw err;
+      }
+      lockPath = err.lockPath;
+    }
+  }
+  throw new ExecApprovalsBusyError(lockPath, {
+    attempts,
+    elapsedMs: Date.now() - startedAtMs,
+  });
 }
 
 export async function loadExecApprovalsAsync(): Promise<ExecApprovalsFile> {
@@ -1213,23 +1288,50 @@ function readLockPayload(raw: string): Record<string, unknown> | null {
   }
 }
 
-function readExecApprovalsLockState(lockPath: string): {
+type ExecApprovalsLockState = {
+  /** Owner pid recorded in the sidecar payload, or null when it names none. */
   ownerPid: number | null;
-  definitelyStale: boolean;
-} {
+  /** True when no live owner can ever release this sidecar. */
+  reclaimable: boolean;
+  /** Identity of the sidecar that was judged, used to re-verify before unlink. */
+  identity: { device: number; inode: number; mtimeMs: number } | null;
+};
+
+const MISSING_EXEC_APPROVALS_LOCK: ExecApprovalsLockState = {
+  ownerPid: null,
+  reclaimable: false,
+  identity: null,
+};
+
+function readExecApprovalsLockState(lockPath: string): ExecApprovalsLockState {
+  let stat: fs.Stats;
   try {
-    const payload = readLockPayload(fs.readFileSync(lockPath, "utf8"));
-    const ownerPid =
-      typeof payload?.pid === "number" && Number.isInteger(payload.pid) && payload.pid > 0
-        ? payload.pid
-        : null;
-    return {
-      ownerPid,
-      definitelyStale: isLockOwnerDefinitelyStale({ payload }),
-    };
+    stat = fs.lstatSync(lockPath);
   } catch {
-    return { ownerPid: null, definitelyStale: false };
+    // The holder released between the failed create and this probe.
+    return MISSING_EXEC_APPROVALS_LOCK;
   }
+  let payload: Record<string, unknown> | null;
+  try {
+    payload = readLockPayload(fs.readFileSync(lockPath, "utf8"));
+  } catch {
+    return MISSING_EXEC_APPROVALS_LOCK;
+  }
+  const ownerPid =
+    typeof payload?.pid === "number" && Number.isInteger(payload.pid) && payload.pid > 0
+      ? payload.pid
+      : null;
+  return {
+    ownerPid,
+    reclaimable:
+      isLockOwnerDefinitelyStale({ payload }) ||
+      isAbandonedOwnerlessLock({
+        payload,
+        ageMs: Date.now() - stat.mtimeMs,
+        graceMs: EXEC_APPROVALS_OWNERLESS_LOCK_GRACE_MS,
+      }),
+    identity: { device: stat.dev, inode: stat.ino, mtimeMs: stat.mtimeMs },
+  };
 }
 
 function sleepExecApprovalsSyncLockRetry(): void {
@@ -1261,6 +1363,61 @@ function removeOwnedExecApprovalsLock(
   }
 }
 
+/**
+ * Unlink a sidecar only while it is still the exact file that was judged
+ * reclaimable. A fresh owner publishes a new inode, so the identity recheck
+ * keeps a reclaim from deleting a live holder's lock. The residual race is a
+ * fresh owner substituted between the recheck and the unlink; its worst case
+ * is two writers doing atomic temp+rename saves, which resolves to
+ * last-writer-wins on metadata and can never tear the policy itself.
+ */
+function reclaimExecApprovalsLock(lockPath: string, state: ExecApprovalsLockState): boolean {
+  if (!state.identity) {
+    return false;
+  }
+  try {
+    const current = fs.lstatSync(lockPath);
+    if (
+      current.dev !== state.identity.device ||
+      current.ino !== state.identity.inode ||
+      current.mtimeMs !== state.identity.mtimeMs
+    ) {
+      return false;
+    }
+    fs.rmSync(lockPath, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Publish the sidecar with its owner payload already in it. Creating an empty
+ * file and writing the payload afterwards leaves a window in which a killed
+ * writer strands an owner-less lock that no peer can attribute or reclaim; that
+ * window wedged every exec on this host for hours. Writing a private temp file
+ * and hard-linking it into place keeps O_EXCL semantics (link fails EEXIST when
+ * the lock is held) while making the lock visible only once it names its owner.
+ */
+function createExecApprovalsLockFileSync(lockPath: string, raw: string): number {
+  const tempPath = `${lockPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  const descriptor = fs.openSync(tempPath, "wx", 0o600);
+  try {
+    fs.writeFileSync(descriptor, raw, "utf8");
+    fs.linkSync(tempPath, lockPath);
+  } catch (err) {
+    fs.closeSync(descriptor);
+    throw err;
+  } finally {
+    try {
+      fs.rmSync(tempPath, { force: true });
+    } catch {
+      // Best-effort cleanup; the linked sidecar is the file that matters.
+    }
+  }
+  return descriptor;
+}
+
 function acquireExecApprovalsLockSync(filePath: string): ExecApprovalsSyncLock {
   const normalizedTarget = resolveCanonicalExecApprovalsTarget(filePath);
   const lockPath = `${normalizedTarget}.lock`;
@@ -1274,44 +1431,40 @@ function acquireExecApprovalsLockSync(filePath: string): ExecApprovalsSyncLock {
     payload.starttime = starttime;
   }
   const raw = `${JSON.stringify(payload, null, 2)}\n`;
-  let brokeStaleLock = false;
+  let reclaims = 0;
   for (let attempt = 0; attempt <= EXEC_APPROVALS_SYNC_LOCK_RETRIES; attempt += 1) {
     let descriptor: number;
     try {
-      descriptor = fs.openSync(lockPath, "wx", 0o600);
+      descriptor = createExecApprovalsLockFileSync(lockPath, raw);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
         throw err;
       }
       const state = readExecApprovalsLockState(lockPath);
-      if (state.definitelyStale) {
-        // The recorded owner is provably dead (its pid+starttime no longer
-        // name a live process), and a dead owner never releases its lock:
-        // without recovery every future exec fails closed until a human
-        // deletes the file. Break the lock once and retry. The unlink can in
-        // principle race a fresh owner that replaced the stale file in the
-        // same instant; the worst case of that race is two writers doing
-        // atomic temp+rename saves, which resolves to last-writer-wins on
-        // metadata and can never tear or corrupt the policy itself.
-        if (!brokeStaleLock) {
-          brokeStaleLock = true;
-          try {
-            fs.rmSync(lockPath, { force: true });
-            continue;
-          } catch {
-            // Fall through to the stale error below.
-          }
+      if (state.reclaimable) {
+        // The owner is provably dead or the sidecar was abandoned before it
+        // named one. Neither ever releases the lock, so without recovery every
+        // future exec fails until a human deletes the file.
+        if (
+          reclaims < EXEC_APPROVALS_LOCK_RECLAIMS_PER_ACQUIRE &&
+          reclaimExecApprovalsLock(lockPath, state)
+        ) {
+          reclaims += 1;
+          continue;
         }
         throw Object.assign(new Error(`Exec approvals lock has a stale owner: ${lockPath}`), {
           code: "file_lock_stale",
           lockPath,
         });
       }
-      if (
-        state.ownerPid !== null &&
-        state.ownerPid !== process.pid &&
-        attempt < EXEC_APPROVALS_SYNC_LOCK_RETRIES
-      ) {
+      if (state.ownerPid === process.pid) {
+        // Self-owned: this process cannot release while it blocks here.
+        throw Object.assign(new Error(`Exec approvals are locked: ${lockPath}`), {
+          code: "file_lock_timeout",
+          lockPath,
+        });
+      }
+      if (attempt < EXEC_APPROVALS_SYNC_LOCK_RETRIES) {
         sleepExecApprovalsSyncLockRetry();
         continue;
       }
@@ -1327,21 +1480,7 @@ function acquireExecApprovalsLockSync(filePath: string): ExecApprovalsSyncLock {
       fs.closeSync(descriptor);
       throw err;
     }
-    const lock: ExecApprovalsSyncLock = {
-      descriptor,
-      lockPath,
-      device: stat.dev,
-      inode: stat.ino,
-      raw,
-    };
-    try {
-      fs.writeFileSync(descriptor, raw, "utf8");
-      return lock;
-    } catch (err) {
-      fs.closeSync(descriptor);
-      removeOwnedExecApprovalsLock(lock, { requirePayloadMatch: false });
-      throw err;
-    }
+    return { descriptor, lockPath, device: stat.dev, inode: stat.ino, raw };
   }
   throw new Error(`Failed to acquire exec approvals lock: ${lockPath}`);
 }
@@ -1770,6 +1909,19 @@ export function resolveExecApprovals(
     overrides,
     socket: "persisted",
   });
+}
+
+/**
+ * Resolve exec policy from config overrides alone, leaving the approvals store
+ * untouched - no lock, no file read. Callers use this exactly where the store
+ * cannot change the decision (see hasExecApprovalDelivery), so that a store
+ * that has no say can never block the command either.
+ */
+export function resolveExecApprovalsWithoutStore(
+  agentId: string | undefined,
+  overrides: ExecApprovalsDefaultOverrides,
+): ExecApprovalsResolved {
+  return resolveExecApprovalsFromFile({ file: { version: 1 }, agentId, overrides });
 }
 
 export async function resolveExecApprovalsLocked(

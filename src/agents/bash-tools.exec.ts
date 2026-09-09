@@ -12,11 +12,12 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { normalizeChatChannelId } from "../channels/ids.js";
+import { hasExecApprovalDelivery } from "../infra/exec-approval-availability.js";
 import {
   type ExecAsk,
   type ExecHost,
   type ExecSecurity,
-  loadExecApprovalsForExec,
+  loadExecApprovalsForExecWithRetry,
   maxAsk,
   minSecurity,
   normalizeExecAsk,
@@ -1684,13 +1685,23 @@ export function createExecTool(
         security: configuredSecurity,
         ask: defaults?.ask ?? "off",
       });
+      // Deployment policy: when config already resolves exec to security "full"
+      // with ask "off" and no surface can receive an approval request, the
+      // approvals store has no say in this decision. Reading it could then only
+      // fail an exec that nothing was ever going to gate, so the exec path does
+      // not touch the store at all - no lock, no file read.
+      const approvalsCanGateExec =
+        modePolicy.security !== "full" ||
+        modePolicy.ask !== "off" ||
+        hasExecApprovalDelivery(defaults?.config);
       const approvalPolicy =
-        host === "sandbox"
+        host === "sandbox" || !approvalsCanGateExec
           ? undefined
           : resolveExecApprovalsFromFile({
-              // Raises ExecApprovalsBusyError on lock contention so a busy
-              // store reads as "retry", never as a security=deny lockdown.
-              file: loadExecApprovalsForExec(),
+              // Absorbs transient lock contention. A store that stays locked
+              // for the whole retry budget surfaces as a stuck-lock operator
+              // fault, never as a security=deny lockdown.
+              file: await loadExecApprovalsForExecWithRetry(),
               agentId,
               overrides: {
                 security: "full",
@@ -1928,6 +1939,7 @@ export function createExecTool(
             defaultTimeoutSec,
             security,
             ask,
+            approvalsCanGate: approvalsCanGateExec,
             autoReview,
             autoReviewer,
             signal,

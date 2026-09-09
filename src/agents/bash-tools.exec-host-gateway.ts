@@ -89,6 +89,12 @@ type ProcessGatewayAllowlistParams = {
   defaultTimeoutSec: number;
   security: ExecSecurity;
   ask: ExecAsk;
+  /**
+   * Whether the approvals store can still change this decision. Defaults to
+   * true, the conservative reading. False only when config already resolved
+   * exec to "full" with ask "off" and nothing can receive an approval request.
+   */
+  approvalsCanGate?: boolean;
   autoReview?: boolean;
   autoReviewer?: ExecAutoReviewer;
   signal?: AbortSignal;
@@ -471,6 +477,7 @@ export async function processGatewayAllowlist(
     security: params.security,
     ask: params.ask,
     host: "gateway",
+    approvalsCanGate: params.approvalsCanGate,
   });
   const evaluationPolicySnapshot = createExecApprovalPolicySnapshot({
     file: approvals.file,
@@ -588,6 +595,12 @@ export async function processGatewayAllowlist(
     resolvedPath?: string;
     allowAlwaysDecision?: AllowAlwaysPersistenceDecision;
   }) => {
+    if (params.approvalsCanGate === false) {
+      // Nothing authorized this exec, so there is no authorization to record.
+      // Writing anyway would take the store's exclusive lock on the hot path
+      // and could fail a command that has already been allowed to run.
+      return Promise.resolve();
+    }
     const policyAuthorization =
       options.source === "current-policy" || options.source === "ask-fallback";
     // Exact trust can be the sole basis for bypassing an unavailable execution

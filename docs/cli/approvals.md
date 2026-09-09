@@ -124,6 +124,31 @@ Local shortcut for the same intent, on the local machine only:
 openclaw exec-policy preset yolo
 ```
 
+## When no approver exists, exec skips the approvals store
+
+Exec does not read the approvals store, and does not take its lock, when both
+of these hold:
+
+- the requested policy already resolves to `security: "full"` with `ask: "off"`, and
+- nothing can receive an approval request: `approvals.exec.enabled` is not `true`,
+  and every configured channel sets `channels.<id>.execApprovals.enabled: false`.
+
+In that configuration nobody can answer a prompt and `full` already permits every
+command, so the store cannot change the outcome. Letting it fail a command would
+be an outage with no security benefit: on 2026-09-08 a lock file left behind by a
+restarting gateway blocked every exec for five hours.
+
+The consequence is explicit: **with no approver configured, `exec-approvals.json`
+is not a kill switch.** To put the store back on the decision path, either
+configure an approver (`channels.<id>.execApprovals.enabled: true`, or
+`approvals.exec.enabled: true`) or tighten `tools.exec.security` below `full`.
+Either one restores the locked read and the store's ability to deny.
+
+When the store _is_ consulted, it can no longer wedge exec: a lock whose owner is
+dead, or which never recorded an owner and is older than a few seconds, is
+reclaimed automatically, and contention is retried with backoff before any error
+reaches the agent.
+
 ## Allowlist helpers
 
 ```bash

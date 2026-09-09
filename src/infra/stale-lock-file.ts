@@ -59,6 +59,26 @@ export function isLockOwnerDefinitelyStale(params: {
   return false;
 }
 
+/**
+ * A lock sidecar is created before its owner payload is written, so a sidecar
+ * that names no owner is either microseconds old or abandoned. Nothing ever
+ * releases an abandoned one: the writer that created it died (or was killed)
+ * between creating the file and writing its payload, or wrote a truncated
+ * payload. Past the grace window - orders of magnitude wider than the two
+ * adjacent synchronous syscalls that open the window - an owner-less sidecar
+ * can only be abandoned, and holding it forever wedges every future acquirer.
+ */
+export function isAbandonedOwnerlessLock(params: {
+  payload: Record<string, unknown> | null;
+  ageMs: number;
+  graceMs: number;
+}): boolean {
+  if (readLockFileOwnerPayload(params.payload)?.pid) {
+    return false;
+  }
+  return params.ageMs >= params.graceMs;
+}
+
 export function shouldRemoveDeadOwnerOrExpiredLock(params: {
   payload: Record<string, unknown> | null;
   staleMs: number;

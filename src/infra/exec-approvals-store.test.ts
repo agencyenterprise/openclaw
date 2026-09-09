@@ -233,14 +233,12 @@ describe("exec approvals store helpers", () => {
     ]);
   });
 
-  it("fails closed when a synchronous writer finds an ownerless live lock", () => {
+  it("fails closed when an ownerless lock is too fresh to be abandoned", () => {
     const dir = createHomeDir();
     ensureExecApprovals();
     const lockPath = `${approvalsFilePath(dir)}.lock`;
     const descriptor = fs.openSync(lockPath, "wx", 0o600);
     try {
-      const staleAt = new Date(Date.now() - 60_000);
-      fs.futimesSync(descriptor, staleAt, staleAt);
       const before = fs.fstatSync(descriptor);
 
       expect(() =>
@@ -251,6 +249,29 @@ describe("exec approvals store helpers", () => {
       expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.dev, ino: before.ino });
       fs.writeFileSync(descriptor, `${JSON.stringify({ pid: process.pid })}\n`, "utf8");
       expect(fs.readFileSync(lockPath, "utf8")).toContain(`"pid":${process.pid}`);
+    } finally {
+      fs.closeSync(descriptor);
+      fs.rmSync(lockPath, { force: true });
+    }
+  });
+
+  it("reclaims an ownerless lock that outlived the payload-write window", () => {
+    const dir = createHomeDir();
+    ensureExecApprovals();
+    const lockPath = `${approvalsFilePath(dir)}.lock`;
+    const descriptor = fs.openSync(lockPath, "wx", 0o600);
+    try {
+      // A sidecar that never recorded an owner is only legitimate for the
+      // microseconds between its create and its payload write. Aged past that,
+      // it was abandoned by a writer that died in between, and nothing will
+      // ever release it: refusing to reclaim wedges every later writer.
+      const staleAt = new Date(Date.now() - 60_000);
+      fs.futimesSync(descriptor, staleAt, staleAt);
+
+      saveExecApprovals({ version: 1, defaults: { security: "full" }, agents: {} });
+
+      expect(readApprovalsFile(dir).defaults?.security).toBe("full");
+      expect(fs.existsSync(lockPath)).toBe(false);
     } finally {
       fs.closeSync(descriptor);
       fs.rmSync(lockPath, { force: true });

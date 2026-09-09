@@ -12,6 +12,7 @@ import {
   type ExecApprovalsFile,
   loadExecApprovals,
   loadExecApprovalsForExec,
+  loadExecApprovalsForExecWithRetry,
   recordAllowlistMatchesUse,
   resolveExecApprovalsPath,
   saveExecApprovals,
@@ -54,9 +55,24 @@ function lockPathForApprovals(): string {
 }
 
 function writeLockOwnedBy(payload: Record<string, unknown>): void {
+  writeRawLock(`${JSON.stringify(payload, null, 2)}\n`);
+}
+
+function writeRawLock(raw: string): void {
   const lockPath = lockPathForApprovals();
   fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(lockPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  fs.writeFileSync(lockPath, raw, { mode: 0o600 });
+}
+
+/** Backdate the sidecar past the owner-less grace window. */
+function ageLockBySeconds(seconds: number): void {
+  const lockPath = lockPathForApprovals();
+  const when = new Date(Date.now() - seconds * 1000);
+  fs.utimesSync(lockPath, when, when);
+}
+
+function listStateDirEntries(): string[] {
+  return fs.readdirSync(path.dirname(lockPathForApprovals()));
 }
 
 describe("exec approvals reliability", () => {
@@ -89,6 +105,90 @@ describe("exec approvals reliability", () => {
     const file = loadExecApprovalsForExec();
     expect(file.agents?.main?.allowlist?.[0]?.pattern).toBe("/usr/bin/uptime");
     expect(fs.existsSync(lockPathForApprovals())).toBe(false);
+  });
+
+  it("reclaims an owner-less lock left behind by a writer that died mid-create", () => {
+    saveExecApprovals(makeApprovalsFile());
+    // Exactly what a gateway killed between creating the sidecar and writing
+    // its payload leaves behind: a zero-byte lock naming nobody.
+    writeRawLock("");
+    ageLockBySeconds(30);
+    const file = loadExecApprovalsForExec();
+    expect(file.agents?.main?.allowlist?.[0]?.pattern).toBe("/usr/bin/uptime");
+    expect(fs.existsSync(lockPathForApprovals())).toBe(false);
+  });
+
+  it("reclaims an aged lock whose payload is unparseable", () => {
+    saveExecApprovals(makeApprovalsFile());
+    writeRawLock("{ truncated");
+    ageLockBySeconds(30);
+    expect(loadExecApprovalsForExec().agents?.main?.allowlist?.[0]?.pattern).toBe(
+      "/usr/bin/uptime",
+    );
+    expect(fs.existsSync(lockPathForApprovals())).toBe(false);
+  });
+
+  it("reclaims a lock whose recorded pid is dead and carries no start time", () => {
+    saveExecApprovals(makeApprovalsFile());
+    writeLockOwnedBy({ pid: 3999999, createdAt: new Date().toISOString(), nonce: "dead-no-start" });
+    expect(loadExecApprovalsForExec().agents?.main?.allowlist?.[0]?.pattern).toBe(
+      "/usr/bin/uptime",
+    );
+    expect(fs.existsSync(lockPathForApprovals())).toBe(false);
+  });
+
+  it("waits on a freshly created owner-less lock instead of stealing it", () => {
+    saveExecApprovals(makeApprovalsFile());
+    // Inside the grace window this is indistinguishable from a live writer that
+    // has not published its payload yet, so it must not be reclaimed.
+    writeRawLock("");
+    expect(() => loadExecApprovalsForExec()).toThrow(ExecApprovalsBusyError);
+    expect(fs.existsSync(lockPathForApprovals())).toBe(true);
+    fs.rmSync(lockPathForApprovals(), { force: true });
+  });
+
+  it("never clobbers a held lock and leaves no temp sidecar behind", () => {
+    saveExecApprovals(makeApprovalsFile());
+    const held = `${JSON.stringify({ pid: process.pid, nonce: "held" }, null, 2)}\n`;
+    writeRawLock(held);
+    expect(() => loadExecApprovalsForExec()).toThrow(ExecApprovalsBusyError);
+    expect(fs.readFileSync(lockPathForApprovals(), "utf8")).toBe(held);
+    fs.rmSync(lockPathForApprovals(), { force: true });
+    expect(listStateDirEntries().filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("retries through contention that clears and returns the store", async () => {
+    saveExecApprovals(makeApprovalsFile());
+    // pid 1 is alive and is not this process, so the lock is contended, not stale.
+    writeLockOwnedBy({ pid: 1, createdAt: new Date().toISOString(), nonce: "foreign" });
+    // The non-retrying loader gives up on exactly this state; the retrying one
+    // is what keeps contention from reaching the agent as a command failure.
+    expect(() => loadExecApprovalsForExec()).toThrow(ExecApprovalsBusyError);
+    const release = setTimeout(() => {
+      fs.rmSync(lockPathForApprovals(), { force: true });
+    }, 60);
+    try {
+      const file = await loadExecApprovalsForExecWithRetry({ retryDelaysMs: [0, 25, 50, 100] });
+      expect(file.agents?.main?.allowlist?.[0]?.pattern).toBe("/usr/bin/uptime");
+    } finally {
+      clearTimeout(release);
+      fs.rmSync(lockPathForApprovals(), { force: true });
+    }
+  });
+
+  it("surfaces an exhausted budget as a stuck lock that must not be retried", async () => {
+    saveExecApprovals(makeApprovalsFile());
+    writeLockOwnedBy({ pid: 1, createdAt: new Date().toISOString(), nonce: "foreign" });
+    const error = await loadExecApprovalsForExecWithRetry({ retryDelaysMs: [0, 10, 10] }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+    expect(error).toBeInstanceOf(ExecApprovalsBusyError);
+    const message = (error as Error).message;
+    expect(message).toContain("Retrying cannot clear it");
+    expect(message).toContain("3 attempts");
+    expect(message).not.toContain("retry the command");
+    fs.rmSync(lockPathForApprovals(), { force: true });
   });
 
   it("serves repeat reads from the stat-validated cache and sees atomic rewrites", () => {

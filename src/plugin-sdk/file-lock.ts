@@ -1,11 +1,13 @@
 // File lock helpers serialize plugin writes that share a filesystem-backed state file.
 import "../infra/fs-safe-defaults.js";
+import fs from "node:fs";
 import {
   acquireFileLock as acquireFsSafeFileLock,
   drainFileLockManagerForTest,
   resetFileLockManagerForTest,
 } from "@openclaw/fs-safe/file-lock";
 import {
+  isAbandonedOwnerlessLock,
   isLockOwnerDefinitelyStale,
   shouldRemoveDeadOwnerOrExpiredLock,
 } from "../infra/stale-lock-file.js";
@@ -57,6 +59,11 @@ export type FileLockStaleError = Error & {
 };
 
 const FILE_LOCK_MANAGER_KEY = "openclaw.plugin-sdk.file-lock";
+// A sidecar is owner-less only for the microseconds between its create and its
+// payload write. Past this window nothing will ever name or release it, and a
+// fail-closed lock that refuses to reclaim it stays wedged until a human
+// intervenes - the failure mode that took exec down for hours on 2026-09-08.
+const OWNERLESS_LOCK_GRACE_MS = 3_000;
 let currentProcessStartTime: number | null | undefined;
 
 function getCurrentProcessStartTime(): number | null {
@@ -64,6 +71,15 @@ function getCurrentProcessStartTime(): number | null {
     currentProcessStartTime = getFileLockProcessStartTime(process.pid);
   }
   return currentProcessStartTime;
+}
+
+function readLockSidecarAgeMs(lockPath: string, nowMs: number): number {
+  try {
+    return nowMs - fs.lstatSync(lockPath).mtimeMs;
+  } catch {
+    // Unreadable sidecar: report an age that can never clear the grace window.
+    return Number.NEGATIVE_INFINITY;
+  }
 }
 
 function normalizeLockError(err: unknown): never {
@@ -118,7 +134,12 @@ export async function acquireFileLock(
       },
       shouldReclaim: (params) =>
         staleRecovery === "fail-closed"
-          ? isLockOwnerDefinitelyStale({ payload: params.payload })
+          ? isLockOwnerDefinitelyStale({ payload: params.payload }) ||
+            isAbandonedOwnerlessLock({
+              payload: params.payload,
+              ageMs: readLockSidecarAgeMs(params.lockPath, params.nowMs),
+              graceMs: OWNERLESS_LOCK_GRACE_MS,
+            })
           : shouldRemoveDeadOwnerOrExpiredLock({
               payload: params.payload,
               staleMs: params.staleMs,

@@ -18,6 +18,7 @@ import {
   resolveExecApprovalAllowedDecisions,
   resolveExecApprovalsLocked,
   resolveExecApprovalsTranscriptPath,
+  resolveExecApprovalsWithoutStore,
   type ExecAsk,
   type ExecApprovalDecision,
   type ExecApprovalsResolved,
@@ -227,11 +228,24 @@ export async function resolveExecHostApprovalContext(params: {
   security: ExecSecurity;
   ask: ExecAsk;
   host: "gateway" | "node";
+  /**
+   * Whether the approvals store can still change this decision. Defaults to
+   * true, the conservative reading. Pass false only where config already
+   * resolved exec to "full" with ask "off" and nothing can receive an approval
+   * request: the store is then consulted neither for policy nor for its lock.
+   */
+  approvalsCanGate?: boolean;
 }): Promise<ExecHostApprovalContext> {
-  const approvals = await resolveExecApprovalsLocked(params.agentId, {
-    security: params.security,
-    ask: params.ask,
-  });
+  const approvals =
+    params.approvalsCanGate === false
+      ? resolveExecApprovalsWithoutStore(params.agentId, {
+          security: params.security,
+          ask: params.ask,
+        })
+      : await resolveExecApprovalsLocked(params.agentId, {
+          security: params.security,
+          ask: params.ask,
+        });
   // Session/config tool policy is the caller's requested contract. The host file
   // may tighten that contract, but it must not silently broaden it.
   const hostSecurity = minSecurity(params.security, approvals.agent.security);
