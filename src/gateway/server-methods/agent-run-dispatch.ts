@@ -156,6 +156,7 @@ export function dispatchAgentRunFromGateway(params: {
         timeoutPhase: timeoutAttribution.timeoutPhase,
         providerStarted: timeoutAttribution.providerStarted,
       });
+      const terminalSummary = aborted ? "aborted" : terminalOutcome.reason;
       if (taskTracked) {
         tryFinalizeTrackedAgentTask({
           runId: params.runId,
