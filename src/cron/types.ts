@@ -190,7 +190,7 @@ export type CronRunOutcome = {
   /** True once agent execution begins; retries after this point can replay side effects. */
   executionStarted?: boolean;
   /** Optional classifier for execution errors to guide fallback behavior. */
-  errorKind?: "delivery-target";
+  errorKind?: "delivery-target" | "native-busy";
   summary?: string;
   sessionId?: string;
   sessionKey?: string;

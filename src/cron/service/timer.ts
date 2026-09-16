@@ -627,6 +627,7 @@ function isScheduledTerminalOneShotRetry(
   if (lastRunStatus === "error") {
     return true;
   }
+  if (lastRunStatus === "skipped" && job.state.lastError === "NATIVE_BUSY") return true;
   return (
     lastRunStatus === "skipped" &&
     job.sessionTarget === "main" &&
@@ -779,6 +780,19 @@ export function applyJobResult(
   job.state.lastFailureNotificationDeliveryStatus = deliveryState.failureNotification.status;
   job.state.lastFailureNotificationDeliveryError = deliveryState.failureNotification.error;
   job.updatedAtMs = result.endedAt;
+
+  if (
+    result.status === "skipped" &&
+    result.errorKind === "native-busy" &&
+    result.error === "NATIVE_BUSY" &&
+    result.executionStarted === false
+  ) {
+    // Persist the original obligation through the existing scheduler. A busy
+    // owner is not a failed experiment and must not consume retry/error limits.
+    // Do not revive a job that an operator disabled while admission was attempted.
+    job.state.nextRunAtMs = isJobEnabled(job) ? result.endedAt + 60_000 : undefined;
+    return false;
+  }
 
   // Track consecutive errors for backoff / auto-disable; skipped runs use a
   // separate counter so opt-in skip alerts do not affect retry behavior.
@@ -1275,7 +1289,16 @@ async function onTimer(state: CronServiceState) {
     throw err;
   }
   try {
-    await admission.run(async () => await onAdmittedTimer(state));
+    await admission.run(async () => {
+      try {
+        await onAdmittedTimer(state);
+      } finally {
+        if (!state.stopped && !state.schedulingPaused && !state.restartRecoveryPending && state.deps.cronEnabled) {
+          try { await state.deps.onMaintenance?.(); }
+          catch (error) { state.deps.log.warn({ error: error instanceof Error ? error.name : "UNKNOWN" }, "cron: maintenance callback failed"); }
+        }
+      }
+    });
   } finally {
     admission.release();
   }
@@ -2327,6 +2350,8 @@ async function executeDetachedCronJob(
     return {
       status: res.status,
       error: res.error,
+      errorKind: res.errorKind,
+      executionStarted: res.executionStarted,
       deliveryError: res.deliveryError,
       summary: res.summary,
       delivered: res.delivered,
@@ -2380,6 +2405,7 @@ async function executeDetachedCronJob(
   return {
     status: res.status,
     error: res.error,
+    errorKind: res.errorKind,
     executionStarted: res.executionStarted,
     // Forward the post-run delivery failure recorded on an otherwise
     // successful run so the service can persist it as `lastDeliveryError` and

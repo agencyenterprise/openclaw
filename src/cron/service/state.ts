@@ -190,6 +190,8 @@ export type CronServiceDeps = {
     mode?: "announce" | "webhook";
     accountId?: string;
   }) => Promise<void>;
+  /** Existing timer maintenance, outside the store lock; no job execution implied. */
+  onMaintenance?: () => void | Promise<void>;
   onEvent?: (evt: CronEvent) => void;
 };
 

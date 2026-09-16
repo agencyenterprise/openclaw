@@ -1,5 +1,6 @@
 import { finiteSecondsToTimerSafeMilliseconds } from "@openclaw/normalization-core/number-coercion";
 import { runCommandWithTimeout } from "../process/exec.js";
+import { admitDispatchChild } from "../state/thread-dispatch.js";
 import {
   buildCronCommandSummary,
   isCronCommandActionCriticalLine,
@@ -98,6 +99,12 @@ export async function runCronCommandJob(params: {
   const command = formatCommand(payload.argv);
   const noOutputTimeoutMs = secondsToMs(payload.noOutputTimeoutSeconds);
   try {
+    const finishUnresolved = admitDispatchChild({
+      kind: "command_cron_process",
+      jobId: params.job.id,
+      argv: payload.argv,
+      cwd: payload.cwd ?? null,
+    });
     const result = await runCommandWithTimeout(payload.argv, {
       timeoutMs: secondsToMs(payload.timeoutSeconds) ?? DEFAULT_COMMAND_TIMEOUT_MS,
       ...(payload.cwd ? { cwd: payload.cwd } : {}),
@@ -108,7 +115,7 @@ export async function runCronCommandJob(params: {
       preserveOutputLine: isCronCommandActionCriticalLine,
       ...(params.abortSignal ? { signal: params.abortSignal } : {}),
       killProcessTree: true,
-    });
+    }).finally(() => finishUnresolved?.());
     const ok =
       result.code === 0 &&
       !result.killed &&

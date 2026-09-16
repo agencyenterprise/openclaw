@@ -57,6 +57,13 @@ import {
 } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
 import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
+import {
+  dispatchHash,
+  loadDispatchConfig,
+  NativeDispatchBusyError,
+  withThreadDispatch,
+} from "../state/thread-dispatch.js";
+import { resolveCronDispatchOrigin } from "./cron-dispatch-origin.js";
 import { createCronExitWatchers, type CronExitResult } from "./cron-exit-watchers.js";
 import type { GatewayCronServiceContract } from "./server-cron-contract.js";
 import {
@@ -120,12 +127,14 @@ function reconcileCronExitWatchers(params: {
   cronEnabled: boolean;
   exitWatchers: ReturnType<typeof createCronExitWatchers>;
   jobs: CronJob[];
+  retryOnly?: boolean;
 }) {
   if (!params.cronEnabled) {
     params.exitWatchers.cancelAll();
     return;
   }
-  params.exitWatchers.reconcile(params.jobs);
+  if (params.retryOnly) params.exitWatchers.retryPending(params.jobs);
+  else params.exitWatchers.reconcile(params.jobs);
 }
 
 /** Pick only the keys whose values are not `undefined` from an object. */
@@ -399,7 +408,7 @@ export function buildGatewayCronService(params: {
   };
   let exitWatcherReconciliations = 0;
   let exitWatcherGeneration = 0;
-  const reconcileExitWatchers = async () => {
+  const reconcileExitWatchers = async (retryOnly = false) => {
     const generation = exitWatcherGeneration;
     exitWatcherReconciliations += 1;
     try {
@@ -415,6 +424,7 @@ export function buildGatewayCronService(params: {
         cronEnabled,
         exitWatchers: exitWatchersRef.current,
         jobs,
+        retryOnly,
       });
     } catch (err) {
       cronLogger.warn({ err: String(err) }, "cron-exit: reconcile failed");
@@ -453,6 +463,7 @@ export function buildGatewayCronService(params: {
   };
 
   const cron = new CronService({
+    onMaintenance: () => reconcileExitWatchers(true),
     storePath,
     cronEnabled,
     cronConfig: params.cfg.cron,
@@ -565,10 +576,43 @@ export function buildGatewayCronService(params: {
       }
     },
     runCommandJob: async ({ job, abortSignal }) => {
-      const result = await runCronCommandJob({
-        job,
-        abortSignal,
-        nowMs: Date.now,
+      const { agentId: dispatchAgentId, cfg: dispatchRuntimeConfig } = resolveCronAgent(
+        job.agentId,
+      );
+      const dispatchConfig = loadDispatchConfig();
+      const result = await withThreadDispatch({
+        config: dispatchConfig,
+        sessionKey: dispatchConfig
+          ? resolveCronDispatchOrigin(job, dispatchAgentId, dispatchRuntimeConfig)
+          : resolveCronSessionTargetSessionKey(job.sessionTarget),
+        operationId: `command-cron:${job.id}:${job.state.runningAtMs ?? "missing"}`,
+        kind: "native",
+        identity: {
+          jobId: job.id,
+          runningAtMs: job.state.runningAtMs ?? null,
+          sessionTarget: job.sessionTarget,
+          payload: job.payload,
+        },
+        run: () => runCronCommandJob({ job, abortSignal, nowMs: Date.now }),
+        // A normally returned wrapper result completes only the native owner,
+        // including nonzero exits; independent child UNKNOWN claims remain.
+        terminalReceipt: (result) =>
+          dispatchHash({
+            kind: "command_cron_terminal",
+            jobId: job.id,
+            runningAtMs: job.state.runningAtMs ?? null,
+            status: result.status,
+          }),
+      }).catch((error) => {
+        if (error instanceof NativeDispatchBusyError)
+          return {
+            status: "skipped" as const,
+            error: "NATIVE_BUSY",
+            errorKind: "native-busy" as const,
+            executionStarted: false,
+            summary: undefined,
+          };
+        throw error;
       });
       const plan = resolveCronDeliveryPlan(job);
       const deliveryTrace = {
@@ -797,6 +841,10 @@ export function buildGatewayCronService(params: {
 
   exitWatchersRef.current = createCronExitWatchers({
     getProcessSupervisor,
+    resolveDispatchOrigin: (job) => {
+      const { agentId, cfg } = resolveCronAgent(job.agentId);
+      return resolveCronDispatchOrigin(job, agentId, cfg);
+    },
     persistCompletion: async (jobId) =>
       await runWithGatewayIndependentRootWorkAdmission(async () => {
         await cron.update(jobId, { enabled: false });

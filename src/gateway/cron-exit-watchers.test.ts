@@ -98,9 +98,9 @@ function onExitJob(id: string, command = "true", enabled = true): CronJob {
 
 const noopLogger = { info: () => {}, warn: () => {} };
 
+// Drain asynchronous lifecycle continuations without assuming a fixed promise depth.
 const flush = async () => {
-  await Promise.resolve();
-  await Promise.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
 };
 
 describe("createCronExitWatchers", () => {

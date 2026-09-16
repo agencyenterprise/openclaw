@@ -1,3 +1,4 @@
+import fs from "node:fs";
 // Gateway cron tests cover isolated agent turns, heartbeat wakeups, completion
 // delivery, lifecycle cleanup, hook emission, and SSRF-guarded webhooks.
 import os from "node:os";
@@ -6,10 +7,18 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CliDeps } from "../cli/deps.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { SsrFBlockedError } from "../infra/net/ssrf.js";
+import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import {
   getActiveGatewayRootWorkCount,
   resetGatewayWorkAdmission,
 } from "../process/gateway-work-admission.js";
+import {
+  admitThreadDispatch,
+  dispatchHash,
+  NativeDispatchBusyError,
+  settleThreadDispatch,
+  withThreadDispatch,
+} from "../state/thread-dispatch.js";
 import { createDeferred } from "../test-utils/deferred.js";
 
 type RunCronIsolatedAgentTurnMock = (params: {
@@ -297,7 +306,112 @@ function expectCleanupForSessionKeys(sessionKeys: string[]) {
   expect(options.onWarn).toBeTypeOf("function");
 }
 
+const V2_BUSY_SCHEMA =
+  "CREATE TABLE thread_fences (\n scope_key TEXT PRIMARY KEY NOT NULL,\n epoch INTEGER NOT NULL CHECK(epoch >= 1),\n state TEXT NOT NULL CHECK(state IN ('OPEN','DRAINING','RETIRED')),\n updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)\n) STRICT;\nCREATE TABLE thread_dispatch_claims (\n claim_id TEXT PRIMARY KEY NOT NULL,\n scope_key TEXT NOT NULL REFERENCES thread_fences(scope_key),\n epoch INTEGER NOT NULL CHECK(epoch >= 1),\n fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64),\n kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 64),\n state TEXT NOT NULL CHECK(state IN ('STARTING','RUNNING','UNKNOWN','TERMINAL')),\n created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),\n updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),\n terminal_receipt TEXT,\n CHECK((state='TERMINAL' AND terminal_receipt IS NOT NULL AND length(terminal_receipt)=64)\n       OR (state!='TERMINAL' AND terminal_receipt IS NULL))\n) STRICT;\nCREATE INDEX thread_dispatch_open_claims ON thread_dispatch_claims(scope_key,epoch,state);\nCREATE UNIQUE INDEX thread_dispatch_one_native ON thread_dispatch_claims(scope_key) WHERE kind='native' AND state!='TERMINAL';\nPRAGMA user_version=2;\n";
+
 describe("buildGatewayCronService", () => {
+  it("retains a busy one-shot durably and executes once after the native owner terminates", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-14T12:00:00Z"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cron-native-busy-"));
+    const dbPath = path.join(dir, "dispatch.sqlite");
+    const db = new (requireNodeSqlite().DatabaseSync)(dbPath);
+    db.exec(V2_BUSY_SCHEMA);
+    fs.chmodSync(dbPath, 0o600);
+    const scope = "slack/C123/1788816064.061969";
+    db.prepare("INSERT INTO thread_fences VALUES (?,1,'OPEN',0)").run(scope);
+    const dispatchConfig = {
+      databasePath: dbPath,
+      scopes: { [scope]: 1 },
+      sessionScopes: { test: scope },
+    };
+    const owner = {
+      claimId: "current-owner",
+      scopeKey: scope,
+      epoch: 1,
+      fingerprint: dispatchHash("owner"),
+      kind: "native",
+    };
+    admitThreadDispatch(dispatchConfig, owner);
+    let effects = 0;
+    runCronIsolatedAgentTurnMock.mockImplementation(async () => {
+      try {
+        await withThreadDispatch({
+          config: dispatchConfig,
+          sessionKey: "test",
+          operationId: "queued-cron-arrival",
+          kind: "native",
+          identity: {},
+          run: async () => {
+            effects += 1;
+          },
+          terminalReceipt: () => dispatchHash("observed-native-terminal"),
+        });
+        return { status: "ok", summary: "synthetic effect complete" };
+      } catch (error) {
+        if (!(error instanceof NativeDispatchBusyError)) throw error;
+        return {
+          status: "skipped",
+          error: "NATIVE_BUSY",
+          errorKind: "native-busy",
+          executionStarted: false,
+        } as never;
+      }
+    });
+    const cfg = createCronConfig("server-cron-native-busy-v2");
+    loadConfigMock.mockReturnValue(cfg);
+    const state = buildGatewayCronService({ cfg, deps: {} as CliDeps, broadcast: () => {} });
+    let resumed: ReturnType<typeof buildGatewayCronService> | undefined;
+    try {
+      const job = await state.cron.add({
+        name: "busy-arrival",
+        enabled: true,
+        schedule: { kind: "at", at: new Date(1).toISOString() },
+        sessionTarget: "isolated",
+        wakeMode: "now",
+        deleteAfterRun: false,
+        payload: { kind: "agentTurn", message: "synthetic-only busy arrival" },
+        delivery: { mode: "none" },
+      });
+      await state.cron.run(job.id, "force");
+      const saved = (await state.cron.list({ includeDisabled: true })).find(
+        (entry) => entry.id === job.id,
+      );
+      expect(saved?.enabled).toBe(true);
+      expect(saved?.state.lastError).toBe("NATIVE_BUSY");
+      expect(saved?.state.nextRunAtMs).toBeGreaterThan(Date.now());
+      expect(saved?.state.consecutiveErrors ?? 0).toBe(0);
+      expect(effects).toBe(0);
+      state.cron.stop();
+      resumed = buildGatewayCronService({ cfg, deps: {} as CliDeps, broadcast: () => {} });
+      const retained = (await resumed.cron.list({ includeDisabled: true })).find(
+        (entry) => entry.id === job.id,
+      );
+      expect(retained?.state.nextRunAtMs).toBe(saved?.state.nextRunAtMs);
+      expect(retained?.enabled).toBe(true);
+      settleThreadDispatch(dispatchConfig, owner, dispatchHash("owner-observed-terminal"));
+      vi.setSystemTime(retained!.state.nextRunAtMs!);
+      await resumed.cron.run(job.id, "due");
+      expect(effects).toBe(1);
+      await resumed.cron.run(job.id, "due");
+      expect(effects).toBe(1);
+      const done = (await resumed.cron.list({ includeDisabled: true })).find(
+        (entry) => entry.id === job.id,
+      );
+      expect(done?.enabled).toBe(false);
+      expect(done?.state.lastRunStatus).toBe("ok");
+    } finally {
+      state.cron.stop();
+      resumed?.cron.stop();
+      db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      runCronIsolatedAgentTurnMock.mockImplementation(async () => ({
+        status: "ok",
+        summary: "ok",
+      }));
+      vi.useRealTimers();
+    }
+  });
   beforeEach(() => {
     enqueueSystemEventMock.mockClear();
     consumeSelectedSystemEventEntriesMock.mockClear();
@@ -723,6 +837,79 @@ describe("buildGatewayCronService", () => {
       state.cron.stop();
     }
   });
+
+  it("preserves main command rejection before dispatch", async () => {
+    const cfg = createCronConfig("server-cron-main-command-refusal");
+    loadConfigMock.mockReturnValue(cfg);
+    const state = buildGatewayCronService({ cfg, deps: {} as CliDeps, broadcast: () => {} });
+    try {
+      await expect(
+        state.cron.add({
+          name: "invalid-main-command",
+          enabled: true,
+          schedule: { kind: "at", at: new Date(1).toISOString() },
+          sessionTarget: "main",
+          wakeMode: "now",
+          payload: { kind: "command", argv: ["false"] },
+          delivery: { mode: "none" },
+        }),
+      ).rejects.toThrow('main cron jobs require payload.kind="systemEvent"');
+    } finally {
+      state.cron.stop();
+    }
+  });
+
+  it.each(["isolated", "current"] as const)(
+    "runs actual command cron with persisted %s origin under opt-in",
+    async (target) => {
+      const cfg = createCronConfig("server-cron-origin-" + target);
+      loadConfigMock.mockReturnValue(cfg);
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "command-origin-"));
+      const marker = path.join(dir, "ran");
+      const dispatchPath = path.join(dir, "dispatch.json");
+      const state = buildGatewayCronService({ cfg, deps: {} as CliDeps, broadcast: () => {} });
+      try {
+        const job = await state.cron.add({
+          name: "origin-fixture",
+          enabled: true,
+          deleteAfterRun: false,
+          schedule: { kind: "at", at: new Date(1).toISOString() },
+          sessionTarget: target,
+          ...(target === "current" ? { sessionKey: "agent:main:main" } : {}),
+          wakeMode: "next-heartbeat",
+          payload: {
+            kind: "command",
+            argv: [
+              process.execPath,
+              "-e",
+              "require('node:fs').writeFileSync(process.argv[1], 'one')",
+              marker,
+            ],
+          },
+          delivery: { mode: "none" },
+        });
+        fs.writeFileSync(
+          dispatchPath,
+          JSON.stringify({
+            databasePath: path.join(dir, "unused.sqlite"),
+            scopes: { "slack/C123/100.000001": 1 },
+            sessionScopes: {},
+            unscopedSessionKeys: ["agent:main:main"],
+            unscopedCronSessionKeys: [`agent:main:cron:${job.id}`],
+          }),
+          { mode: 0o600 },
+        );
+        vi.stubEnv("OPENCLAW_THREAD_DISPATCH_CONFIG", dispatchPath);
+        await state.cron.run(job.id, "force");
+        expect(state.cron.getJob(job.id)?.state.lastRunStatus).toBe("ok");
+        expect(fs.readFileSync(marker, "utf8")).toBe("one");
+      } finally {
+        state.cron.stop();
+        vi.unstubAllEnvs();
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("suppresses command cron NO_REPLY output before announce delivery", async () => {
     const cfg = createCronConfig("server-cron-command-no-reply");

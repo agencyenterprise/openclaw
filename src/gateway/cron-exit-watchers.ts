@@ -1,6 +1,7 @@
 import type { CronJob } from "../cron/types.js";
 import { markOpenClawExecEnv } from "../infra/openclaw-exec-env.js";
 import type { ManagedRun, ProcessSupervisor } from "../process/supervisor/index.js";
+import { dispatchHash, loadDispatchConfig, readNativeAdmissionBusy, withThreadDispatch } from "../state/thread-dispatch.js";
 import { resolveExitWatchShell } from "./cron-exit-watch-shell.js";
 
 /**
@@ -29,6 +30,7 @@ export type CronExitResult = {
 
 type CronExitWatchers = {
   reconcile: (jobs: CronJob[]) => void;
+  retryPending: (jobs: CronJob[]) => void;
   cancel: (jobId: string) => void;
   cancelAll: () => void;
   activeJobIds: () => string[];
@@ -46,6 +48,7 @@ function isWatchableExitJob(job: CronJob): job is OnExitCronJob {
 
 export function createCronExitWatchers(params: {
   getProcessSupervisor: () => ProcessSupervisor;
+  resolveDispatchOrigin?: (job: CronJob) => string;
   persistCompletion: (jobId: string) => Promise<void>;
   fireOnExit: (job: CronJob, exit: CronExitResult) => void | Promise<void>;
   logger: Logger;
@@ -69,12 +72,18 @@ export function createCronExitWatchers(params: {
     cwd: string | undefined;
   };
   const active = new Map<string, WatcherSlot>();
+  // The original enabled persisted job is the restart-safe obligation. This
+  // process-local cooldown never replaces its identity or authorizes replay.
+  const busyRetries = new Map<string, { operationId: string; notBeforeMs: number }>();
+  const operationIdFor = (job: OnExitCronJob) =>
+    `cron-watch:${job.id}:${job.updatedAtMs}:${dispatchHash({ command: job.schedule.command, cwd: job.schedule.cwd ?? null })}`;
   // A cancelled child can keep running until the supervisor observes exit.
   // Retain those slots separately so replacement arms can own the job id while
   // suspension still sees every predecessor that is settling.
   const settlingCancelledSlots = new Set<WatcherSlot>();
 
   const cancel = (jobId: string) => {
+    busyRetries.delete(jobId);
     const slot = active.get(jobId);
     if (!slot) {
       return;
@@ -117,61 +126,107 @@ export function createCronExitWatchers(params: {
     };
     active.set(job.id, slot);
     const owns = () => active.get(job.id) === slot && slot.armToken === armToken;
+    const operationId = operationIdFor(job);
+    let entered = false;
+    let admissionAttempted = false;
     void (async () => {
-      let run: ManagedRun;
+      let exit: Awaited<ReturnType<ManagedRun["wait"]>> | undefined;
       try {
-        run = await params.getProcessSupervisor().spawn({
-          sessionId: `cron-exit:${job.id}`,
-          backendId: "cron-exit-watch",
-          scopeKey: scopeKey(job.id),
-          replaceExistingScope: true,
-          mode: "child",
-          argv: [shell.command, ...shell.argsFor(command)],
-          ...(cwd ? { cwd } : {}),
-          // Mark the child as an OpenClaw-launched subprocess (loop protection /
-          // detection) and bound its lifetime — consistent with how cron
-          // command-payload jobs run via runCommandWithTimeout.
-          env: markOpenClawExecEnv({ ...process.env }),
-          timeoutMs: ON_EXIT_WATCH_TIMEOUT_MS,
-          captureOutput: true,
+        const config = loadDispatchConfig();
+        const sessionKey = config ? params.resolveDispatchOrigin?.(job) : undefined;
+        admissionAttempted = true;
+        exit = await withThreadDispatch({
+          config,
+          sessionKey,
+          operationId,
+          kind: "native",
+          identity: { jobId: job.id, updatedAtMs: job.updatedAtMs, command, cwd: cwd ?? null },
+          run: async () => {
+            entered = true;
+            let run: ManagedRun;
+            try {
+              run = await params.getProcessSupervisor().spawn({
+                sessionId: `cron-exit:${job.id}`,
+                backendId: "cron-exit-watch",
+                scopeKey: scopeKey(job.id),
+                replaceExistingScope: true,
+                mode: "child",
+                argv: [shell.command, ...shell.argsFor(command)],
+                ...(cwd ? { cwd } : {}),
+                // Mark the child as an OpenClaw-launched subprocess (loop protection /
+                // detection) and bound its lifetime — consistent with how cron
+                // command-payload jobs run via runCommandWithTimeout.
+                env: markOpenClawExecEnv({ ...process.env }),
+                timeoutMs: ON_EXIT_WATCH_TIMEOUT_MS,
+                captureOutput: true,
+              });
+            } catch (err) {
+              if (owns()) {
+                active.delete(job.id);
+              }
+              params.logger.warn(
+                { err: String(err), jobId: job.id },
+                "cron-exit: watcher spawn failed",
+              );
+              return;
+            }
+            if (!owns()) {
+              // Cancelled or re-armed (changed command/cwd) while the spawn was in
+              // flight — kill this now-orphaned child instead of leaking it. Wait for
+              // supervisor settlement so suspension cannot snapshot a live child.
+              run.cancel("manual-cancel");
+              try {
+                await run.wait();
+              } catch {
+                // The watcher was already cancelled; settlement, not outcome, matters.
+              }
+              return;
+            }
+            slot.run = run;
+            params.logger.info(
+              { jobId: job.id, runId: run.runId, command },
+              "cron-exit: watcher armed",
+            );
+            let exit: Awaited<ReturnType<ManagedRun["wait"]>>;
+            try {
+              exit = await run.wait();
+            } catch (err) {
+              // run.wait() rejected (e.g. supervisor error) rather than resolving with
+              // an exit. Release the slot so a future reconcile can re-arm, and avoid
+              // an unhandled rejection. FAIL CLOSED: do not fire on an unknown outcome.
+              if (owns()) {
+                active.delete(job.id);
+              }
+              params.logger.warn(
+                { err: String(err), jobId: job.id },
+                "cron-exit: run.wait() rejected; released watcher slot without firing",
+              );
+              return;
+            }
+            return exit;
+          },
+          terminalReceipt: (result) =>
+            result
+              ? dispatchHash({
+                  kind: "cron_watch_terminal",
+                  jobId: job.id,
+                  exitCode: result.exitCode,
+                  reason: result.reason,
+                })
+              : undefined,
         });
       } catch (err) {
         if (owns()) {
+          const refusal = readNativeAdmissionBusy(err);
+          if (admissionAttempted && !entered && refusal?.claimId === operationId) {
+            busyRetries.set(job.id, { operationId, notBeforeMs: Date.now() + 60_000 });
+          }
           active.delete(job.id);
         }
-        params.logger.warn({ err: String(err), jobId: job.id }, "cron-exit: watcher spawn failed");
+        params.logger.warn({ err: String(err), jobId: job.id }, "cron-exit: dispatch refused");
         return;
       }
-      if (!owns()) {
-        // Cancelled or re-armed (changed command/cwd) while the spawn was in
-        // flight — kill this now-orphaned child instead of leaking it. Wait for
-        // supervisor settlement so suspension cannot snapshot a live child.
-        run.cancel("manual-cancel");
-        try {
-          await run.wait();
-        } catch {
-          // The watcher was already cancelled; settlement, not outcome, matters.
-        }
-        return;
-      }
-      slot.run = run;
-      params.logger.info({ jobId: job.id, runId: run.runId, command }, "cron-exit: watcher armed");
-      let exit: Awaited<ReturnType<ManagedRun["wait"]>>;
-      try {
-        exit = await run.wait();
-      } catch (err) {
-        // run.wait() rejected (e.g. supervisor error) rather than resolving with
-        // an exit. Release the slot so a future reconcile can re-arm, and avoid
-        // an unhandled rejection. FAIL CLOSED: do not fire on an unknown outcome.
-        if (owns()) {
-          active.delete(job.id);
-        }
-        params.logger.warn(
-          { err: String(err), jobId: job.id },
-          "cron-exit: run.wait() rejected; released watcher slot without firing",
-        );
-        return;
-      }
+      if (!exit) return;
       if (!owns()) {
         return;
       }
@@ -227,8 +282,11 @@ export function createCronExitWatchers(params: {
     });
   };
 
-  const reconcile = (jobs: CronJob[]) => {
+  const reconcile = (jobs: CronJob[], retryOnly = false) => {
     const want = new Map(jobs.filter(isWatchableExitJob).map((j) => [j.id, j] as const));
+    for (const jobId of busyRetries.keys()) {
+      if (!want.has(jobId)) busyRetries.delete(jobId);
+    }
     // Cancel watchers whose job is gone or no longer watchable.
     for (const jobId of Array.from(active.keys())) {
       if (!want.has(jobId)) {
@@ -250,18 +308,27 @@ export function createCronExitWatchers(params: {
         }
         cancel(jobId);
       }
+      const retry = busyRetries.get(jobId);
+      if (retryOnly && (!retry || retry.operationId !== operationIdFor(job))) {
+        busyRetries.delete(jobId);
+        continue;
+      }
+      if (retry && retry.operationId === operationIdFor(job) && Date.now() < retry.notBeforeMs) continue;
+      busyRetries.delete(jobId);
       arm(job);
     }
   };
 
   const cancelAll = () => {
+    busyRetries.clear();
     for (const jobId of Array.from(active.keys())) {
       cancel(jobId);
     }
   };
 
   return {
-    reconcile,
+    reconcile: (jobs) => reconcile(jobs),
+    retryPending: (jobs) => reconcile(jobs, true),
     cancel,
     cancelAll,
     activeJobIds: () =>

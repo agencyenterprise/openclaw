@@ -1,3 +1,5 @@
+import { bindCronDispatchSession, withCronDispatchOwner, loadDispatchConfig } from "../../state/thread-dispatch.js";
+import { resolveCronDispatchOrigin } from "../../gateway/cron-dispatch-origin.js";
 import { isDeepStrictEqual } from "node:util";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { retireSessionMcpRuntime } from "../../agents/agent-bundle-mcp-tools.js";
@@ -52,6 +54,7 @@ import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { resolveNonNegativeNumber } from "../../shared/number-coercion.js";
 import { resolveCronSkillsSnapshot } from "../../skills/runtime/cron-snapshot.js";
 import type { SkillSnapshot } from "../../skills/types.js";
+import { NativeDispatchBusyError } from "../../state/thread-dispatch.js";
 import { removeCronRunContinuationSessionIfIdle } from "../../tasks/cron-run-continuation-cleanup.js";
 import {
   hasExplicitCronDeliveryTarget,
@@ -1618,7 +1621,22 @@ async function disposeCronRunContext(params: {
 }
 
 /** Runs one isolated cron agent turn, including setup, execution, delivery, and persistence. */
-export async function runCronIsolatedAgentTurn(params: {
+export async function runCronIsolatedAgentTurn(params: Parameters<typeof runCronIsolatedAgentTurnInternal>[0]): Promise<RunCronAgentTurnResult> {
+  if (!loadDispatchConfig()) return runCronIsolatedAgentTurnInternal(params);
+  return withCronDispatchOwner({
+    sessionKey: resolveCronDispatchOrigin(params.job, params.agentId ?? "main", params.cfg),
+    operationId: `isolated-cron:${params.job.id}:${params.job.state.runningAtMs ?? "missing"}`,
+    identity: { jobId: params.job.id, runningAtMs: params.job.state.runningAtMs ?? null,
+      sourceSessionKey: params.job.sessionKey, sessionTarget: params.job.sessionTarget, message: params.message },
+    run: () => runCronIsolatedAgentTurnInternal(params),
+    completed: result => result.status === "ok" && !(params.abortSignal ?? params.signal)?.aborted,
+  }).catch((error): RunCronAgentTurnResult => {
+    if (error instanceof NativeDispatchBusyError) return { status: "skipped", error: "NATIVE_BUSY", errorKind: "native-busy", executionStarted: false };
+    throw error;
+  });
+}
+
+async function runCronIsolatedAgentTurnInternal(params: {
   cfg: OpenClawConfig;
   deps: CliDeps;
   job: CronJob;
@@ -1650,6 +1668,7 @@ export async function runCronIsolatedAgentTurn(params: {
   if (!prepared.ok) {
     return prepared.result;
   }
+  bindCronDispatchSession(prepared.context.runSessionKey);
   // Capture the stable run id before execution can rotate its persisted session.
   const initialSessionId = prepared.context.cronSession.sessionEntry.sessionId;
   const ownsRunContext = params.job.sessionTarget === "isolated";
@@ -1807,6 +1826,14 @@ export async function runCronIsolatedAgentTurn(params: {
     }
     return finalized;
   } catch (err) {
+    if (err instanceof NativeDispatchBusyError) {
+      return prepared.context.withRunSession({
+        status: "skipped",
+        error: "NATIVE_BUSY",
+        errorKind: "native-busy",
+        executionStarted: false,
+      });
+    }
     const isCronLaneTimeout = isAborted() || isCronNestedLaneTaskTimeoutError(err);
     const error = isCronLaneTimeout ? abortReason() : String(err);
     outcome = "error";
