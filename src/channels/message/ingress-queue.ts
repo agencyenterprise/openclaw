@@ -144,6 +144,8 @@ export type ChannelIngressQueue<TPayload, TMetadata = unknown, TCompletedMetadat
     },
   ): Promise<ChannelIngressQueueEnqueueResult<TPayload, TMetadata, TCompletedMetadata>>;
   listPending(options?: {
+    /** Restrict selection before pagination so unrelated lanes cannot starve this owner. */
+    laneKey?: string;
     limit?: number | "all";
     orderBy?: "received" | "id";
   }): Promise<Array<ChannelIngressQueueRecord<TPayload, TMetadata>>>;
@@ -556,6 +558,10 @@ export function createChannelIngressQueue<
     TMetadata,
     TCompletedMetadata
   >["listPending"] = async (listOptions) => {
+    const laneKey = listOptions?.laneKey;
+    if (laneKey !== undefined && (typeof laneKey !== "string" || !laneKey.trim())) {
+      throw new Error("Channel ingress lane filter cannot be empty");
+    }
     const { db } = openStateDatabase(options.stateDir);
     const kysely = getChannelIngressKysely(db);
     const limit = normalizeLimit(listOptions?.limit);
@@ -567,6 +573,9 @@ export function createChannelIngressQueue<
         .selectAll()
         .where("queue_name", "=", queueName)
         .where("status", "=", "pending");
+      if (laneKey !== undefined) {
+        pageQuery = pageQuery.where("lane_key", "=", laneKey.trim());
+      }
       if (lastRow) {
         const cursor = lastRow;
         pageQuery =

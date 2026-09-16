@@ -16,6 +16,11 @@ import { emitSlackMessageDeletedHook } from "../../message-deleted-hook.js";
 import type { SlackAppMentionEvent, SlackMessageEvent } from "../../types.js";
 import { normalizeSlackChannelType } from "../channel-type.js";
 import type { SlackMonitorContext } from "../context.js";
+import {
+  observeSlackIngressFailure,
+  slackIngressHeldError,
+  withSlackIngressOptions,
+} from "../durable-adoption.js";
 import { resolveSlackEventScope, type SlackEventScope } from "../event-scope.js";
 import { appendSlackInboundRecoveryLog } from "../inbound-recovery-log.js";
 import type { SlackMessageHandler } from "../message-handler.js";
@@ -319,11 +324,15 @@ export function registerSlackMessageEvents(params: {
         return;
       }
 
-      await handleSlackMessage(message, {
-        source: "message",
-        ...(eventScope ? { eventScope, awaitDispatch: true } : {}),
-      });
+      await handleSlackMessage(
+        message,
+        withSlackIngressOptions(typeof event === "object" && event !== null ? event : {}, {
+          source: "message" as const,
+          ...(eventScope ? { eventScope, awaitDispatch: true } : {}),
+        }),
+      );
     } catch (err) {
+      if (typeof event === "object" && event !== null && observeSlackIngressFailure(event, err)) throw slackIngressHeldError();
       ctx.runtime.error?.(danger(`slack handler failed: ${formatErrorMessage(err)}`));
     }
   };
@@ -399,13 +408,14 @@ export function registerSlackMessageEvents(params: {
 
         await handleSlackMessage(
           withSlackRedeliverySource(mention as unknown as SlackMessageEvent, context),
-          {
-            source: "app_mention",
+          withSlackIngressOptions(typeof event === "object" && event !== null ? event : {}, {
+            source: "app_mention" as const,
             wasMentioned: true,
             ...(eventScope ? { eventScope, awaitDispatch: true } : {}),
-          },
+          }),
         );
       } catch (err) {
+        if (typeof event === "object" && event !== null && observeSlackIngressFailure(event, err)) throw slackIngressHeldError();
         ctx.runtime.error?.(danger(`slack mention handler failed: ${formatErrorMessage(err)}`));
       }
     },

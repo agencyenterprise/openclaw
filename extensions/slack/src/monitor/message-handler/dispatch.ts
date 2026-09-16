@@ -92,6 +92,7 @@ import type { SlackMessageEvent } from "../../types.js";
 import { normalizeSlackAllowOwnerEntry } from "../allow-list.js";
 import { resolveStorePath, updateLastRoute } from "../config.runtime.js";
 import { recordInboundSession } from "../conversation.runtime.js";
+import { getSlackIngressAdoptionCallback } from "../durable-adoption.js";
 import { escapeSlackMrkdwn } from "../mrkdwn.js";
 import {
   createSlackReplyDeliveryPlan,
@@ -2117,6 +2118,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
       history: prepared.turn.history,
       botLoopProtection: resolveSlackBotLoopProtection(prepared),
       replyOptions: {
+        onTurnAdopted: getSlackIngressAdoptionCallback(prepared.ctxPayload),
         skillFilter: prepared.channelConfig?.skills,
         sourceReplyDeliveryMode,
         // Room events are observe-style turns; Slack status indicators imply an

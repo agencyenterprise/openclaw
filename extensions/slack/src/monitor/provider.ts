@@ -1,3 +1,7 @@
+import { createChannelIngressQueue } from "openclaw/plugin-sdk/reply-runtime";
+import { createSlackDurableMonitor } from "./durable-monitor.js";
+import { loadSlackDurableMonitorConfig } from "./durable-monitor-config.js";
+import type { SlackIngressPayload, SlackIngressMetadata } from "./durable-ingress.js";
 // Slack provider module implements model/runtime integration.
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
@@ -329,8 +333,25 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
   const mediaMaxBytes = (opts.mediaMaxMb ?? slackCfg.mediaMaxMb ?? 20) * 1024 * 1024;
   const removeAckAfterReply = cfg.messages?.removeAckAfterReply ?? false;
   const clientOptions = resolveSlackWebClientOptions();
+  const durableConfig = loadSlackDurableMonitorConfig(account.accountId, slackMode);
+  let durableBotIdentity: { botUserId?: string; botId?: string } | undefined;
+  const durableMonitor = durableConfig ? createSlackDurableMonitor({
+    scope: durableConfig.scope,
+    getIgnoredBotIdentity: () => durableBotIdentity,
+    queue: createChannelIngressQueue<SlackIngressPayload, SlackIngressMetadata, SlackIngressMetadata>({
+      channelId: "slack-durable-v1",
+      accountId: account.accountId,
+      stateDir: durableConfig.stateDir,
+    }),
+    onHeld: () => runtime.error?.("SLACK_DURABLE_INGRESS_HELD_UNCERTAIN"),
+  }) : undefined;
   const { app, receiver, socketModeLogger } = createSlackBoltApp({
     interop: await getSlackBoltInterop(),
+    ...(durableMonitor ? {
+      // SDK event/receiver nominal types differ; the adapter preserves the real receiver.
+      decorateReceiver: (value: import("@slack/bolt").Receiver) =>
+        durableMonitor.wrapReceiver(value as unknown as Parameters<typeof durableMonitor.wrapReceiver>[0]) as import("@slack/bolt").Receiver,
+    } : {}),
     slackMode,
     botToken,
     appToken: slackMode === "socket" ? (appToken ?? undefined) : undefined,
@@ -339,6 +360,8 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     clientOptions: clientOptions as Record<string, unknown>,
     ...(slackCfg.socketMode ? { socketMode: slackCfg.socketMode } : {}),
   });
+
+  durableMonitor?.bindApp(app as unknown as Parameters<NonNullable<typeof durableMonitor>["bindApp"]>[0]);
 
   // Pre-set shuttingDown on the SocketModeClient before app.stop() to prevent
   // a race where the library's internal ping timeout fires disconnect() before
@@ -430,6 +453,15 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
   const teamId = installationIdentity.kind === "workspace" ? installationIdentity.teamId : "";
   const apiAppId =
     installationIdentity.kind === "degraded" ? "" : (installationIdentity.apiAppId ?? "");
+  if (durableConfig && (installationIdentity.kind !== "workspace" ||
+      teamId !== durableConfig.scope.teamId || apiAppId !== durableConfig.scope.appId)) {
+    durableMonitor?.stop();
+    try { await gracefulStop(); } finally { unregisterSocketModeConnectionDiagnostics(); }
+    throw new Error("SLACK_DURABLE_INGRESS_AUTH_IDENTITY_MISMATCH");
+  }
+  if (durableConfig && authTestError === undefined && botUserId && botId) {
+    durableBotIdentity = Object.freeze({ botUserId, botId });
+  }
   if (authTestError !== undefined) {
     runtime.log?.(
       warn(
@@ -711,6 +743,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
   }
 
   const stopOnAbort = () => {
+    durableMonitor?.stop();
     if (opts.abortSignal?.aborted && slackMode === "socket") {
       void gracefulStop();
     }
@@ -718,6 +751,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
   opts.abortSignal?.addEventListener("abort", stopOnAbort, { once: true });
 
   try {
+    if (!opts.abortSignal?.aborted) void durableMonitor?.start();
     if (slackMode === "socket") {
       let reconnectAttempts = 0;
       let hasLoggedSocketConnected = false;
@@ -825,6 +859,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
       }
     }
   } finally {
+    durableMonitor?.stop();
     await presenceMonitor?.stop();
     if (slackMode === "relay") {
       setSlackDefaultSendIdentity(account.accountId, undefined);

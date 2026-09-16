@@ -314,6 +314,7 @@ export function createSlackBoltApp(params: {
   slackWebhookPath: string;
   clientOptions: Record<string, unknown>;
   socketMode?: SlackSocketModeConfig;
+  decorateReceiver?: (receiver: SlackReceiver) => SlackReceiver;
 }) {
   const socketModeLogger = createSlackSocketModeLogger();
   const socketModeReceiverOptions: SlackSocketModeReceiverOptions = {
@@ -349,6 +350,7 @@ export function createSlackBoltApp(params: {
   } else {
     receiver = createSlackRelayReceiver();
   }
+  if (params.decorateReceiver) receiver = params.decorateReceiver(receiver);
   const app = new params.interop.App({
     token: params.botToken,
     clientOptions: params.clientOptions,

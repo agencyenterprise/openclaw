@@ -244,10 +244,19 @@ export function resolveSlackInstallationIdentity(params: {
   if (!teamId) {
     throw new Error("Slack workspace auth.test returned no team_id");
   }
+  // auth.test may omit app_id for workspace installations too. The transport
+  // identity comes from the authenticated Socket Mode app token, not an event.
+  const transportApiAppId = normalizeOptionalString(params.transportApiAppId);
+  if (apiAppId && transportApiAppId && apiAppId !== transportApiAppId) {
+    throw new Error(
+      `Slack token mismatch: bot token app_id=${apiAppId} but transport app_id=${transportApiAppId}`,
+    );
+  }
+  const effectiveApiAppId = apiAppId ?? transportApiAppId;
   return {
     kind: "workspace",
     teamId,
-    ...(apiAppId ? { apiAppId } : {}),
+    ...(effectiveApiAppId ? { apiAppId: effectiveApiAppId } : {}),
     ...(enterpriseId ? { enterpriseId } : {}),
   };
 }

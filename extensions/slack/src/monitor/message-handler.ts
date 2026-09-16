@@ -15,6 +15,16 @@ import type { SlackSendIdentity } from "../send.js";
 import type { SlackMessageEvent } from "../types.js";
 import { stripSlackMentionsForCommandDetection } from "./commands.js";
 import type { SlackMonitorContext } from "./context.js";
+import {
+  attachSlackPreparedIngress,
+  canReleaseSlackIngressSeen,
+  hasSlackIngressParticipant,
+  isSlackIngressAdopted,
+  observeSlackIngressFailure,
+  registerSlackControlUnseen,
+  slackIngressHeldError,
+  transferSlackIngressParticipant,
+} from "./durable-adoption.js";
 import type { SlackEventScope } from "./event-scope.js";
 import {
   hasSlackInboundMessageDelivery,
@@ -240,7 +250,9 @@ export function createSlackMessageHandler(params: {
     buildKey: (entry) =>
       buildSlackDebounceKey(entry.message, ctx.accountId, entry.opts.eventScope?.teamId),
     shouldDebounce: (entry) =>
-      !entry.opts.eventScope && shouldDebounceSlackMessage(entry.message, ctx.cfg),
+      !hasSlackIngressParticipant(entry.opts) &&
+      !entry.opts.eventScope &&
+      shouldDebounceSlackMessage(entry.message, ctx.cfg),
     onFlush: async (entries) => {
       const retryEntries = (sourceError: unknown): SlackInboundRetryResult => {
         const cause = classifySlackInboundRetryCause(sourceError);
@@ -347,6 +359,7 @@ export function createSlackMessageHandler(params: {
               awaitDispatch: _awaitDispatch,
               ...lastOpts
             } = last.opts;
+            transferSlackIngressParticipant(last.opts, lastOpts);
             const appMentionRetryKey =
               seenMessageKey && lastOpts.source === "app_mention" && !ctx.botUserId
                 ? seenMessageKey
@@ -399,6 +412,17 @@ export function createSlackMessageHandler(params: {
             if (!prepared) {
               return;
             }
+            if (hasSlackIngressParticipant(last.opts)) attachSlackPreparedIngress(last.opts, prepared.ctxPayload, {
+              storePath: prepared.turn.storePath,
+              sessionKey: prepared.route.sessionKey,
+            });
+            registerSlackControlUnseen(last.opts, () => {
+              for (const entry of entries) {
+                const key = buildSeenMessageKey(entry.message.channel, entry.message.ts, entry.opts.eventScope?.teamId);
+                if (key) { appMentionDispatchedKeys.delete(key); appMentionRetryKeys.delete(key); appMentionPreparingKeys.delete(key); }
+                ctx.releaseSeenMessage(entry.message.channel, entry.message.ts, entry.opts.eventScope);
+              }
+            });
             onPrepared?.(prepared);
             if (entries.length > 1) {
               const ids = entries.map((entry) => entry.message.ts).filter(Boolean) as string[];
@@ -410,13 +434,13 @@ export function createSlackMessageHandler(params: {
             }
             try {
               await dispatchPreparedSlackMessage(prepared);
-              await recordSlackInboundMessageDeliveries({
+              if (!hasSlackIngressParticipant(last.opts) || isSlackIngressAdopted(last.opts)) await recordSlackInboundMessageDeliveries({
                 accountId: ctx.accountId,
                 ...(last.opts.eventScope ? { teamId: last.opts.eventScope.teamId } : {}),
                 messages: entries.map((entry) => entry.message),
               });
             } catch (error) {
-              if (!isRetryableSlackInboundError(error)) {
+              if (!hasSlackIngressParticipant(last.opts) && !isRetryableSlackInboundError(error)) {
                 await recordSlackInboundMessageDeliveries({
                   accountId: ctx.accountId,
                   ...(last.opts.eventScope ? { teamId: last.opts.eventScope.teamId } : {}),
@@ -426,7 +450,8 @@ export function createSlackMessageHandler(params: {
               throw error;
             }
           } catch (error) {
-            if (isRetryableSlackInboundError(error)) {
+            if (hasSlackIngressParticipant(last.opts)) observeSlackIngressFailure(last.opts, error);
+            if ((!hasSlackIngressParticipant(last.opts) && isRetryableSlackInboundError(error)) || canReleaseSlackIngressSeen(last.opts, error)) {
               // Every buffered event passed the seen gate before this combined dispatch.
               // Release all of them so the retry can rebuild the same batch.
               for (const entry of entries) {
@@ -452,9 +477,11 @@ export function createSlackMessageHandler(params: {
           completion.resolve();
         }
       } catch (error) {
+        const owned = entries.some((entry) => observeSlackIngressFailure(entry.opts, error));
+        const dispatchError = owned ? slackIngressHeldError() : error;
         const retry = retryEntries(error);
         for (const completion of completions) {
-          completion.reject(error);
+          completion.reject(dispatchError);
         }
         if (retry.exhausted.length > 0) {
           // Retries are spent and no turn ever ran these messages. Say so in the thread; a
@@ -467,7 +494,7 @@ export function createSlackMessageHandler(params: {
             error,
           });
         }
-        throw error;
+        throw dispatchError;
       }
     },
     onError: (err) => {
@@ -596,6 +623,7 @@ export function createSlackMessageHandler(params: {
     );
     const canDebounce =
       !reviewerSynthetic &&
+      !hasSlackIngressParticipant(opts) &&
       !opts.eventScope &&
       debounceMs > 0 &&
       shouldDebounceSlackMessage(resolvedMessage, ctx.cfg);
@@ -614,20 +642,19 @@ export function createSlackMessageHandler(params: {
       pendingTopLevelDebounceKeys.set(conversationKey, pendingKeys);
     }
     const dispatchCompletion = opts.awaitDispatch ? createSlackDispatchCompletion() : undefined;
-    await debouncer.enqueue({
-      message: resolvedMessage,
-      opts: {
-        ...opts,
-        ...(dispatchCompletion
-          ? {
-              dispatchCompletion: {
-                resolve: dispatchCompletion.resolve,
-                reject: dispatchCompletion.reject,
-              },
-            }
-          : {}),
-      },
-    });
+    const queuedOptions: QueuedSlackMessageOptions = {
+      ...opts,
+      ...(dispatchCompletion
+        ? {
+            dispatchCompletion: {
+              resolve: dispatchCompletion.resolve,
+              reject: dispatchCompletion.reject,
+            },
+          }
+        : {}),
+    };
+    transferSlackIngressParticipant(opts, queuedOptions);
+    await debouncer.enqueue({ message: resolvedMessage, opts: queuedOptions });
     return dispatchCompletion;
   }
 
