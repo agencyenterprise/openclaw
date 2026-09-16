@@ -279,7 +279,7 @@ export type AssembledChannelTurn = {
    * Observes turn adoption without waiting for settle. Threaded into
    * replyOptions for the agent runner (after recovery persist attempt).
    */
-  onTurnAdopted?: () => void | Promise<void>;
+  onTurnAdopted?: GetReplyOptions["onTurnAdopted"];
 };
 
 /** Channel turn with dispatch runner already prepared. */
@@ -388,5 +388,5 @@ export type RunChannelTurnParams<TRaw, TDispatchResult = DispatchFromConfigResul
    * recovery-context persist attempt (context may be absent when source
    * delivery is suppressed). Default callers still await full settle.
    */
-  onTurnAdopted?: () => void | Promise<void>;
+  onTurnAdopted?: GetReplyOptions["onTurnAdopted"];
 };

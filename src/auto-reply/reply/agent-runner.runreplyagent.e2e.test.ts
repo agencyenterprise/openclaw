@@ -4530,3 +4530,49 @@ describe("runReplyAgent typing (heartbeat)", () => {
 import { getReplyPayloadMetadata } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
+
+const fenceSql =
+  "CREATE TABLE thread_fences (\n scope_key TEXT PRIMARY KEY NOT NULL,\n epoch INTEGER NOT NULL CHECK(epoch >= 1),\n state TEXT NOT NULL CHECK(state IN ('OPEN','DRAINING','RETIRED')),\n updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)\n) STRICT;\nCREATE TABLE thread_dispatch_claims (\n claim_id TEXT PRIMARY KEY NOT NULL,\n scope_key TEXT NOT NULL REFERENCES thread_fences(scope_key),\n epoch INTEGER NOT NULL CHECK(epoch >= 1),\n fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64),\n kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 64),\n state TEXT NOT NULL CHECK(state IN ('STARTING','RUNNING','UNKNOWN','TERMINAL')),\n created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),\n updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),\n terminal_receipt TEXT,\n CHECK((state='TERMINAL' AND terminal_receipt IS NOT NULL AND length(terminal_receipt)=64)\n       OR (state!='TERMINAL' AND terminal_receipt IS NULL))\n) STRICT;\nCREATE INDEX thread_dispatch_open_claims ON thread_dispatch_claims(scope_key,epoch,state);\nCREATE UNIQUE INDEX thread_dispatch_one_native ON thread_dispatch_claims(scope_key) WHERE kind='native' AND state!='TERMINAL';\nPRAGMA user_version=2;\n";
+
+async function logicalFenceFixture() {
+  const { chmodSync, writeFileSync } = await import("node:fs");
+  const { requireNodeSqlite } = await import("../../infra/node-sqlite.js");
+  const dir = await mkdtemp(join(tmpdir(), "logical-reply-"));
+  const databasePath = join(dir, "claims.sqlite");
+  const db = new (requireNodeSqlite().DatabaseSync)(databasePath);
+  db.exec(fenceSql); chmodSync(databasePath, 0o600);
+  const scope = "slack/C123/1788816064.061969";
+  db.prepare("INSERT INTO thread_fences VALUES (?,1,'OPEN',0)").run(scope);
+  const config = { databasePath, scopes: { [scope]: 1 }, sessionScopes: { main: scope } };
+  const configPath = join(dir, "config.json");
+  writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
+  vi.stubEnv("OPENCLAW_THREAD_DISPATCH_CONFIG", configPath);
+  return { db, config, scope, cleanup: async () => { db.close(); vi.unstubAllEnvs(); await rm(dir,{recursive:true,force:true}); } };
+}
+it("V3 busy logical reply refuses before typing, steering hook, maintenance or adoption", async () => {
+  const f = await logicalFenceFixture();
+  const { admitThreadDispatch, dispatchHash } = await import("../../state/thread-dispatch.js");
+  admitThreadDispatch(f.config, { claimId: "incumbent", scopeKey: f.scope, epoch: 1, kind: "native", fingerprint: dispatchHash("incumbent") });
+  const adopted = vi.fn();
+  state.beforeAgentReplyHasHooksMock.mockReturnValue(true);
+  const run = createMinimalRun({ sourceTurnId: `channel-user:v1:${"b".repeat(64)}`, shouldSteer: true, isActive: true, opts: { onTurnAdopted: adopted } });
+  try {
+    await expect(run.run()).rejects.toThrow("NATIVE_BUSY");
+    expect(state.beforeAgentReplyRunMock).not.toHaveBeenCalled();
+    expect(state.compactEmbeddedAgentSessionMock).not.toHaveBeenCalled();
+    expect(state.runEmbeddedAgentMock).not.toHaveBeenCalled();
+    expect(state.queueEmbeddedAgentMessageMock).not.toHaveBeenCalled();
+    expect(adopted).not.toHaveBeenCalled();
+    expect(f.db.prepare("SELECT count(*) AS n FROM thread_dispatch_claims").get()?.n).toBe(1);
+  } finally { await f.cleanup(); }
+});
+it("V3 actual reply final success settles the logical owner only after its body finishes", async () => {
+  const f = await logicalFenceFixture();
+  state.runEmbeddedAgentMock.mockResolvedValue({ payloads: [{text:"final"}], meta: {stopReason:"stop",durationMs:1,agentMeta:{usage:{input:1,output:1}}} });
+  const run = createMinimalRun({ sourceTurnId: `channel-user:v1:${"c".repeat(64)}` });
+  try {
+    await run.run();
+    expect(state.runEmbeddedAgentMock).toHaveBeenCalledTimes(1);
+    expect(f.db.prepare("SELECT state FROM thread_dispatch_claims").get()?.state).toBe("TERMINAL");
+  } finally { await f.cleanup(); }
+});

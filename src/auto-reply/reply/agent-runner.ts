@@ -1,3 +1,4 @@
+import { dispatchHash, withLogicalReplyDispatch } from "../../state/thread-dispatch.js";
 // Orchestrates reply agent execution, payload building, and delivery callbacks.
 import crypto from "node:crypto";
 import { expectDefined } from "@openclaw/normalization-core";
@@ -1166,7 +1167,19 @@ function resolveAdmittedRunSessionFile(params: {
   return params.sessionFile;
 }
 
-export async function runReplyAgent(params: {
+export async function runReplyAgent(
+  params: Parameters<typeof runReplyAgentInternal>[0],
+): Promise<ReplyPayload | ReplyPayload[] | undefined> {
+  // Host-private channel source symbol, never a caller-written logical claim or RPC ID.
+  return withLogicalReplyDispatch({
+    sessionKey: params.sessionKey ?? params.followupRun.run.sessionKey,
+    sourceTurnId: readChannelSourceTurnId(params.sessionCtx),
+    prompt: params.transcriptCommandBody ?? params.commandBody,
+    run: (observeCompleted) => runReplyAgentInternal(params, observeCompleted),
+  });
+}
+
+async function runReplyAgentInternal(params: {
   commandBody: string;
   transcriptCommandBody?: string;
   followupRun: FollowupRun;
@@ -1203,7 +1216,7 @@ export async function runReplyAgent(params: {
   resetTriggered?: boolean;
   replyThreadingOverride?: TemplateContext["ReplyThreading"];
   replyOperation?: ReplyOperation;
-}): Promise<ReplyPayload | ReplyPayload[] | undefined> {
+}, observeLogicalCompleted?: (receipt: string) => void): Promise<ReplyPayload | ReplyPayload[] | undefined> {
   const {
     commandBody,
     transcriptCommandBody,
@@ -1873,7 +1886,11 @@ export async function runReplyAgent(params: {
     // Adoption marks run start and must never be spool-replayed (would re-run tools).
     // Suppressed delivery persists only the user transcript; crashed suppressed runs die
     // silently. Deliverable turns atomically persist transcript plus recovery ownership.
-    await opts?.onTurnAdopted?.();
+    await opts?.onTurnAdopted?.(
+      followupRun.userTurnTranscriptRecorder && storePath && sessionKey && restartRecoverySourceTurnId
+        ? { sessionId: replyOperation.sessionId, sessionKey, storePath, sourceTurnId: restartRecoverySourceTurnId }
+        : undefined,
+    );
     const runOutcome = await withBeforeAgentReplyObserver(
       {
         beforeDispatch: async () => {
@@ -2974,6 +2991,18 @@ export async function runReplyAgent(params: {
     const result = returnWithQueuedFollowupDrain(
       finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
     );
+    const terminalMeta = runResult.meta;
+    if (observeLogicalCompleted && terminalMeta &&
+        !terminalMeta.aborted && !terminalMeta.yielded && !terminalMeta.replayInvalid &&
+        !terminalMeta.error && !terminalMeta.pendingToolCalls?.length &&
+        ["stop", "end_turn", "completed"].includes(terminalMeta.stopReason ?? "") &&
+        !fallbackExhausted && !terminalFailurePayload &&
+        (!replyOperation.result || replyOperation.result.kind === "completed")) {
+      observeLogicalCompleted(dispatchHash({
+        kind: "logical_reply_terminal", sessionKey, sourceTurnId: restartRecoverySourceTurnId,
+        stopReason: terminalMeta.stopReason, durationMs: terminalMeta.durationMs,
+      }));
+    }
     return result;
   } catch (error) {
     // Drain/restart aborts stay silent and defer to post-restart main-session

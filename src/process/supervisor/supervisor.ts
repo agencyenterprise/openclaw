@@ -6,6 +6,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { getShellConfig } from "../../agents/shell-utils.js";
 import { createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
+import { admitDispatchChild } from "../../state/thread-dispatch.js";
 import { createChildAdapter } from "./adapters/child.js";
 import { createPtyAdapter } from "./adapters/pty.js";
 import { createRunRegistry } from "./registry.js";
@@ -119,6 +120,35 @@ export function createProcessSupervisor(): ProcessSupervisor {
   };
 
   const spawn = async (input: SpawnInput): Promise<ManagedRun> => {
+    const finishUnresolved = admitDispatchChild({
+      sessionId: input.sessionId,
+      backendId: input.backendId,
+      runId: input.runId ?? null,
+      mode: input.mode,
+      command: input.mode === "child" ? input.argv : input.ptyCommand,
+      cwd: input.cwd ?? null,
+    });
+    try {
+      const managed = await spawnAdmitted(input);
+      // This observer survives background tool return. Current adapter.wait()
+      // proves leader exit only, so keep UNKNOWN until external reconciliation.
+      void managed
+        .wait()
+        .then(
+          () => finishUnresolved?.(),
+          () => finishUnresolved?.(),
+        )
+        .catch(() => {
+          /* durable STARTING/UNKNOWN still blocks handoff */
+        });
+      return managed;
+    } catch (error) {
+      finishUnresolved?.();
+      throw error;
+    }
+  };
+
+  const spawnAdmitted = async (input: SpawnInput): Promise<ManagedRun> => {
     const runId = normalizeOptionalString(input.runId) ?? crypto.randomUUID();
     const scopeKey = normalizeOptionalString(input.scopeKey);
     if (input.replaceExistingScope && scopeKey) {

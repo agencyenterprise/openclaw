@@ -1,3 +1,4 @@
+import { NativeDispatchBusyError } from "../../state/thread-dispatch.js";
 import { sanitizeForLog } from "../../../packages/terminal-core/src/ansi.js";
 import {
   classifyOAuthRefreshFailure,
@@ -122,6 +123,8 @@ export async function handleAgentExecutionError(params: {
 }): Promise<ErrorAction> {
   const turn = params.turn;
   const err = params.error;
+  // Dispatch contention is not a provider failure or a completed reply.
+  if (err instanceof NativeDispatchBusyError) throw err;
   const takePendingLifecycleTerminal = () => {
     const terminal = params.state.pendingLifecycleTerminal?.backstop;
     params.state.pendingLifecycleTerminal = undefined;

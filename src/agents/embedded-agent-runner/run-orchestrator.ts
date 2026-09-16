@@ -1,3 +1,4 @@
+import { hasCronDispatchOwner, runCronDispatchAttempt } from "../../state/thread-dispatch.js";
 /**
  * Embedded-agent run orchestration implementation.
  */
@@ -19,6 +20,13 @@ import {
   buildAgentHookContextIdentityFields,
 } from "../../plugins/hook-agent-context.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import {
+  dispatchHash,
+  loadDispatchConfig,
+  hasLogicalDispatchOwner,
+  runLogicalDispatchAttempt,
+  withThreadDispatch,
+} from "../../state/thread-dispatch.js";
 import { resolveUserPath } from "../../utils.js";
 import { isMarkdownCapableMessageChannel } from "../../utils/message-channel.js";
 import { resolveAgentDir, resolveAgentWorkspaceDir } from "../agent-scope.js";
@@ -69,13 +77,83 @@ export function runEmbeddedAgent(
   const lifecycleGeneration =
     internalParamsInput.lifecycleGeneration ??
     captureAgentRunLifecycleGeneration(internalParamsInput.runId);
-  return withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
-    runEmbeddedAgentInternal({
-      ...internalParamsInput,
-      config,
-      lifecycleGeneration,
-    }),
-  );
+  if (hasCronDispatchOwner()) {
+    return runCronDispatchAttempt({
+      sessionKey: backfillSessionKey({ config, sessionId: internalParamsInput.sessionId,
+        sessionKey: internalParamsInput.sessionKey, agentId: internalParamsInput.agentId }),
+      run: () => withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
+        runEmbeddedAgentInternal({ ...internalParamsInput, config, lifecycleGeneration })),
+      terminalReceipt: result => {
+        const meta = result.meta;
+        if (!meta || meta.aborted || meta.yielded || meta.error || meta.pendingToolCalls?.length ||
+            !["stop", "end_turn", "completed"].includes(meta.stopReason ?? "")) return undefined;
+        return dispatchHash({ kind: "cron_attempt_terminal", runId: internalParamsInput.runId,
+          sessionKey: internalParamsInput.sessionKey, lifecycleGeneration, stopReason: meta.stopReason });
+      },
+    });
+  }
+  if (hasLogicalDispatchOwner()) {
+    // Inherited authority must be checked even if mutable host opt-in changed.
+    return runLogicalDispatchAttempt({
+      sessionKey: backfillSessionKey({ config, sessionId: internalParamsInput.sessionId,
+        sessionKey: internalParamsInput.sessionKey, agentId: internalParamsInput.agentId }),
+      run: () => withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
+        runEmbeddedAgentInternal({ ...internalParamsInput, config, lifecycleGeneration })),
+    })!;
+  }
+  const dispatchConfig = loadDispatchConfig();
+  if (!dispatchConfig) {
+    return withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
+      runEmbeddedAgentInternal({ ...internalParamsInput, config, lifecycleGeneration }),
+    );
+  }
+  const dispatchSessionKey = backfillSessionKey({
+    config,
+    sessionId: internalParamsInput.sessionId,
+    sessionKey: internalParamsInput.sessionKey,
+    agentId: internalParamsInput.agentId,
+  });
+  return withThreadDispatch({
+    config: dispatchConfig,
+    sessionKey: dispatchSessionKey,
+    operationId: `native:${internalParamsInput.runId}`,
+    kind: "native",
+    identity: {
+      runId: internalParamsInput.runId,
+      sessionKey: dispatchSessionKey,
+      sessionId: internalParamsInput.sessionId,
+      prompt: internalParamsInput.prompt,
+    },
+    run: () =>
+      withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
+        runEmbeddedAgentInternal({ ...internalParamsInput, config, lifecycleGeneration }),
+      ),
+    terminalReceipt: (result) => {
+      const meta = result.meta;
+      if (
+        !meta ||
+        meta.aborted ||
+        meta.yielded ||
+        // replayInvalid forbids repeating side effects; it does not mean this
+        // awaited successful turn is still active. Child claims stay separate.
+        meta.error ||
+        meta.pendingToolCalls?.length ||
+        !["stop", "end_turn", "completed"].includes(meta.stopReason ?? "")
+      )
+        return undefined;
+      // This releases only the observed native turn. Child/external UNKNOWN
+      // claims remain independent blockers for retirement.
+      return dispatchHash({
+        kind: "native_terminal",
+        runId: internalParamsInput.runId,
+        sessionKey: dispatchSessionKey,
+        sessionId: internalParamsInput.sessionId,
+        lifecycleGeneration,
+        stopReason: meta.stopReason,
+        durationMs: meta.durationMs,
+      });
+    },
+  });
 }
 
 async function runEmbeddedAgentInternal(

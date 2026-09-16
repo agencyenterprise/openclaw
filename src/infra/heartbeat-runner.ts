@@ -1,3 +1,4 @@
+import { NativeDispatchBusyError } from "../state/thread-dispatch.js";
 // Runs heartbeat checks and emits status updates for configured agents.
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -2374,6 +2375,10 @@ export async function runHeartbeatOnce(opts: {
     consumeInspectedSystemEvents();
     return { status: "ran", durationMs: Date.now() - startedAt };
   } catch (err) {
+    if (err instanceof NativeDispatchBusyError) {
+      emitHeartbeatEvent({ status: "skipped", reason: HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT, durationMs: Date.now() - startedAt });
+      return { status: "skipped", reason: HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT };
+    }
     const reason = formatErrorMessage(err);
     emitHeartbeatEvent({
       status: "failed",

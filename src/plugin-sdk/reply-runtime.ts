@@ -66,3 +66,25 @@ export type { FinalizedMsgContext, MsgContext } from "../auto-reply/templating.j
 export type { CommandTurnContext } from "../auto-reply/command-turn-context.js";
 export { generateConversationLabel } from "../auto-reply/reply/conversation-label-generator.js";
 export type { ConversationLabelParams } from "../auto-reply/reply/conversation-label-generator.js";
+
+// Metadata-only adoption and trusted source identity for durable channel ingress.
+export { readChannelSourceAdoptionReceipt } from "../config/sessions/session-accessor.source-adoption.js";
+export type {
+  ChannelSourceAdoptionTarget,
+  ChannelSourceAdoptionReceipt,
+} from "../config/sessions/session-accessor.source-adoption.js";
+export { readChannelSourceTurnId } from "../auto-reply/reply/source-turn-id.js";
+export { NativeDispatchBusyError } from "../state/thread-dispatch.js";
+
+export { readNativePreAdmissionRefusal } from "../state/thread-dispatch.js";
+export { readChannelSourcePreAdmissionAbsence } from "../config/sessions/session-accessor.source-absence.js";
+export type {
+  ChannelSourceAbsenceTarget,
+  ChannelSourceAbsenceReceipt,
+} from "../config/sessions/session-accessor.source-absence.js";
+
+export { loadDispatchConfig } from "../state/thread-dispatch.js";
+
+export { createChannelIngressQueue } from "../channels/message/ingress-queue.js";
+
+export { withNativeControlProbe } from "../state/thread-dispatch.js";

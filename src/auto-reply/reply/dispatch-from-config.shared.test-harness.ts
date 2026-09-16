@@ -635,7 +635,8 @@ vi.mock("./dispatch-acp-session.runtime.js", () => ({
   readAcpSessionEntry: (params: { sessionKey: string; cfg?: OpenClawConfig }) =>
     acpMocks.readAcpSessionEntry(params),
 }));
-vi.mock("../../tts/tts-config.js", () => ({
+vi.mock("../../tts/tts-config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tts/tts-config.js")>()),
   normalizeTtsAutoMode: (value: unknown) => ttsMocks.normalizeTtsAutoMode(value),
   resolveConfiguredTtsMode: (cfg: OpenClawConfig) => ttsMocks.resolveTtsConfig(cfg).mode,
   shouldCleanTtsDirectiveText: () => true,

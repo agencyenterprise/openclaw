@@ -1,3 +1,5 @@
+import type { ChannelSourceAdoptionTarget } from "../config/sessions/session-accessor.source-adoption.js";
+export type { ChannelSourceAdoptionTarget } from "../config/sessions/session-accessor.source-adoption.js";
 import type { FastMode } from "@openclaw/normalization-core/string-coerce";
 /** Public option types for reply generation callbacks, streaming, and delivery policy. */
 import type { AgentPlanStep } from "../channels/streaming.js";
@@ -96,9 +98,9 @@ export type GetReplyOptions = {
   /**
    * Called after the restart-recovery delivery-context persist attempt
    * completes (context may be absent when source delivery is suppressed).
-   * Channels may complete ingress ownership here without waiting for settle.
+   * Target identifies the actual adoption; durable ingress consumers must verify readback before completion.
    */
-  onTurnAdopted?: () => void | Promise<void>;
+  onTurnAdopted?: (target?: ChannelSourceAdoptionTarget) => void | Promise<void>;
   /** Shared lifecycle owner for the current user-turn transcript append. */
   userTurnTranscriptRecorder?: UserTurnTranscriptRecorder;
   /** Current user turn is already durable; replay it without appending another copy. */

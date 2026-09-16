@@ -1,3 +1,4 @@
+import { NativeDispatchBusyError } from "../state/thread-dispatch.js";
 /**
  * Runs model and image fallback chains across provider/model candidates.
  */
@@ -411,6 +412,7 @@ async function runFallbackCandidate<T>(params: {
       result,
     };
   } catch (err) {
+    if (err instanceof NativeDispatchBusyError) throw err;
     if (isCommandLaneTaskTimeoutError(err)) {
       throw err;
     }
