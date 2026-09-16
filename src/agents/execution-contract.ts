@@ -34,14 +34,14 @@ export function stripProviderPrefix(modelId: string): string {
  * - `gpt-5.4`, `gpt-5.4-alt`, `gpt-5.0` (dot separator)
  * - `gpt-5-preview`, `gpt-5-turbo`, `gpt-5-2025-03` (dash separator)
  *
- * Does NOT cover `gpt-4.5`, `gpt-6`, or any non-gpt-5 family member.
+ * Also covers the exact verified `gpt-6-astra` ID. Other GPT-6 IDs remain unsupported.
  */
-const STRICT_AGENTIC_MODEL_ID_PATTERN = /^gpt-5(?:[.o-]|$)/i;
+const STRICT_AGENTIC_MODEL_ID_PATTERN = /^(?:gpt-5(?:[.o-]|$)|gpt-6-astra$)/i;
 
 /**
  * Supported provider + model combinations where strict-agentic is the intended
  * runtime contract. Kept as a narrow helper so both the execution-contract
- * resolver uses for the GPT-5-family OpenAI strict-agentic default. The embedded
+ * resolver uses for the GPT-5-family and exact GPT-6-Astra OpenAI strict-agentic default. The embedded
  * `mock-openai` QA lane intentionally piggybacks on that contract so repo QA
  * can exercise the same incomplete-turn recovery rules end to end.
  */
@@ -61,7 +61,7 @@ export function isStrictAgenticSupportedProviderModel(params: {
 /**
  * Returns the effective execution contract for an embedded OpenClaw run.
  *
- * strict-agentic is a GPT-5-family OpenAI-only runtime contract,
+ * strict-agentic is a GPT-5-family and exact GPT-6-Astra OpenAI-only runtime contract,
  * so an unsupported provider/model pair always collapses to `"default"`
  * regardless of what the caller passed or what config says — the contract
  * is inert off-provider. Within the supported lane, the behavior matrix is:
@@ -74,7 +74,7 @@ export function isStrictAgenticSupportedProviderModel(params: {
  *   structured plan tool and non-visible turn recovery apply to out-of-the-box
  *   GPT-5 runs without requiring every user to set the flag.
  * - Unsupported provider/model (anything that is not openai
- *   with a gpt-5-family model id) ⇒ `"default"`, even when the config
+ *   with a gpt-5-family or exact gpt-6-astra model id) ⇒ `"default"`, even when the config
  *   explicitly sets `"strict-agentic"`. The structured guards check this lane
  *   again, so an explicit `"strict-agentic"` on an unsupported lane is a no-op
  *   rather than a hard failure.
@@ -95,7 +95,7 @@ function resolveEffectiveExecutionContract(params: {
     agentId: params.agentId ?? undefined,
   });
   const explicit = resolveAgentExecutionContract(params.config, sessionAgentId);
-  // strict-agentic is a GPT-5-family OpenAI runtime contract
+  // strict-agentic is a GPT-5-family and exact GPT-6-Astra OpenAI runtime contract
   // regardless of whether it was set explicitly or auto-activated. On an
   // unsupported provider/model pair the contract is inert either way, so
   // the effective value collapses to "default".

@@ -86,6 +86,7 @@ function buildOpenAIThinkingProfile(params: {
 }): ProviderThinkingProfile {
   const modelId = normalizeModelId(params.modelId);
   const agentRuntime = normalizeModelId(params.agentRuntime ?? "");
+  const isAstra = modelId === "gpt-6-astra";
   const isBare = modelId === "gpt-5.6";
   const isSol = modelId === "gpt-5.6-sol";
   const isTerra = modelId === "gpt-5.6-terra";
@@ -98,7 +99,7 @@ function buildOpenAIThinkingProfile(params: {
     ? authoritativeCodexEfforts.includes("max")
     : fallbackCodexMax;
   const supportsMax =
-    modelId.startsWith("gpt-5.6") && (agentRuntime !== "codex" || codexSupportsMax);
+    (modelId.startsWith("gpt-5.6") || isAstra) && (agentRuntime !== "codex" || codexSupportsMax);
   const fallbackCodexUltra = isSol || isTerra;
   const codexSupportsUltra = authoritativeCodexEfforts
     ? authoritativeCodexEfforts.includes("ultra")
@@ -106,14 +107,14 @@ function buildOpenAIThinkingProfile(params: {
   // OpenClaw owns its logical Ultra orchestration. Native Codex capabilities
   // come only from the selected ChatGPT route's catalog metadata.
   const supportsUltra =
-    (isBare || isSol || isTerra || isLuna) &&
+    (isBare || isSol || isTerra || isLuna || isAstra) &&
     (agentRuntime === "openclaw" ||
       agentRuntime === "auto" ||
       (agentRuntime === "codex" && codexSupportsUltra));
-  const defaultLevel = isSol || isTerra || isLuna ? "medium" : undefined;
+  const defaultLevel = isSol || isTerra || isLuna || isAstra ? "medium" : undefined;
   const fallbackLevels: ProviderThinkingProfile["levels"] = [
     ...OPENAI_THINKING_BASE_LEVELS,
-    ...(matchesExactOrPrefix(params.modelId, params.xhighModelIds)
+    ...((isAstra || matchesExactOrPrefix(params.modelId, params.xhighModelIds))
       ? [{ id: "xhigh" as const }]
       : []),
     ...(supportsMax ? [{ id: "max" as const }] : []),

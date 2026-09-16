@@ -1,5 +1,6 @@
 // OpenAI model route membership shared by catalog and policy surfaces.
 
+export const OPENAI_GPT_6_ASTRA_MODEL_ID = "gpt-6-astra";
 export const OPENAI_CHAT_LATEST_MODEL_ID = "chat-latest";
 export const OPENAI_GPT_56_MODEL_ID = "gpt-5.6";
 export const OPENAI_GPT_56_SOL_MODEL_ID = "gpt-5.6-sol";
@@ -32,6 +33,8 @@ const OPENAI_DUAL_ROUTE_MODEL_IDS = [
 
 /** Direct aliases excluded from the ChatGPT catalog. */
 const OPENAI_PLATFORM_ONLY_ROUTE_MODEL_IDS = [
+  // Only the authenticated Platform route has been verified for this registration.
+  OPENAI_GPT_6_ASTRA_MODEL_ID,
   OPENAI_CHAT_LATEST_MODEL_ID,
   OPENAI_GPT_56_MODEL_ID,
 ] as const;
