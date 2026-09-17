@@ -19,6 +19,7 @@ import {
   buildAgentHookContextIdentityFields,
 } from "../../plugins/hook-agent-context.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import { bindCurrentNativeOwnerDeadline } from "../../state/thread-dispatch.js";
 import { hasProtectedDispatchOwner } from "../../state/thread-dispatch.js";
 import { hasCronDispatchOwner, runCronDispatchAttempt } from "../../state/thread-dispatch.js";
 import {
@@ -92,8 +93,11 @@ export function runEmbeddedAgent(
     withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
       runEmbeddedAgentInternal({ ...internalParamsInput, config, lifecycleGeneration }),
     );
-  const runTracked = () =>
-    hasProtectedDispatchOwner() ? withNativeCleanupTracking(cleanupIdentity, runPlain) : runPlain();
+  const runTracked = () => {
+    if (!hasProtectedDispatchOwner()) return runPlain();
+    bindCurrentNativeOwnerDeadline(internalParamsInput.timeoutMs);
+    return withNativeCleanupTracking(cleanupIdentity, runPlain);
+  };
   if (hasCronDispatchOwner()) {
     return runCronDispatchAttempt({
       sessionKey: backfillSessionKey({
@@ -154,6 +158,7 @@ export function runEmbeddedAgent(
     config: dispatchConfig,
     sessionKey: dispatchSessionKey,
     operationId: `native:${internalParamsInput.runId}`,
+    timeoutMs: internalParamsInput.timeoutMs,
     kind: "native",
     identity: {
       runId: internalParamsInput.runId,

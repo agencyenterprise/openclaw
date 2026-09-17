@@ -440,3 +440,63 @@ it("overlapping cleanup identity refuses before second callback", async () => {
   release();
   await first;
 });
+
+it("overloaded FailoverError survives actual exhausted model fallback and cron error-result conversion", async () => {
+  const { runWithModelFallback } = await import("../model-fallback.js");
+  const { FailoverError } = await import("../failover-error.js");
+  const { makeModelFallbackCfg } = await import("../test-helpers/model-fallback-config-fixture.js");
+  const { db } = prepareFence();
+  const p = laneRunParams();
+  let failure: unknown;
+  runEmbeddedAgentViaCliBackendIfEligible.mockImplementationOnce(async () => {
+    const finish = beginNativeCleanupAttempt();
+    admitDispatchChild({ fixture: "overload keeps prior external effect unresolved" })?.();
+    finish((await cleanupFixture()).verified);
+    throw new FailoverError("server_is_overloaded: service_unavailable_error", {
+      reason: "overloaded",
+      provider: "openai",
+      model: "gpt-4.1-mini",
+    });
+  });
+  const result = await withCronDispatchOwner({
+    sessionKey: p.sessionKey,
+    operationId: "isolated-cron:overload:1",
+    identity: { fixture: "actual overloaded exhausted fallback" },
+    timeoutMs: p.timeoutMs,
+    completed: () => false,
+    run: async () => {
+      bindCronDispatchSession("agent:main:cron:overload:run:one");
+      try {
+        await runWithModelFallback({
+          cfg: makeModelFallbackCfg({
+            agents: {
+              defaults: {
+                model: {
+                  primary: "openai/gpt-4.1-mini",
+                  fallbacks: [],
+                },
+              },
+            },
+          }),
+          provider: "openai",
+          model: "gpt-4.1-mini",
+          run: () => runEmbeddedAgent({ ...p, sessionKey: "agent:main:cron:overload:run:one" }),
+        });
+        throw new Error("expected exhausted fallback");
+      } catch (error) {
+        failure = error;
+        return { status: "error", error: String(error) };
+      }
+    },
+  });
+  expect(result.status).toBe("error");
+  expect(String(failure)).toContain("overloaded");
+  expect(runEmbeddedAgentViaCliBackendIfEligible).toHaveBeenCalledOnce();
+  expect(
+    db.prepare("SELECT state FROM thread_dispatch_claims WHERE kind='native'").get()?.state,
+  ).toBe("TERMINAL");
+  expect(
+    db.prepare("SELECT state FROM thread_dispatch_claims WHERE kind!='native'").get()?.state,
+  ).toBe("UNKNOWN");
+  db.close();
+});

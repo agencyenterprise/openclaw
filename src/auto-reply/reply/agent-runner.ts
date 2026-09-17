@@ -1,4 +1,3 @@
-import { dispatchHash, withLogicalReplyDispatch } from "../../state/thread-dispatch.js";
 // Orchestrates reply agent execution, payload building, and delivery callbacks.
 import crypto from "node:crypto";
 import { expectDefined } from "@openclaw/normalization-core";
@@ -65,6 +64,7 @@ import {
 import { CommandLaneClearedError, GatewayDrainingError } from "../../process/command-queue.js";
 import { shouldPreserveUserFacingSessionStateForInputProvenance } from "../../sessions/input-provenance.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
+import { dispatchHash, withLogicalReplyDispatch } from "../../state/thread-dispatch.js";
 import {
   normalizeDeliveryContext,
   type DeliveryContext,
@@ -1172,6 +1172,7 @@ export async function runReplyAgent(
 ): Promise<ReplyPayload | ReplyPayload[] | undefined> {
   // Host-private channel source symbol, never a caller-written logical claim or RPC ID.
   return withLogicalReplyDispatch({
+    timeoutMs: params.followupRun.run.timeoutMs,
     sessionKey: params.sessionKey ?? params.followupRun.run.sessionKey,
     sourceTurnId: readChannelSourceTurnId(params.sessionCtx),
     prompt: params.transcriptCommandBody ?? params.commandBody,
@@ -1179,44 +1180,47 @@ export async function runReplyAgent(
   });
 }
 
-async function runReplyAgentInternal(params: {
-  commandBody: string;
-  transcriptCommandBody?: string;
-  followupRun: FollowupRun;
-  queueKey: string;
-  resolvedQueue: QueueSettings;
-  shouldSteer: boolean;
-  shouldFollowup: boolean;
-  isActive: boolean;
-  isRunActive?: () => boolean;
-  isStreaming: boolean;
-  opts?: InternalGetReplyOptions;
-  typing: TypingController;
-  sessionEntry?: SessionEntry;
-  sessionStore?: Record<string, SessionEntry>;
-  sessionKey?: string;
-  runtimePolicySessionKey?: string;
-  storePath?: string;
-  defaultModel: string;
-  agentCfgContextTokens?: number;
-  resolvedVerboseLevel: VerboseLevel;
-  toolProgressDetail?: "explain" | "raw";
-  isNewSession: boolean;
-  blockStreamingEnabled: boolean;
-  blockReplyChunking?: {
-    minChars: number;
-    maxChars: number;
-    breakPreference: "paragraph" | "newline" | "sentence";
-    flushOnParagraph?: boolean;
-  };
-  resolvedBlockStreamingBreak: "text_end" | "message_end";
-  sessionCtx: TemplateContext;
-  shouldInjectGroupIntro: boolean;
-  typingMode: TypingMode;
-  resetTriggered?: boolean;
-  replyThreadingOverride?: TemplateContext["ReplyThreading"];
-  replyOperation?: ReplyOperation;
-}, observeLogicalCompleted?: (receipt: string) => void): Promise<ReplyPayload | ReplyPayload[] | undefined> {
+async function runReplyAgentInternal(
+  params: {
+    commandBody: string;
+    transcriptCommandBody?: string;
+    followupRun: FollowupRun;
+    queueKey: string;
+    resolvedQueue: QueueSettings;
+    shouldSteer: boolean;
+    shouldFollowup: boolean;
+    isActive: boolean;
+    isRunActive?: () => boolean;
+    isStreaming: boolean;
+    opts?: InternalGetReplyOptions;
+    typing: TypingController;
+    sessionEntry?: SessionEntry;
+    sessionStore?: Record<string, SessionEntry>;
+    sessionKey?: string;
+    runtimePolicySessionKey?: string;
+    storePath?: string;
+    defaultModel: string;
+    agentCfgContextTokens?: number;
+    resolvedVerboseLevel: VerboseLevel;
+    toolProgressDetail?: "explain" | "raw";
+    isNewSession: boolean;
+    blockStreamingEnabled: boolean;
+    blockReplyChunking?: {
+      minChars: number;
+      maxChars: number;
+      breakPreference: "paragraph" | "newline" | "sentence";
+      flushOnParagraph?: boolean;
+    };
+    resolvedBlockStreamingBreak: "text_end" | "message_end";
+    sessionCtx: TemplateContext;
+    shouldInjectGroupIntro: boolean;
+    typingMode: TypingMode;
+    resetTriggered?: boolean;
+    replyThreadingOverride?: TemplateContext["ReplyThreading"];
+    replyOperation?: ReplyOperation;
+  },
+  observeLogicalCompleted?: (receipt: string) => void,
+): Promise<ReplyPayload | ReplyPayload[] | undefined> {
   const {
     commandBody,
     transcriptCommandBody,
@@ -1887,8 +1891,16 @@ async function runReplyAgentInternal(params: {
     // Suppressed delivery persists only the user transcript; crashed suppressed runs die
     // silently. Deliverable turns atomically persist transcript plus recovery ownership.
     await opts?.onTurnAdopted?.(
-      followupRun.userTurnTranscriptRecorder && storePath && sessionKey && restartRecoverySourceTurnId
-        ? { sessionId: replyOperation.sessionId, sessionKey, storePath, sourceTurnId: restartRecoverySourceTurnId }
+      followupRun.userTurnTranscriptRecorder &&
+        storePath &&
+        sessionKey &&
+        restartRecoverySourceTurnId
+        ? {
+            sessionId: replyOperation.sessionId,
+            sessionKey,
+            storePath,
+            sourceTurnId: restartRecoverySourceTurnId,
+          }
         : undefined,
     );
     const runOutcome = await withBeforeAgentReplyObserver(
@@ -2992,16 +3004,28 @@ async function runReplyAgentInternal(params: {
       finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
     );
     const terminalMeta = runResult.meta;
-    if (observeLogicalCompleted && terminalMeta &&
-        !terminalMeta.aborted && !terminalMeta.yielded && !terminalMeta.replayInvalid &&
-        !terminalMeta.error && !terminalMeta.pendingToolCalls?.length &&
-        ["stop", "end_turn", "completed"].includes(terminalMeta.stopReason ?? "") &&
-        !fallbackExhausted && !terminalFailurePayload &&
-        (!replyOperation.result || replyOperation.result.kind === "completed")) {
-      observeLogicalCompleted(dispatchHash({
-        kind: "logical_reply_terminal", sessionKey, sourceTurnId: restartRecoverySourceTurnId,
-        stopReason: terminalMeta.stopReason, durationMs: terminalMeta.durationMs,
-      }));
+    if (
+      observeLogicalCompleted &&
+      terminalMeta &&
+      !terminalMeta.aborted &&
+      !terminalMeta.yielded &&
+      !terminalMeta.replayInvalid &&
+      !terminalMeta.error &&
+      !terminalMeta.pendingToolCalls?.length &&
+      ["stop", "end_turn", "completed"].includes(terminalMeta.stopReason ?? "") &&
+      !fallbackExhausted &&
+      !terminalFailurePayload &&
+      (!replyOperation.result || replyOperation.result.kind === "completed")
+    ) {
+      observeLogicalCompleted(
+        dispatchHash({
+          kind: "logical_reply_terminal",
+          sessionKey,
+          sourceTurnId: restartRecoverySourceTurnId,
+          stopReason: terminalMeta.stopReason,
+          durationMs: terminalMeta.durationMs,
+        }),
+      );
     }
     return result;
   } catch (error) {

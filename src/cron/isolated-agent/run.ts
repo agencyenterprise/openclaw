@@ -1,5 +1,3 @@
-import { bindCronDispatchSession, withCronDispatchOwner, loadDispatchConfig } from "../../state/thread-dispatch.js";
-import { resolveCronDispatchOrigin } from "../../gateway/cron-dispatch-origin.js";
 import { isDeepStrictEqual } from "node:util";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { retireSessionMcpRuntime } from "../../agents/agent-bundle-mcp-tools.js";
@@ -18,6 +16,7 @@ import { resolveSessionWorkStartError } from "../../config/sessions/lifecycle.js
 import { formatSqliteSessionFileMarker } from "../../config/sessions/sqlite-marker.js";
 import type { AgentDefaultsConfig } from "../../config/types.agent-defaults.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { resolveCronDispatchOrigin } from "../../gateway/cron-dispatch-origin.js";
 import {
   assertAgentRunLifecycleGenerationCurrent,
   claimAgentRunContext,
@@ -54,6 +53,11 @@ import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { resolveNonNegativeNumber } from "../../shared/number-coercion.js";
 import { resolveCronSkillsSnapshot } from "../../skills/runtime/cron-snapshot.js";
 import type { SkillSnapshot } from "../../skills/types.js";
+import {
+  bindCronDispatchSession,
+  withCronDispatchOwner,
+  loadDispatchConfig,
+} from "../../state/thread-dispatch.js";
 import { NativeDispatchBusyError } from "../../state/thread-dispatch.js";
 import { removeCronRunContinuationSessionIfIdle } from "../../tasks/cron-run-continuation-cleanup.js";
 import {
@@ -1621,17 +1625,51 @@ async function disposeCronRunContext(params: {
 }
 
 /** Runs one isolated cron agent turn, including setup, execution, delivery, and persistence. */
-export async function runCronIsolatedAgentTurn(params: Parameters<typeof runCronIsolatedAgentTurnInternal>[0]): Promise<RunCronAgentTurnResult> {
+export async function runCronIsolatedAgentTurn(
+  params: Parameters<typeof runCronIsolatedAgentTurnInternal>[0],
+): Promise<RunCronAgentTurnResult> {
   if (!loadDispatchConfig()) return runCronIsolatedAgentTurnInternal(params);
+  const ownerRuntimeConfig = resolveCronActiveRuntimeConfig(params.cfg);
+  const requestedOwnerAgent = params.agentId?.trim() || params.job.agentId?.trim();
+  const ownerAgentId = requestedOwnerAgent
+    ? normalizeAgentId(requestedOwnerAgent)
+    : resolveDefaultAgentId(ownerRuntimeConfig);
+  const ownerDefaults = buildCronAgentDefaultsConfig({
+    defaults: ownerRuntimeConfig.agents?.defaults,
+    agentConfigOverride: requestedOwnerAgent
+      ? resolveAgentConfig(ownerRuntimeConfig, ownerAgentId)
+      : undefined,
+  });
+  const ownerTimeoutMs = resolveAgentTimeoutMs({
+    cfg: {
+      ...ownerRuntimeConfig,
+      agents: { ...ownerRuntimeConfig.agents, defaults: ownerDefaults },
+    },
+    overrideSeconds:
+      params.job.payload.kind === "agentTurn" ? params.job.payload.timeoutSeconds : undefined,
+  });
   return withCronDispatchOwner({
+    timeoutMs: ownerTimeoutMs,
     sessionKey: resolveCronDispatchOrigin(params.job, params.agentId ?? "main", params.cfg),
     operationId: `isolated-cron:${params.job.id}:${params.job.state.runningAtMs ?? "missing"}`,
-    identity: { jobId: params.job.id, runningAtMs: params.job.state.runningAtMs ?? null,
-      sourceSessionKey: params.job.sessionKey, sessionTarget: params.job.sessionTarget, message: params.message },
+    identity: {
+      jobId: params.job.id,
+      runningAtMs: params.job.state.runningAtMs ?? null,
+      sourceSessionKey: params.job.sessionKey,
+      sessionTarget: params.job.sessionTarget,
+      message: params.message,
+    },
     run: () => runCronIsolatedAgentTurnInternal(params),
-    completed: result => result.status === "ok" && !(params.abortSignal ?? params.signal)?.aborted,
+    completed: (result) =>
+      result.status === "ok" && !(params.abortSignal ?? params.signal)?.aborted,
   }).catch((error): RunCronAgentTurnResult => {
-    if (error instanceof NativeDispatchBusyError) return { status: "skipped", error: "NATIVE_BUSY", errorKind: "native-busy", executionStarted: false };
+    if (error instanceof NativeDispatchBusyError)
+      return {
+        status: "skipped",
+        error: "NATIVE_BUSY",
+        errorKind: "native-busy",
+        executionStarted: false,
+      };
     throw error;
   });
 }

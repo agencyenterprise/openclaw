@@ -1,4 +1,3 @@
-import { runProvenUnscopedDispatch, completeNativeControlProbe, enterNativeControlProbe, observeNativeControlProbe, loadDispatchConfig, resolveDispatchScope, withLogicalChannelDispatch, trackLogicalDispatchHook } from "../../state/thread-dispatch.js";
 /** Main reply dispatch pipeline from finalized config/context to delivery payloads. */
 import { isParentOwnedBackgroundAcpSession } from "@openclaw/acp-core/session-interaction-mode";
 import {
@@ -27,6 +26,7 @@ import {
   isSubagentEnvelopeSession,
   resolveSubagentCapabilityStore,
 } from "../../agents/subagent-capabilities.js";
+import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { isToolAllowedByPolicies } from "../../agents/tool-policy-match.js";
 import { mergeAlsoAllowPolicy, resolveToolProfilePolicy } from "../../agents/tool-policy.js";
 import {
@@ -76,6 +76,16 @@ import { getGlobalHookRunner, getGlobalPluginRegistry } from "../../plugins/hook
 import type { PluginHookReplyDispatchEvent } from "../../plugins/hook-types.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { resolveSilentReplyPolicyFromPolicies } from "../../shared/silent-reply-policy.js";
+import {
+  runProvenUnscopedDispatch,
+  completeNativeControlProbe,
+  enterNativeControlProbe,
+  observeNativeControlProbe,
+  loadDispatchConfig,
+  resolveDispatchScope,
+  withLogicalChannelDispatch,
+  trackLogicalDispatchHook,
+} from "../../state/thread-dispatch.js";
 import { createTtsDirectiveTextStreamCleaner } from "../../tts/directives.js";
 import {
   normalizeTtsAutoMode,
@@ -223,51 +233,93 @@ export async function dispatchReplyFromConfig(
   try {
     const controlProbe = enterNativeControlProbe();
     const dispatchConfig = loadDispatchConfig();
-    const sourceSessionKey = normalizeOptionalString(params.ctx.SessionKey) ?? normalizeOptionalString(params.ctx.CommandTargetSessionKey);
+    const sourceSessionKey =
+      normalizeOptionalString(params.ctx.SessionKey) ??
+      normalizeOptionalString(params.ctx.CommandTargetSessionKey);
     if (!dispatchConfig || !resolveDispatchScope(dispatchConfig, sourceSessionKey)) {
       if (controlProbe) throw new Error("THREAD_CONTROL_PROBE_UNSUPPORTED");
       const run = () => dispatchReplyFromConfigInner(params, messageAuditTerminal);
-      const result = dispatchConfig ? await runProvenUnscopedDispatch(dispatchConfig, sourceSessionKey, run) : await run();
+      const result = dispatchConfig
+        ? await runProvenUnscopedDispatch(dispatchConfig, sourceSessionKey, run)
+        : await run();
       messageAuditTerminal?.finishSuccess(result);
       return result;
     }
     // Resolve the same route and host source identity before runtime plugin initialization.
     const entry = resolveSessionStoreLookup(params.ctx, params.cfg);
     const bound = resolveBoundAcpDispatchSessionKey({ ctx: params.ctx, cfg: params.cfg });
-    const routedEntry = bound ? resolveSessionStoreLookup({ ...params.ctx, SessionKey: bound }, params.cfg) : entry;
+    const routedEntry = bound
+      ? resolveSessionStoreLookup({ ...params.ctx, SessionKey: bound }, params.cfg)
+      : entry;
     const route = resolveEffectiveReplyRoute({ ctx: params.ctx, entry: routedEntry.entry });
-    const sourceTurnId = readChannelSourceTurnId(params.ctx) ??
+    const sourceTurnId =
+      readChannelSourceTurnId(params.ctx) ??
       (shouldMintChannelSourceTurnId(params.ctx.Provider ?? params.ctx.Surface)
         ? buildChannelSourceTurnId({
-            provider: resolveOriginMessageProvider({ originatingChannel: route.channel, provider: params.ctx.Provider ?? params.ctx.Surface }),
-            accountId: route.accountId, conversationId: route.to,
-            messageId: normalizeOptionalString(params.ctx.MessageSidFull) ?? normalizeOptionalString(params.ctx.MessageSid),
-          }) : undefined);
+            provider: resolveOriginMessageProvider({
+              originatingChannel: route.channel,
+              provider: params.ctx.Provider ?? params.ctx.Surface,
+            }),
+            accountId: route.accountId,
+            conversationId: route.to,
+            messageId:
+              normalizeOptionalString(params.ctx.MessageSidFull) ??
+              normalizeOptionalString(params.ctx.MessageSid),
+          })
+        : undefined);
     setChannelSourceTurnId(params.ctx, sourceTurnId);
-    if (controlProbe && (!sourceSessionKey || !sourceTurnId || !/^channel-user:v1:[a-f0-9]{64}$/.test(sourceTurnId) ||
+    if (
+      controlProbe &&
+      (!sourceSessionKey ||
+        !sourceTurnId ||
+        !/^channel-user:v1:[a-f0-9]{64}$/.test(sourceTurnId) ||
         (bound && bound !== sourceSessionKey) ||
-        (params.ctx.CommandTargetSessionKey && params.ctx.CommandTargetSessionKey !== sourceSessionKey))) {
+        (params.ctx.CommandTargetSessionKey &&
+          params.ctx.CommandTargetSessionKey !== sourceSessionKey))
+    ) {
       throw new Error("THREAD_CONTROL_PROBE_IDENTITY");
     }
     const abortRuntime = params.fastAbortResolver ? null : await loadAbortRuntime();
     const abortResolver = params.fastAbortResolver ?? abortRuntime?.tryFastAbortFromMessage;
     if (!abortResolver) throw new Error("THREAD_DISPATCH_ABORT_UNAVAILABLE");
     const fastAbort = await abortResolver({ ctx: params.ctx, cfg: params.cfg });
-    if (controlProbe) observeNativeControlProbe({ sourceTurnId: sourceTurnId!, sessionKey: sourceSessionKey!,
-      scopeKey: resolveDispatchScope(dispatchConfig, sourceSessionKey)! }, fastAbort.handled);
+    if (controlProbe)
+      observeNativeControlProbe(
+        {
+          sourceTurnId: sourceTurnId!,
+          sessionKey: sourceSessionKey!,
+          scopeKey: resolveDispatchScope(dispatchConfig, sourceSessionKey)!,
+        },
+        fastAbort.handled,
+      );
     const commandTarget = normalizeOptionalString(params.ctx.CommandTargetSessionKey);
-    if (!fastAbort.handled && ((bound && bound !== sourceSessionKey) ||
-        (commandTarget && commandTarget !== sourceSessionKey))) {
+    if (
+      !fastAbort.handled &&
+      ((bound && bound !== sourceSessionKey) ||
+        (commandTarget && commandTarget !== sourceSessionKey))
+    ) {
       throw new Error("THREAD_DISPATCH_TARGET_REFUSED");
     }
-    const run = () => dispatchReplyFromConfigInner(params, messageAuditTerminal, { fastAbort, controlOnly: fastAbort.handled });
+    const run = () =>
+      dispatchReplyFromConfigInner(params, messageAuditTerminal, {
+        fastAbort,
+        controlOnly: fastAbort.handled,
+      });
     // Stop is authenticated by the existing resolver; it never needs scientific ownership.
-    const result = fastAbort.handled ? await run() : await withLogicalChannelDispatch({
-      config: dispatchConfig, sessionKey: sourceSessionKey, sourceTurnId,
-      prompt: params.ctx.RawBody ?? params.ctx.CommandBody ?? params.ctx.Body ?? "",
-      abortSignal: params.replyOptions?.abortSignal,
-      run,
-    });
+    const result = fastAbort.handled
+      ? await run()
+      : await withLogicalChannelDispatch({
+          config: dispatchConfig,
+          sessionKey: sourceSessionKey,
+          sourceTurnId,
+          timeoutMs: resolveAgentTimeoutMs({
+            cfg: params.cfg,
+            overrideSeconds: params.replyOptions?.timeoutOverrideSeconds,
+          }),
+          prompt: params.ctx.RawBody ?? params.ctx.CommandBody ?? params.ctx.Body ?? "",
+          abortSignal: params.replyOptions?.abortSignal,
+          run,
+        });
     if (controlProbe) completeNativeControlProbe();
     messageAuditTerminal?.finishSuccess(result);
     return result;
@@ -280,7 +332,10 @@ export async function dispatchReplyFromConfig(
 async function dispatchReplyFromConfigInner(
   params: DispatchFromConfigParams,
   messageAuditTerminal: InboundMessageAuditTerminalRecorder | undefined,
-  controlled?: { fastAbort: Awaited<ReturnType<NonNullable<DispatchFromConfigParams["fastAbortResolver"]>>>; controlOnly: boolean },
+  controlled?: {
+    fastAbort: Awaited<ReturnType<NonNullable<DispatchFromConfigParams["fastAbortResolver"]>>>;
+    controlOnly: boolean;
+  },
 ): Promise<DispatchFromConfigResult> {
   const { ctx, cfg, dispatcher } = params;
   if (params.replyOptions?.abortSignal?.aborted) {
@@ -566,8 +621,12 @@ async function dispatchReplyFromConfigInner(
       inboundAudio || getDispatchReplyOperation()?.acceptedSteeredInboundAudio === true,
   });
   if (!controlled?.controlOnly) {
-    const { ensureRuntimePluginsLoaded } = await traceReplyPhase("reply.load_runtime_plugins", () => loadRuntimePlugins());
-    await traceReplyPhase("reply.ensure_runtime_plugins", () => { ensureRuntimePluginsLoaded({ config: cfg, workspaceDir }); });
+    const { ensureRuntimePluginsLoaded } = await traceReplyPhase("reply.load_runtime_plugins", () =>
+      loadRuntimePlugins(),
+    );
+    await traceReplyPhase("reply.ensure_runtime_plugins", () => {
+      ensureRuntimePluginsLoaded({ config: cfg, workspaceDir });
+    });
   }
   const hookRunner = controlled?.controlOnly ? undefined : getGlobalHookRunner();
   // Extract message context for hooks (plugin and internal)
@@ -1122,10 +1181,11 @@ async function dispatchReplyFromConfigInner(
     ) {
       const messageReceivedHookContext = buildMessageReceivedHookContext();
       emitOwnedHook(
-        () => hookRunner.runMessageReceived(
-          toPluginMessageReceivedEvent(messageReceivedHookContext),
-          toPluginMessageContext(messageReceivedHookContext),
-        ),
+        () =>
+          hookRunner.runMessageReceived(
+            toPluginMessageReceivedEvent(messageReceivedHookContext),
+            toPluginMessageContext(messageReceivedHookContext),
+          ),
         "dispatch-from-config: message_received plugin hook failed",
       );
     }
@@ -1136,13 +1196,14 @@ async function dispatchReplyFromConfigInner(
       // created, so ledger-style consumers need the original ts alongside this one.
       const sourceTs = normalizeOptionalString(ctx.SourceTs);
       emitOwnedHook(
-        () => triggerInternalHook(
-          createInternalHookEvent("message", "received", sessionKey, {
-            ...receivedContext,
-            ...(sourceTs ? { metadata: { ...receivedContext.metadata, sourceTs } } : {}),
-            timestamp,
-          }),
-        ),
+        () =>
+          triggerInternalHook(
+            createInternalHookEvent("message", "received", sessionKey, {
+              ...receivedContext,
+              ...(sourceTs ? { metadata: { ...receivedContext.metadata, sourceTs } } : {}),
+              timestamp,
+            }),
+          ),
         "dispatch-from-config: message_received internal hook failed",
       );
     }
@@ -1157,7 +1218,7 @@ async function dispatchReplyFromConfigInner(
     if (!fastAbortResolver || !formatAbortReplyTextResolver) {
       throw new Error("abort runtime unavailable");
     }
-    const fastAbort = controlled?.fastAbort ?? await fastAbortResolver({ ctx, cfg });
+    const fastAbort = controlled?.fastAbort ?? (await fastAbortResolver({ ctx, cfg }));
     if (fastAbort.handled) {
       if (pluginOwnedBinding) {
         touchConversationBindingRecord(pluginOwnedBinding.bindingId);

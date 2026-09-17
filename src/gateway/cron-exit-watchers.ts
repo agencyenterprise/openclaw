@@ -140,6 +140,7 @@ export function createCronExitWatchers(params: {
           sessionKey,
           operationId,
           kind: "native",
+          timeoutMs: ON_EXIT_WATCH_TIMEOUT_MS,
           identity: { jobId: job.id, updatedAtMs: job.updatedAtMs, command, cwd: cwd ?? null },
           run: async () => {
             entered = true;

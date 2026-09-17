@@ -5,6 +5,12 @@ import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
+import {
+  captureNativeOwner,
+  inspectNativeOwner,
+  recoverDeadNativeOwner,
+  bindNativeOwnerDeadline,
+} from "./native-owner-recovery.js";
 
 type NativeControlReceipt = Readonly<{
   sourceTurnId: string;
@@ -68,6 +74,7 @@ export type DispatchConfig = {
   sessionScopes: Record<string, string>;
   unscopedSessionKeys?: string[];
   unscopedCronSessionKeys?: string[];
+  automaticSessions?: boolean;
 };
 export type DispatchClaim = {
   claimId: string;
@@ -104,7 +111,7 @@ export function admitDispatchChild(identity: unknown): (() => void) | undefined 
   admitThreadDispatch(parent.config, claim, parent.claim);
   return () => settleThreadDispatch(parent.config, claim);
 }
-const scopePattern = /^slack\/[CGD][A-Z0-9]+\/[0-9]+\.[0-9]{6}$/;
+const scopePattern = /^(?:slack\/[CGD][A-Z0-9]+\/[0-9]+\.[0-9]{6}|session\/[a-f0-9]{64})$/;
 const frozenSchema =
   "CREATE TABLE thread_fences (\n scope_key TEXT PRIMARY KEY NOT NULL,\n epoch INTEGER NOT NULL CHECK(epoch >= 1),\n state TEXT NOT NULL CHECK(state IN ('OPEN','DRAINING','RETIRED')),\n updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)\n) STRICT;\nCREATE TABLE thread_dispatch_claims (\n claim_id TEXT PRIMARY KEY NOT NULL,\n scope_key TEXT NOT NULL REFERENCES thread_fences(scope_key),\n epoch INTEGER NOT NULL CHECK(epoch >= 1),\n fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64),\n kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 64),\n state TEXT NOT NULL CHECK(state IN ('STARTING','RUNNING','UNKNOWN','TERMINAL')),\n created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),\n updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),\n terminal_receipt TEXT,\n CHECK((state='TERMINAL' AND terminal_receipt IS NOT NULL AND length(terminal_receipt)=64)\n       OR (state!='TERMINAL' AND terminal_receipt IS NULL))\n) STRICT;\nCREATE INDEX thread_dispatch_open_claims ON thread_dispatch_claims(scope_key,epoch,state);\nCREATE UNIQUE INDEX thread_dispatch_one_native ON thread_dispatch_claims(scope_key) WHERE kind='native' AND state!='TERMINAL';\nPRAGMA user_version=2;\n";
 const shaPattern = /^[a-f0-9]{64}$/;
@@ -126,6 +133,7 @@ export function validateDispatchConfig(value: unknown): DispatchConfig {
     Object.keys(value).some(
       (key) =>
         ![
+          "automaticSessions",
           "databasePath",
           "scopes",
           "sessionScopes",
@@ -135,10 +143,12 @@ export function validateDispatchConfig(value: unknown): DispatchConfig {
     )
   )
     refuse();
+  if (value.automaticSessions !== undefined && typeof value.automaticSessions !== "boolean")
+    refuse();
   for (const [scope, epoch] of Object.entries(value.scopes)) {
     if (!scopePattern.test(scope) || !Number.isSafeInteger(epoch) || Number(epoch) < 1) refuse();
   }
-  if (!Object.keys(value.scopes).length) refuse();
+  if (!Object.keys(value.scopes).length && value.automaticSessions !== true) refuse();
   for (const [session, scope] of Object.entries(value.sessionScopes)) {
     if (!session || typeof scope !== "string" || !Object.hasOwn(value.scopes, scope)) refuse();
   }
@@ -185,7 +195,7 @@ const cronRunPattern = new RegExp(
 );
 function canonicalSlackScope(sessionKey: string): string | undefined {
   const matched =
-    /^agent:[a-z0-9][a-z0-9_-]*:slack:channel:([cgd][a-z0-9]+):thread:([0-9]+\.[0-9]{6})$/i.exec(
+    /^agent:[a-z0-9][a-z0-9_-]*:slack:channel:([cgd][a-z0-9]+):thread:([0-9]+\.[0-9]{6})(?::heartbeat)?$/i.exec(
       sessionKey,
     );
   if (!matched) return undefined;
@@ -205,6 +215,43 @@ export function resolveDispatchScope(
     return mapped;
   }
   const scope = canonicalSlackScope(sessionKey);
+  if (config.automaticSessions === true) {
+    if (
+      sessionKey.length > 512 ||
+      !/^agent:[a-z0-9][a-z0-9_-]*:[!-~]+$/.test(sessionKey) ||
+      sessionKey.includes("::")
+    )
+      refuse();
+    let canonical =
+      sessionKey.endsWith(":heartbeat") && sessionKey.split(":").length > 3
+        ? sessionKey.slice(0, -10)
+        : sessionKey;
+    if (!scope) {
+      if (sessionKey !== sessionKey.toLowerCase() || sessionKey.includes(":thread:")) refuse();
+      if (canonical.includes(":cron:")) {
+        const base = cronBasePattern.test(canonical)
+          ? canonical
+          : cronRunPattern.exec(canonical)?.[1];
+        if (!base) refuse();
+        canonical = base;
+      }
+    }
+    const automaticScope = scope ?? `session/${dispatchHash(canonical)}`;
+    if (!Object.hasOwn(config.scopes, automaticScope)) {
+      const epoch = database(config, (db) => {
+        db.prepare(
+          "INSERT OR IGNORE INTO thread_fences(scope_key,epoch,state,updated_at_ms) VALUES (?,1,'OPEN',?)",
+        ).run(automaticScope, Date.now());
+        const row = db
+          .prepare("SELECT epoch FROM thread_fences WHERE scope_key=?")
+          .get(automaticScope);
+        if (!row || !Number.isSafeInteger(row.epoch) || Number(row.epoch) < 1) refuse();
+        return Number(row.epoch);
+      });
+      config.scopes[automaticScope] = epoch;
+    }
+    return automaticScope;
+  }
   if (scope) return Object.hasOwn(config.scopes, scope) ? scope : undefined;
   // Host-reviewed exact sessions and exact cron jobs only. No unknown-origin wildcard.
   if (config.unscopedSessionKeys?.includes(sessionKey)) return undefined;
@@ -322,6 +369,21 @@ export function admitThreadDispatch(
       )
         refuse();
     } else if (parent !== undefined) refuse();
+    if (claim.kind === "native") {
+      const old = db
+        .prepare(
+          "SELECT * FROM thread_dispatch_claims WHERE scope_key=? AND kind='native' AND state!='TERMINAL'",
+        )
+        .get(claim.scopeKey);
+      if (old)
+        recoverDeadNativeOwner(db, config.databasePath, {
+          claimId: String(old.claim_id),
+          scopeKey: String(old.scope_key),
+          epoch: Number(old.epoch),
+          fingerprint: String(old.fingerprint),
+          kind: "native",
+        });
+    }
     if (
       claim.kind === "native" &&
       db
@@ -337,6 +399,7 @@ export function admitThreadDispatch(
       );
       throw error;
     }
+    if (claim.kind === "native") captureNativeOwner(config.databasePath, claim);
     const now = Date.now();
     db.prepare(
       "INSERT INTO thread_dispatch_claims (claim_id,scope_key,epoch,fingerprint,kind,state,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,'STARTING',?,?)",
@@ -377,6 +440,61 @@ export function settleThreadDispatch(
     ).run(receipt ? "TERMINAL" : "UNKNOWN", receipt ?? null, Date.now(), claim.claimId);
   });
 }
+export function bindCurrentNativeOwnerDeadline(timeoutMs: number): void {
+  const owner = dispatchContext.getStore();
+  if (owner && !("unconfigured" in owner)) {
+    if (owner.closed) refuse();
+    bindNativeOwnerDeadline(owner.config.databasePath, owner.claim, timeoutMs);
+  }
+}
+export function inspectNativeDispatchOwners(config: DispatchConfig) {
+  const before = lstatSync(config.databasePath);
+  if (!before.isFile() || before.uid !== process.getuid?.() || before.mode & 0o077) refuse();
+  const db = new (requireNodeSqlite().DatabaseSync)(config.databasePath, { readOnly: true });
+  try {
+    const after = lstatSync(config.databasePath);
+    if (after.dev !== before.dev || after.ino !== before.ino) refuse();
+    db.exec("PRAGMA query_only=ON; BEGIN;");
+    if (db.prepare("PRAGMA user_version").get()?.user_version !== 2) refuse();
+    const rows = db
+      .prepare(
+        "SELECT * FROM thread_dispatch_claims WHERE kind='native' AND state!='TERMINAL' LIMIT 10001",
+      )
+      .all();
+    if (rows.length > 10000) refuse();
+    const result = rows
+      .filter(
+        (row) =>
+          config.scopes[String(row.scope_key)] === row.epoch ||
+          (config.automaticSessions === true && scopePattern.test(String(row.scope_key))),
+      )
+      .map((row) => {
+        const claim = {
+          claimId: String(row.claim_id),
+          scopeKey: String(row.scope_key),
+          epoch: Number(row.epoch),
+          fingerprint: String(row.fingerprint),
+          kind: "native",
+        };
+        validClaim(claim);
+        return {
+          ...inspectNativeOwner(config.databasePath, claim),
+          state: row.state,
+          updatedAtMs: row.updated_at_ms,
+        };
+      });
+    db.exec("COMMIT;");
+    return {
+      schema: "fractal-native-owner-inspection-v1",
+      databasePath: config.databasePath,
+      observedAtMs: Date.now(),
+      rows: result,
+    };
+  } finally {
+    db.close();
+  }
+}
+
 export function hasProtectedDispatchOwner(): boolean {
   const owner = dispatchContext.getStore();
   return Boolean(owner && !("unconfigured" in owner) && !owner.closed);
@@ -390,6 +508,7 @@ export async function withThreadDispatch<T>(params: {
   run: () => Promise<T>;
   terminalReceipt: (result: T) => string | undefined;
   failedErrorReceipt?: (error: unknown) => string | undefined;
+  timeoutMs?: number;
   config?: DispatchConfig;
 }): Promise<T> {
   const config = params.config ?? loadDispatchConfig();
@@ -408,7 +527,11 @@ export async function withThreadDispatch<T>(params: {
   admitThreadDispatch(config, claim);
   const owner: DispatchContext = { config, claim, childIndex: 0, closed: false };
   try {
-    const result = await dispatchContext.run(owner, params.run);
+    const result = await dispatchContext.run(owner, () => {
+      if (params.kind === "native" && params.timeoutMs !== undefined)
+        bindNativeOwnerDeadline(config.databasePath, claim, params.timeoutMs);
+      return params.run();
+    });
     owner.closed = true;
     settleThreadDispatch(config, claim, params.terminalReceipt(result));
     return result;
@@ -453,6 +576,7 @@ type LogicalReplyParams<T> = {
   run: (observeCompleted: (receipt: string) => void) => Promise<T>;
   config?: DispatchConfig;
   abortSignal?: AbortSignal;
+  timeoutMs?: number;
 };
 export function trackLogicalDispatchHook(task: () => Promise<unknown>): boolean {
   const logical = logicalDispatchContext.getStore();
@@ -531,6 +655,7 @@ async function withLogicalOwner<T>(
       config,
       sessionKey,
       operationId: claimId,
+      timeoutMs: params.timeoutMs,
       kind: "native",
       identity: { scopeKey, sessionKey, sourceTurnId, promptSha256: dispatchHash(params.prompt) },
       run: async () => {
@@ -638,6 +763,7 @@ export function bindCronDispatchSession(sessionKey: string): void {
 export async function withCronDispatchOwner<T>(params: {
   sessionKey: string;
   operationId: string;
+  timeoutMs?: number;
   identity: unknown;
   run: () => Promise<T>;
   completed: (result: T) => boolean;
@@ -657,6 +783,7 @@ export async function withCronDispatchOwner<T>(params: {
     operationId: params.operationId,
     identity: params.identity,
     kind: "native",
+    timeoutMs: params.timeoutMs,
     run: async () => {
       const owner = dispatchContext.getStore();
       if (!owner) refuse();
