@@ -4576,3 +4576,14 @@ it("V3 actual reply final success settles the logical owner only after its body 
     expect(f.db.prepare("SELECT state FROM thread_dispatch_claims").get()?.state).toBe("TERMINAL");
   } finally { await f.cleanup(); }
 });
+it("host heartbeat actual reply final observer settles without channel source", async () => {
+ const f=await logicalFenceFixture();
+ const {withHostReplyDispatch}=await import("../../state/thread-dispatch.js");
+ state.runEmbeddedAgentMock.mockResolvedValue({payloads:[{text:"final"}],meta:{stopReason:"stop",durationMs:1,agentMeta:{usage:{input:1,output:1}}}});
+ const run=createMinimalRun();
+ try {
+  await withHostReplyDispatch({sessionKey:"main",operationId:"heartbeat:actual-reply-fixture",identity:{host:true},timeoutMs:5000,run:run.run});
+  expect(state.runEmbeddedAgentMock).toHaveBeenCalledTimes(1);
+  expect(f.db.prepare("SELECT state FROM thread_dispatch_claims").get()?.state).toBe("TERMINAL");
+ }finally{await f.cleanup();}
+});

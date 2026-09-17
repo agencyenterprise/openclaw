@@ -561,7 +561,8 @@ type LogicalDispatchContext = {
   owner: DispatchContext;
   sessionKey: string;
   sourceTurnId: string;
-  role: "dispatch" | "reply";
+  role: "dispatch" | "reply" | "host";
+  replyEntered?: boolean;
   observeCompleted: (receipt: string) => void;
   hooks: Promise<boolean>[];
   acceptingHooks: boolean;
@@ -580,7 +581,7 @@ type LogicalReplyParams<T> = {
 };
 export function trackLogicalDispatchHook(task: () => Promise<unknown>): boolean {
   const logical = logicalDispatchContext.getStore();
-  if (!logical || logical.role !== "dispatch") return false;
+  if (!logical || (logical.role !== "dispatch" && logical.role !== "host")) return false;
   if (!logical.acceptingHooks) refuse();
   try {
     logical.hooks.push(
@@ -612,11 +613,12 @@ export function withLogicalReplyDispatch<T>(params: LogicalReplyParams<T>): Prom
   const parent = logicalDispatchContext.getStore();
   if (parent) {
     if (
-      parent.role !== "dispatch" ||
-      params.sourceTurnId !== parent.sourceTurnId ||
+      (parent.role !== "dispatch" && parent.role !== "host") ||
+      (parent.role !== "host" && params.sourceTurnId !== parent.sourceTurnId) ||
       params.sessionKey !== parent.sessionKey
     )
       refuse();
+    parent.replyEntered = true;
     return runLogicalDispatchAttempt({
       sessionKey: params.sessionKey,
       run: () => params.run(parent.observeCompleted),
@@ -624,13 +626,70 @@ export function withLogicalReplyDispatch<T>(params: LogicalReplyParams<T>): Prom
   }
   return withLogicalOwner(params, "reply");
 }
+// Only the heartbeat scheduler's already-admitted independent gateway root calls this.
+// A new wake never inherits authority (or a retired context) from its requester.
+// Its own exact scope still has to acquire the durable native owner normally.
+export function runIndependentHeartbeatDispatch<T>(run: () => Promise<T>): Promise<T> {
+  return nativeControlProbe.exit(() =>
+    cronDispatchContext.exit(() => logicalDispatchContext.exit(() => dispatchContext.exit(run))),
+  );
+}
+// Host entrypoints call this only after authenticating/admitting their real invocation.
+// No public message field grants this private continuation capability.
+export function withHostReplyDispatch<T>(params: {
+  sessionKey: string;
+  operationId: string;
+  identity: unknown;
+  timeoutMs: number;
+  run: () => Promise<T>;
+  completedWithoutReply?: (result: T) => boolean;
+}): Promise<T> {
+  if (
+    logicalDispatchContext.getStore() ||
+    dispatchContext.getStore() ||
+    cronDispatchContext.getStore()
+  )
+    refuse();
+  if (!params.operationId || params.operationId.length > 512) refuse();
+  return withLogicalOwner(
+    {
+      sessionKey: params.sessionKey,
+      sourceTurnId: `host-turn:v1:${dispatchHash({ operationId: params.operationId })}`,
+      prompt: dispatchHash(params.identity),
+      timeoutMs: params.timeoutMs,
+      run: () => params.run(),
+    },
+    "host",
+    params.completedWithoutReply,
+  );
+}
+export function bindHostReplyDispatchSession(sessionKey: string): void {
+  const context = logicalDispatchContext.getStore();
+  if (!context) return;
+  if (
+    context.role !== "host" ||
+    context.replyEntered ||
+    context.owner.closed ||
+    resolveDispatchScope(context.owner.config, sessionKey) !== context.owner.claim.scopeKey
+  )
+    refuse();
+  context.sessionKey = sessionKey;
+}
 export function withLogicalChannelDispatch<T>(params: LogicalReplyParams<T>): Promise<T> {
-  if (logicalDispatchContext.getStore()) refuse();
+  const parent = logicalDispatchContext.getStore();
+  if (parent?.role === "host") {
+    return runLogicalDispatchAttempt({
+      sessionKey: params.sessionKey,
+      run: () => params.run(parent.observeCompleted),
+    })!;
+  }
+  if (parent) refuse();
   return withLogicalOwner(params, "dispatch");
 }
 async function withLogicalOwner<T>(
   params: LogicalReplyParams<T>,
-  role: "dispatch" | "reply",
+  role: "dispatch" | "reply" | "host",
+  completedWithoutReply?: (result: T) => boolean,
 ): Promise<T> {
   const config = params.config ?? loadDispatchConfig();
   if (!config) return params.run(() => {});
@@ -640,7 +699,9 @@ async function withLogicalOwner<T>(
   if (
     !params.sessionKey ||
     typeof params.sourceTurnId !== "string" ||
-    !/^channel-user:v1:[a-f0-9]{64}$/.test(params.sourceTurnId)
+    !(role === "host"
+      ? /^host-turn:v1:[a-f0-9]{64}$/.test(params.sourceTurnId)
+      : /^channel-user:v1:[a-f0-9]{64}$/.test(params.sourceTurnId))
   )
     refuse();
   const sessionKey = params.sessionKey;
@@ -678,6 +739,11 @@ async function withLogicalOwner<T>(
         return logicalDispatchContext.run(logical, async () => {
           try {
             const result = await params.run(logical.observeCompleted);
+            if (role === "host" && !logical.replyEntered && completedWithoutReply?.(result))
+              completedReceipt = dispatchHash({
+                kind: "host_turn_without_reply_completed",
+                sourceTurnId,
+              });
             // Hooks may register work while earlier hooks finish: drain every admitted batch.
             let offset = 0;
             while (offset < logical.hooks.length) {

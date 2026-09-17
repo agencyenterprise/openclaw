@@ -2,6 +2,7 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { runWithGatewayIndependentRootWorkAdmission } from "../process/gateway-work-admission.js";
 import { resolveTimerTimeoutMs } from "../shared/number-coercion.js";
+import { runIndependentHeartbeatDispatch } from "../state/thread-dispatch.js";
 import { normalizeHeartbeatWakeReason } from "./heartbeat-reason.js";
 
 export type HeartbeatRunResult =
@@ -235,7 +236,7 @@ function schedule(coalesceMs: number, kind: WakeTimerKind = "normal") {
           // Each wake is detached process work: admit the whole handler before
           // it can mutate sessions or commitments, and keep it visible until done.
           const res = await runWithGatewayIndependentRootWorkAdmission(async () =>
-            active(wakeOpts),
+            runIndependentHeartbeatDispatch(() => active(wakeOpts)),
           );
           if (res.status === "skipped" && isRetryableHeartbeatBusySkipReason(res.reason)) {
             // The target runtime is busy; retry this wake target soon.
