@@ -3,6 +3,11 @@ import type { AssistantMessage } from "../../../llm/types.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import type { NormalizedUsage } from "../../usage.js";
 import { log } from "../logger.js";
+import {
+  invalidateNativeCleanupTracking,
+  trackNativeCleanupDependency,
+  hasNativeCleanupTracking,
+} from "../native-cleanup-proof.js";
 import type { PromptCacheBreak, PromptCacheChange } from "../prompt-cache-observability.js";
 import { clearActiveEmbeddedRun } from "../runs.js";
 import type {
@@ -25,6 +30,7 @@ type StreamCleanupInput = {
   removeAttemptAbortSignalListener: () => void;
   state: EmbeddedAttemptExecutionState;
   unsubscribe: () => void;
+  waitForPendingEvents: () => Promise<void>;
 };
 
 function cleanupEmbeddedAttemptStreamExecution(input: StreamCleanupInput): void {
@@ -42,11 +48,13 @@ function cleanupEmbeddedAttemptStreamExecution(input: StreamCleanupInput): void 
   try {
     input.unsubscribe();
   } catch (error) {
+    invalidateNativeCleanupTracking();
     // A throwing unsubscribe indicates a resource leak, but must not mask the run error.
     log.error(
       `CRITICAL: unsubscribe failed, possible resource leak: runId=${attempt.runId} ${String(error)}`,
     );
   }
+  if (hasNativeCleanupTracking()) trackNativeCleanupDependency(input.waitForPendingEvents());
   attempt.replyOperation?.detachBackend(input.queueHandle);
   clearActiveEmbeddedRun(
     attempt.sessionId,
@@ -360,6 +368,7 @@ export async function runEmbeddedAttemptSettledPhase(
       removeAttemptAbortSignalListener,
       state,
       unsubscribe,
+      waitForPendingEvents,
     });
   }
 

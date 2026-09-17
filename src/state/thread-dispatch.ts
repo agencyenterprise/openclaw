@@ -6,7 +6,11 @@ import type { DatabaseSync } from "node:sqlite";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
 
-type NativeControlReceipt = Readonly<{ sourceTurnId: string; sessionKey: string; scopeKey: string }>;
+type NativeControlReceipt = Readonly<{
+  sourceTurnId: string;
+  sessionKey: string;
+  scopeKey: string;
+}>;
 type NativeControlProbe = {
   open: boolean;
   entered: boolean;
@@ -44,13 +48,15 @@ export function enterNativeControlProbe(): boolean {
 }
 export function completeNativeControlProbe(): void {
   const probe = nativeControlProbe.getStore();
-  if (!probe || !probe.open || probe.disposition !== "HANDLED") throw new Error("THREAD_CONTROL_PROBE_UNVERIFIED");
+  if (!probe || !probe.open || probe.disposition !== "HANDLED")
+    throw new Error("THREAD_CONTROL_PROBE_UNVERIFIED");
   probe.responseCompleted = true;
 }
 /** Core-only latch after the existing authenticated abort resolver has returned. */
 export function observeNativeControlProbe(receipt: NativeControlReceipt, handled: boolean): void {
   const probe = nativeControlProbe.getStore();
-  if (!probe || !probe.open || !probe.entered || probe.receipt) throw new Error("THREAD_CONTROL_PROBE_UNVERIFIED");
+  if (!probe || !probe.open || !probe.entered || probe.receipt)
+    throw new Error("THREAD_CONTROL_PROBE_UNVERIFIED");
   probe.receipt = Object.freeze({ ...receipt });
   probe.disposition = handled ? "HANDLED" : "NOT_HANDLED";
   if (!handled) throw new Error("THREAD_CONTROL_PROBE_NOT_HANDLED");
@@ -70,7 +76,12 @@ export type DispatchClaim = {
   fingerprint: string;
   kind: string;
 };
-type DispatchContext = { config: DispatchConfig; claim: DispatchClaim; childIndex: number };
+type DispatchContext = {
+  config: DispatchConfig;
+  claim: DispatchClaim;
+  childIndex: number;
+  closed?: boolean;
+};
 const dispatchContext = new AsyncLocalStorage<DispatchContext | { unconfigured: true }>();
 export function admitDispatchChild(identity: unknown): (() => void) | undefined {
   const parent = dispatchContext.getStore();
@@ -80,6 +91,7 @@ export function admitDispatchChild(identity: unknown): (() => void) | undefined 
     return undefined;
   }
   if ("unconfigured" in parent) return undefined;
+  if (parent.closed) refuse();
   const index = parent.childIndex++;
   if (!Number.isSafeInteger(index)) refuse();
   const claim: DispatchClaim = {
@@ -111,7 +123,16 @@ export function validateDispatchConfig(value: unknown): DispatchConfig {
     !dictionary(value.sessionScopes) ||
     typeof value.databasePath !== "string" ||
     !path.isAbsolute(value.databasePath) ||
-    Object.keys(value).some((key) => !["databasePath", "scopes", "sessionScopes", "unscopedSessionKeys", "unscopedCronSessionKeys"].includes(key))
+    Object.keys(value).some(
+      (key) =>
+        ![
+          "databasePath",
+          "scopes",
+          "sessionScopes",
+          "unscopedSessionKeys",
+          "unscopedCronSessionKeys",
+        ].includes(key),
+    )
   )
     refuse();
   for (const [scope, epoch] of Object.entries(value.scopes)) {
@@ -125,15 +146,26 @@ export function validateDispatchConfig(value: unknown): DispatchConfig {
   for (const field of ["unscopedSessionKeys", "unscopedCronSessionKeys"] as const) {
     const entries = value[field];
     if (entries === undefined) continue;
-    if (!Array.isArray(entries) || entries.length > 1024 || new Set(entries).size !== entries.length) refuse();
+    if (
+      !Array.isArray(entries) ||
+      entries.length > 1024 ||
+      new Set(entries).size !== entries.length
+    )
+      refuse();
     for (const key of entries) {
-      if (typeof key !== "string" || key.length > 512 || !/^agent:[a-z0-9][a-z0-9_-]*:[!-~]+$/.test(key) ||
-          selectedKeys.includes(key.toLowerCase())) refuse();
+      if (
+        typeof key !== "string" ||
+        key.length > 512 ||
+        !/^agent:[a-z0-9][a-z0-9_-]*:[!-~]+$/.test(key) ||
+        selectedKeys.includes(key.toLowerCase())
+      )
+        refuse();
       const parsed = canonicalSlackScope(key);
       if (parsed && Object.hasOwn(value.scopes, parsed)) refuse();
       if (field === "unscopedCronSessionKeys" && !cronBasePattern.test(key)) refuse();
       // Thread-like or cron-like aliases need their strict recognized grammar, never an exact-list escape.
-      if (field === "unscopedSessionKeys" && (key.includes(":thread:") || key.includes(":cron:"))) refuse();
+      if (field === "unscopedSessionKeys" && (key.includes(":thread:") || key.includes(":cron:")))
+        refuse();
     }
   }
   return value as DispatchConfig;
@@ -148,15 +180,24 @@ export function loadDispatchConfig(): DispatchConfig | undefined {
 }
 const uuidPattern = "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
 const cronBasePattern = new RegExp(`^agent:[a-z0-9][a-z0-9_-]*:cron:${uuidPattern}$`);
-const cronRunPattern = new RegExp(`^(agent:[a-z0-9][a-z0-9_-]*:cron:${uuidPattern}):run:${uuidPattern}$`);
+const cronRunPattern = new RegExp(
+  `^(agent:[a-z0-9][a-z0-9_-]*:cron:${uuidPattern}):run:${uuidPattern}$`,
+);
 function canonicalSlackScope(sessionKey: string): string | undefined {
-  const matched = /^agent:[a-z0-9][a-z0-9_-]*:slack:channel:([cgd][a-z0-9]+):thread:([0-9]+\.[0-9]{6})$/i.exec(sessionKey);
+  const matched =
+    /^agent:[a-z0-9][a-z0-9_-]*:slack:channel:([cgd][a-z0-9]+):thread:([0-9]+\.[0-9]{6})$/i.exec(
+      sessionKey,
+    );
   if (!matched) return undefined;
-  const channel = matched[1]; const thread = matched[2];
+  const channel = matched[1];
+  const thread = matched[2];
   if (!channel || !thread) refuse();
   return `slack/${channel.toUpperCase()}/${thread}`;
 }
-export function resolveDispatchScope(config: DispatchConfig, sessionKey?: string): string | undefined {
+export function resolveDispatchScope(
+  config: DispatchConfig,
+  sessionKey?: string,
+): string | undefined {
   if (typeof sessionKey !== "string" || !sessionKey || sessionKey !== sessionKey.trim()) refuse();
   if (Object.hasOwn(config.sessionScopes, sessionKey)) {
     const mapped = config.sessionScopes[sessionKey];
@@ -167,13 +208,24 @@ export function resolveDispatchScope(config: DispatchConfig, sessionKey?: string
   if (scope) return Object.hasOwn(config.scopes, scope) ? scope : undefined;
   // Host-reviewed exact sessions and exact cron jobs only. No unknown-origin wildcard.
   if (config.unscopedSessionKeys?.includes(sessionKey)) return undefined;
-  const cronBase = cronBasePattern.test(sessionKey) ? sessionKey : cronRunPattern.exec(sessionKey)?.[1];
+  const cronBase = cronBasePattern.test(sessionKey)
+    ? sessionKey
+    : cronRunPattern.exec(sessionKey)?.[1];
   if (cronBase && config.unscopedCronSessionKeys?.includes(cronBase)) return undefined;
   refuse();
 }
-export function runProvenUnscopedDispatch<T>(config: DispatchConfig, sessionKey: string | undefined, run: () => Promise<T>): Promise<T> {
+export function runProvenUnscopedDispatch<T>(
+  config: DispatchConfig,
+  sessionKey: string | undefined,
+  run: () => Promise<T>,
+): Promise<T> {
   const inherited = dispatchContext.getStore();
-  if (nativeControlProbe.getStore() || (inherited && !("unconfigured" in inherited)) || resolveDispatchScope(config, sessionKey) !== undefined) refuse();
+  if (
+    nativeControlProbe.getStore() ||
+    (inherited && !("unconfigured" in inherited)) ||
+    resolveDispatchScope(config, sessionKey) !== undefined
+  )
+    refuse();
   return dispatchContext.run({ unconfigured: true }, run);
 }
 function database<T>(config: DispatchConfig, fn: (db: DatabaseSync) => T): T {
@@ -230,7 +282,9 @@ type NativeAdmissionBusyReceipt = Readonly<{ claimId: string; scopeKey: string; 
 const nativeAdmissionBusyReceipts = new WeakMap<object, NativeAdmissionBusyReceipt>();
 /** Private provenance: only a rejected SQL admission can produce this receipt. */
 export function readNativeAdmissionBusy(error: unknown): NativeAdmissionBusyReceipt | undefined {
-  return typeof error === "object" && error !== null ? nativeAdmissionBusyReceipts.get(error) : undefined;
+  return typeof error === "object" && error !== null
+    ? nativeAdmissionBusyReceipts.get(error)
+    : undefined;
 }
 export function admitThreadDispatch(
   config: DispatchConfig,
@@ -277,7 +331,10 @@ export function admitThreadDispatch(
         .get(claim.scopeKey)
     ) {
       const error = new NativeDispatchBusyError();
-      nativeAdmissionBusyReceipts.set(error, Object.freeze({ claimId: claim.claimId, scopeKey: claim.scopeKey, epoch: claim.epoch }));
+      nativeAdmissionBusyReceipts.set(
+        error,
+        Object.freeze({ claimId: claim.claimId, scopeKey: claim.scopeKey, epoch: claim.epoch }),
+      );
       throw error;
     }
     const now = Date.now();
@@ -320,6 +377,11 @@ export function settleThreadDispatch(
     ).run(receipt ? "TERMINAL" : "UNKNOWN", receipt ?? null, Date.now(), claim.claimId);
   });
 }
+export function hasProtectedDispatchOwner(): boolean {
+  const owner = dispatchContext.getStore();
+  return Boolean(owner && !("unconfigured" in owner) && !owner.closed);
+}
+
 export async function withThreadDispatch<T>(params: {
   sessionKey?: string;
   operationId: string;
@@ -327,6 +389,7 @@ export async function withThreadDispatch<T>(params: {
   identity: unknown;
   run: () => Promise<T>;
   terminalReceipt: (result: T) => string | undefined;
+  failedErrorReceipt?: (error: unknown) => string | undefined;
   config?: DispatchConfig;
 }): Promise<T> {
   const config = params.config ?? loadDispatchConfig();
@@ -343,21 +406,32 @@ export async function withThreadDispatch<T>(params: {
     kind: params.kind,
   };
   admitThreadDispatch(config, claim);
+  const owner: DispatchContext = { config, claim, childIndex: 0, closed: false };
   try {
-    const result = await dispatchContext.run({ config, claim, childIndex: 0 }, params.run);
+    const result = await dispatchContext.run(owner, params.run);
+    owner.closed = true;
     settleThreadDispatch(config, claim, params.terminalReceipt(result));
     return result;
   } catch (error) {
+    owner.closed = true;
     // If reconciliation itself fails, STARTING remains durable and blocks retirement.
-    settleThreadDispatch(config, claim);
+    settleThreadDispatch(config, claim, params.failedErrorReceipt?.(error));
     throw error;
   }
 }
 
 // Only host code can create this capability; public run parameters carry no owner.
-type NativePreAdmissionRefusal = Readonly<{ sourceTurnId: string; sessionKey: string; scopeKey: string; claimId: string; epoch: number }>;
+type NativePreAdmissionRefusal = Readonly<{
+  sourceTurnId: string;
+  sessionKey: string;
+  scopeKey: string;
+  claimId: string;
+  epoch: number;
+}>;
 const preAdmissionRefusals = new WeakMap<object, NativePreAdmissionRefusal>();
-export function readNativePreAdmissionRefusal(error: unknown): NativePreAdmissionRefusal | undefined {
+export function readNativePreAdmissionRefusal(
+  error: unknown,
+): NativePreAdmissionRefusal | undefined {
   return typeof error === "object" && error !== null ? preAdmissionRefusals.get(error) : undefined;
 }
 type LogicalDispatchContext = {
@@ -370,7 +444,8 @@ type LogicalDispatchContext = {
   acceptingHooks: boolean;
 };
 const logicalDispatchContext = new AsyncLocalStorage<LogicalDispatchContext>();
-export const hasLogicalDispatchOwner = (): boolean => logicalDispatchContext.getStore() !== undefined;
+export const hasLogicalDispatchOwner = (): boolean =>
+  logicalDispatchContext.getStore() !== undefined;
 type LogicalReplyParams<T> = {
   sessionKey?: string;
   sourceTurnId?: string;
@@ -383,26 +458,45 @@ export function trackLogicalDispatchHook(task: () => Promise<unknown>): boolean 
   const logical = logicalDispatchContext.getStore();
   if (!logical || logical.role !== "dispatch") return false;
   if (!logical.acceptingHooks) refuse();
-  try { logical.hooks.push(task().then(() => true, () => false)); }
-  catch { throw new Error("THREAD_DISPATCH_HOOK_FAILED"); }
+  try {
+    logical.hooks.push(
+      task().then(
+        () => true,
+        () => false,
+      ),
+    );
+  } catch {
+    throw new Error("THREAD_DISPATCH_HOOK_FAILED");
+  }
   return true;
 }
 function waitLogicalHooks(hooks: Promise<boolean>[], signal?: AbortSignal): Promise<boolean[]> {
   if (!signal) return Promise.all(hooks);
   return new Promise((resolve, reject) => {
     const abort = () => reject(new Error("THREAD_DISPATCH_ABORTED"));
-    if (signal.aborted) { abort(); return; }
+    if (signal.aborted) {
+      abort();
+      return;
+    }
     signal.addEventListener("abort", abort, { once: true });
-    void Promise.all(hooks).then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    void Promise.all(hooks)
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener("abort", abort));
   });
 }
 export function withLogicalReplyDispatch<T>(params: LogicalReplyParams<T>): Promise<T> {
   const parent = logicalDispatchContext.getStore();
   if (parent) {
-    if (parent.role !== "dispatch" || params.sourceTurnId !== parent.sourceTurnId ||
-        params.sessionKey !== parent.sessionKey) refuse();
-    return runLogicalDispatchAttempt({ sessionKey: params.sessionKey,
-      run: () => params.run(parent.observeCompleted) })!;
+    if (
+      parent.role !== "dispatch" ||
+      params.sourceTurnId !== parent.sourceTurnId ||
+      params.sessionKey !== parent.sessionKey
+    )
+      refuse();
+    return runLogicalDispatchAttempt({
+      sessionKey: params.sessionKey,
+      run: () => params.run(parent.observeCompleted),
+    })!;
   }
   return withLogicalOwner(params, "reply");
 }
@@ -410,13 +504,21 @@ export function withLogicalChannelDispatch<T>(params: LogicalReplyParams<T>): Pr
   if (logicalDispatchContext.getStore()) refuse();
   return withLogicalOwner(params, "dispatch");
 }
-async function withLogicalOwner<T>(params: LogicalReplyParams<T>, role: "dispatch" | "reply"): Promise<T> {
+async function withLogicalOwner<T>(
+  params: LogicalReplyParams<T>,
+  role: "dispatch" | "reply",
+): Promise<T> {
   const config = params.config ?? loadDispatchConfig();
   if (!config) return params.run(() => {});
   const scopeKey = resolveDispatchScope(config, params.sessionKey);
-  if (!scopeKey) return runProvenUnscopedDispatch(config, params.sessionKey, () => params.run(() => {}));
-  if (!params.sessionKey || typeof params.sourceTurnId !== "string" ||
-      !/^channel-user:v1:[a-f0-9]{64}$/.test(params.sourceTurnId)) refuse();
+  if (!scopeKey)
+    return runProvenUnscopedDispatch(config, params.sessionKey, () => params.run(() => {}));
+  if (
+    !params.sessionKey ||
+    typeof params.sourceTurnId !== "string" ||
+    !/^channel-user:v1:[a-f0-9]{64}$/.test(params.sourceTurnId)
+  )
+    refuse();
   const sessionKey = params.sessionKey;
   const sourceTurnId = params.sourceTurnId;
   let completedReceipt: string | undefined;
@@ -424,41 +526,56 @@ async function withLogicalOwner<T>(params: LogicalReplyParams<T>, role: "dispatc
   const claimId = `logical:${dispatchHash({ scopeKey, sourceTurnId })}`;
   const epoch = config.scopes[scopeKey];
   if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 1) refuse();
-  try { return await withThreadDispatch({
-    config, sessionKey,
-    operationId: claimId,
-    kind: "native",
-    identity: { scopeKey, sessionKey, sourceTurnId, promptSha256: dispatchHash(params.prompt) },
-    run: async () => {
-      entered = true;
-      const owner = dispatchContext.getStore();
-      if (!owner || "unconfigured" in owner) refuse();
-      const logical: LogicalDispatchContext = {
-        owner, sessionKey, sourceTurnId, role, hooks: [], acceptingHooks: true,
-        observeCompleted: (receipt) => {
-          if (typeof receipt !== "string" || !shaPattern.test(receipt) || completedReceipt) refuse();
-          completedReceipt = receipt;
-        },
-      };
-      return logicalDispatchContext.run(logical, async () => {
-        try {
-          const result = await params.run(logical.observeCompleted);
-          // Hooks may register work while earlier hooks finish: drain every admitted batch.
-          let offset = 0;
-          while (offset < logical.hooks.length) {
-            const batch = logical.hooks.slice(offset); offset += batch.length;
-            if ((await waitLogicalHooks(batch, params.abortSignal)).some((ok) => !ok))
-              throw new Error("THREAD_DISPATCH_HOOK_FAILED");
+  try {
+    return await withThreadDispatch({
+      config,
+      sessionKey,
+      operationId: claimId,
+      kind: "native",
+      identity: { scopeKey, sessionKey, sourceTurnId, promptSha256: dispatchHash(params.prompt) },
+      run: async () => {
+        entered = true;
+        const owner = dispatchContext.getStore();
+        if (!owner || "unconfigured" in owner) refuse();
+        const logical: LogicalDispatchContext = {
+          owner,
+          sessionKey,
+          sourceTurnId,
+          role,
+          hooks: [],
+          acceptingHooks: true,
+          observeCompleted: (receipt) => {
+            if (typeof receipt !== "string" || !shaPattern.test(receipt) || completedReceipt)
+              refuse();
+            completedReceipt = receipt;
+          },
+        };
+        return logicalDispatchContext.run(logical, async () => {
+          try {
+            const result = await params.run(logical.observeCompleted);
+            // Hooks may register work while earlier hooks finish: drain every admitted batch.
+            let offset = 0;
+            while (offset < logical.hooks.length) {
+              const batch = logical.hooks.slice(offset);
+              offset += batch.length;
+              if ((await waitLogicalHooks(batch, params.abortSignal)).some((ok) => !ok))
+                throw new Error("THREAD_DISPATCH_HOOK_FAILED");
+            }
+            if (params.abortSignal?.aborted) throw new Error("THREAD_DISPATCH_ABORTED");
+            return result;
+          } finally {
+            logical.acceptingHooks = false;
           }
-          if (params.abortSignal?.aborted) throw new Error("THREAD_DISPATCH_ABORTED");
-          return result;
-        } finally { logical.acceptingHooks = false; }
-      });
-    },
-    terminalReceipt: () => completedReceipt,
-  }); } catch (error) {
+        });
+      },
+      terminalReceipt: () => completedReceipt,
+    });
+  } catch (error) {
     if (role === "dispatch" && !entered && error instanceof NativeDispatchBusyError) {
-      preAdmissionRefusals.set(error, Object.freeze({ sourceTurnId, sessionKey, scopeKey, claimId, epoch }));
+      preAdmissionRefusals.set(
+        error,
+        Object.freeze({ sourceTurnId, sessionKey, scopeKey, claimId, epoch }),
+      );
     }
     throw error;
   }
@@ -471,23 +588,45 @@ export function runLogicalDispatchAttempt<T>(params: {
   const logical = logicalDispatchContext.getStore();
   if (!logical) return undefined;
   const { config, claim } = logical.owner;
-  if (dispatchContext.getStore() !== logical.owner || params.sessionKey !== logical.sessionKey ||
-      resolveDispatchScope(config, params.sessionKey) !== claim.scopeKey ||
-      config.scopes[claim.scopeKey] !== claim.epoch) refuse();
+  if (
+    dispatchContext.getStore() !== logical.owner ||
+    params.sessionKey !== logical.sessionKey ||
+    resolveDispatchScope(config, params.sessionKey) !== claim.scopeKey ||
+    config.scopes[claim.scopeKey] !== claim.epoch
+  )
+    refuse();
   database(config, (db) => {
-    const fence = db.prepare("SELECT epoch,state FROM thread_fences WHERE scope_key=?").get(claim.scopeKey);
-    const owner = db.prepare("SELECT * FROM thread_dispatch_claims WHERE claim_id=?").get(claim.claimId);
-    if (!fence || fence.epoch !== claim.epoch || fence.state !== "OPEN" || !owner ||
-        owner.scope_key !== claim.scopeKey || owner.epoch !== claim.epoch ||
-        owner.fingerprint !== claim.fingerprint || owner.kind !== "native" ||
-        !["STARTING", "RUNNING"].includes(String(owner.state))) refuse();
+    const fence = db
+      .prepare("SELECT epoch,state FROM thread_fences WHERE scope_key=?")
+      .get(claim.scopeKey);
+    const owner = db
+      .prepare("SELECT * FROM thread_dispatch_claims WHERE claim_id=?")
+      .get(claim.claimId);
+    if (
+      !fence ||
+      fence.epoch !== claim.epoch ||
+      fence.state !== "OPEN" ||
+      !owner ||
+      owner.scope_key !== claim.scopeKey ||
+      owner.epoch !== claim.epoch ||
+      owner.fingerprint !== claim.fingerprint ||
+      owner.kind !== "native" ||
+      !["STARTING", "RUNNING"].includes(String(owner.state))
+    )
+      refuse();
   });
   // Admission linearizes above. Drain can follow, but cannot cancel this already admitted promise.
   return params.run();
 }
 
 // Persisted cron origin owns the logical turn; detached session keys are execution identities.
-type CronDispatchContext = { owner?: DispatchContext; sessionKey?: string; receipt?: string; closed: boolean };
+type CronDispatchContext = {
+  owner?: DispatchContext;
+  sessionKey?: string;
+  receipt?: string;
+  failedReceipt?: string;
+  closed: boolean;
+};
 const cronDispatchContext = new AsyncLocalStorage<CronDispatchContext>();
 export const hasCronDispatchOwner = (): boolean => cronDispatchContext.getStore() !== undefined;
 export function bindCronDispatchSession(sessionKey: string): void {
@@ -497,47 +636,89 @@ export function bindCronDispatchSession(sessionKey: string): void {
   context.sessionKey = sessionKey;
 }
 export async function withCronDispatchOwner<T>(params: {
-  sessionKey: string; operationId: string; identity: unknown;
-  run: () => Promise<T>; completed: (result: T) => boolean;
+  sessionKey: string;
+  operationId: string;
+  identity: unknown;
+  run: () => Promise<T>;
+  completed: (result: T) => boolean;
 }): Promise<T> {
   const config = loadDispatchConfig();
   if (!config) return params.run();
-  if (cronDispatchContext.getStore() || logicalDispatchContext.getStore() || dispatchContext.getStore()) refuse();
+  if (
+    cronDispatchContext.getStore() ||
+    logicalDispatchContext.getStore() ||
+    dispatchContext.getStore()
+  )
+    refuse();
   let context: CronDispatchContext | undefined;
-  return withThreadDispatch({ config, sessionKey: params.sessionKey, operationId: params.operationId,
-    identity: params.identity, kind: "native",
+  return withThreadDispatch({
+    config,
+    sessionKey: params.sessionKey,
+    operationId: params.operationId,
+    identity: params.identity,
+    kind: "native",
     run: async () => {
       const owner = dispatchContext.getStore();
       if (!owner) refuse();
-      context = { ...( "unconfigured" in owner ? {} : { owner }), closed: false };
-      try { return await cronDispatchContext.run(context, params.run); }
-      finally { context.closed = true; }
+      context = { ...("unconfigured" in owner ? {} : { owner }), closed: false };
+      try {
+        return await cronDispatchContext.run(context, params.run);
+      } finally {
+        context.closed = true;
+      }
     },
-    terminalReceipt: result => params.completed(result) ? context?.receipt : undefined,
+    failedErrorReceipt: () => context?.failedReceipt,
+    terminalReceipt: (result) =>
+      context?.failedReceipt ?? (params.completed(result) ? context?.receipt : undefined),
   });
 }
 export async function runCronDispatchAttempt<T>(params: {
-  sessionKey?: string; run: () => Promise<T>; terminalReceipt: (result: T) => string | undefined;
+  sessionKey?: string;
+  run: () => Promise<T>;
+  terminalReceipt: (result: T) => string | undefined;
+  failedTerminalReceipt?: (result: T) => string | undefined;
+  failedErrorReceipt?: (error: unknown) => string | undefined;
 }): Promise<T> {
   const context = cronDispatchContext.getStore();
-  if (!context || context.closed || !context.sessionKey || context.sessionKey !== params.sessionKey) refuse();
+  if (!context || context.closed || !context.sessionKey || context.sessionKey !== params.sessionKey)
+    refuse();
   const owner = context.owner;
   if (owner) {
     if (dispatchContext.getStore() !== owner) refuse();
-    database(owner.config, db => {
-      const fence = db.prepare("SELECT epoch,state FROM thread_fences WHERE scope_key=?").get(owner.claim.scopeKey);
-      const row = db.prepare("SELECT * FROM thread_dispatch_claims WHERE claim_id=?").get(owner.claim.claimId);
-      if (!fence || fence.epoch !== owner.claim.epoch || fence.state !== "OPEN" || !row ||
-          row.scope_key !== owner.claim.scopeKey || row.epoch !== owner.claim.epoch ||
-          row.fingerprint !== owner.claim.fingerprint || row.kind !== "native" ||
-          !["STARTING", "RUNNING"].includes(String(row.state))) refuse();
+    database(owner.config, (db) => {
+      const fence = db
+        .prepare("SELECT epoch,state FROM thread_fences WHERE scope_key=?")
+        .get(owner.claim.scopeKey);
+      const row = db
+        .prepare("SELECT * FROM thread_dispatch_claims WHERE claim_id=?")
+        .get(owner.claim.claimId);
+      if (
+        !fence ||
+        fence.epoch !== owner.claim.epoch ||
+        fence.state !== "OPEN" ||
+        !row ||
+        row.scope_key !== owner.claim.scopeKey ||
+        row.epoch !== owner.claim.epoch ||
+        row.fingerprint !== owner.claim.fingerprint ||
+        row.kind !== "native" ||
+        !["STARTING", "RUNNING"].includes(String(row.state))
+      )
+        refuse();
     });
   } else {
     const active = dispatchContext.getStore();
     if (!active || !("unconfigured" in active)) refuse();
   }
   context.receipt = undefined;
-  const result = await params.run();
+  context.failedReceipt = undefined;
+  let result: T;
+  try {
+    result = await params.run();
+  } catch (error) {
+    context.failedReceipt = params.failedErrorReceipt?.(error);
+    throw error;
+  }
   context.receipt = params.terminalReceipt(result);
+  context.failedReceipt = params.failedTerminalReceipt?.(result);
   return result;
 }

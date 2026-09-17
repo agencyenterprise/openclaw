@@ -78,6 +78,7 @@ export async function prepareEmbeddedAttemptSessionRuntime(input: {
     onSessionManagerCreated: (sessionManager: AttemptSessionManager) => void;
     onSessionSettleTrackerReady: (
       buildAbortSettlePromise: SessionSettleTracker["buildAbortSettlePromise"],
+      sealForCleanup?: SessionSettleTracker["sealForCleanup"],
     ) => void;
     onSessionYieldReady: (input: {
       abortActiveSession: SessionSettleTracker["abortActiveSession"];
@@ -147,7 +148,14 @@ export async function prepareEmbeddedAttemptSessionRuntime(input: {
   const toolResultPromptProjectionState = sessionPromptState.toolResults;
   const settleTracker = createEmbeddedAttemptSessionSettleTracker(activeSession);
   input.externalAbortController.setActiveSessionAbort(settleTracker.abortActiveSession);
-  input.lifecycle.onSessionSettleTrackerReady(settleTracker.buildAbortSettlePromise);
+  if (settleTracker.sealForCleanup) {
+    input.lifecycle.onSessionSettleTrackerReady(
+      settleTracker.buildAbortSettlePromise,
+      settleTracker.sealForCleanup,
+    );
+  } else {
+    input.lifecycle.onSessionSettleTrackerReady(settleTracker.buildAbortSettlePromise);
+  }
   input.lifecycle.onSessionYieldReady({
     abortActiveSession: settleTracker.abortActiveSession,
     activeSession,

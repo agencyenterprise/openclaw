@@ -15,6 +15,7 @@ import {
   type ToolSearchCatalogToolExecutor,
 } from "../../tool-search.js";
 import { log } from "../logger.js";
+import { beginNativeCleanupAttempt } from "../native-cleanup-proof.js";
 import {
   createEmbeddedAttemptExternalAbortController,
   type EmbeddedAttemptAbortStatePort,
@@ -47,6 +48,21 @@ import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types
 export async function runEmbeddedAttempt(
   params: EmbeddedRunAttemptParams,
 ): Promise<EmbeddedRunAttemptResult> {
+  const finish = beginNativeCleanupAttempt();
+  let verified = false;
+  try {
+    return await runEmbeddedAttemptInternal(params, (value) => {
+      verified = value;
+    });
+  } finally {
+    finish(verified);
+  }
+}
+async function runEmbeddedAttemptInternal(
+  params: EmbeddedRunAttemptParams,
+  observeCleanup: (verified: boolean) => void,
+): Promise<EmbeddedRunAttemptResult> {
+  let cleanupVerified = false;
   const runAbortController = new AbortController();
   const {
     agentCoreThinkingLevel,
@@ -103,6 +119,7 @@ export async function runEmbeddedAttempt(
     try {
       await bundleMcpRuntime?.dispose();
     } catch {
+      cleanupVerified = false;
       /* best-effort */
     } finally {
       bundleMcpRuntime = undefined;
@@ -110,6 +127,7 @@ export async function runEmbeddedAttempt(
     try {
       await bundleLspRuntime?.dispose();
     } catch {
+      cleanupVerified = false;
       /* best-effort */
     } finally {
       bundleLspRuntime = undefined;
@@ -323,6 +341,7 @@ export async function runEmbeddedAttempt(
     let trajectoryRecorder: Awaited<
       ReturnType<typeof prepareEmbeddedAttemptSessionRuntime>
     >["trajectoryRecorder"] = null;
+    let sealForCleanup: (() => Promise<void>) | undefined;
     let buildAbortSettlePromise: () => Promise<void> | null = () => null;
     try {
       const preparedSessionRuntime = await prepareEmbeddedAttemptSessionRuntime({
@@ -387,7 +406,8 @@ export async function runEmbeddedAttempt(
           onSessionManagerCreated: (createdSessionManager) => {
             sessionManager = createdSessionManager;
           },
-          onSessionSettleTrackerReady: (build) => {
+          onSessionSettleTrackerReady: (build, seal) => {
+            sealForCleanup = seal;
             buildAbortSettlePromise = build;
           },
           onSessionYieldReady: ({ abortActiveSession, activeSession }) => {
@@ -445,7 +465,7 @@ export async function runEmbeddedAttempt(
         },
       });
     } finally {
-      await cleanupEmbeddedAttemptSessionPhase({
+      cleanupVerified = await cleanupEmbeddedAttemptSessionPhase({
         attempt: params,
         session,
         sessionManager,
@@ -457,6 +477,7 @@ export async function runEmbeddedAttempt(
         sandboxSessionKey,
         sessionAgentId,
         buildAbortSettlePromise,
+        sealForCleanup,
         trajectoryRecorder,
         trajectoryEndRecorded: executionState.trajectoryEndRecorded,
         cleanupYieldAborted: executionState.cleanupYieldAborted,
@@ -481,6 +502,7 @@ export async function runEmbeddedAttempt(
     try {
       await cleanupEmbeddedPrepResourcesAfterEarlyExit();
     } catch (cleanupErr) {
+      cleanupVerified = false;
       log.warn(
         `failed to clean up embedded prep resources after early attempt exit: runId=${params.runId} ${String(cleanupErr)}`,
       );
@@ -488,6 +510,7 @@ export async function runEmbeddedAttempt(
     try {
       await releaseRetainedSessionLock?.();
     } catch (releaseErr) {
+      cleanupVerified = false;
       log.error(
         `failed to release retained session lock on attempt teardown: runId=${params.runId} ${String(releaseErr)}`,
       );
@@ -498,5 +521,6 @@ export async function runEmbeddedAttempt(
       executionState.promptError ?? new Error("run exited before diagnostic completion"),
     );
     restoreSkillEnv?.();
+    observeCleanup(cleanupVerified);
   }
 }

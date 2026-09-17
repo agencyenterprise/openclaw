@@ -60,7 +60,7 @@ export async function prepareEmbeddedAttemptStreamRuntime(input: {
   externalAbortController: ExternalAbortController;
   abortActiveSession: Parameters<typeof createEmbeddedAttemptRunAbort>[0]["abortActiveSession"];
   abortState: Parameters<typeof createEmbeddedAttemptRunAbort>[0]["state"];
-  trackPromptSettlePromise: (promise: Promise<void>) => Promise<void>;
+  trackPromptSettlePromise: (promise: Promise<void> | (() => Promise<void>)) => Promise<void>;
   compactionTimeoutMs: number;
   guards: StreamGuardPhaseInput;
   history: HistoryPhaseInput;
@@ -138,7 +138,7 @@ export async function prepareEmbeddedAttemptStreamRuntime(input: {
     options?: Parameters<typeof activeSession.prompt>[1],
   ): Promise<void> =>
     withOwnedSessionTranscriptWrites(input.ownedTranscriptWriteContext, async () =>
-      abortable(input.trackPromptSettlePromise(activeSession.prompt(prompt, options))),
+      abortable(input.trackPromptSettlePromise(() => activeSession.prompt(prompt, options))),
     );
   const onBlockReply = attempt.onBlockReply
     ? bindOwnedSessionTranscriptWrites(input.ownedTranscriptWriteContext, attempt.onBlockReply)

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createEmbeddedAttemptSessionSettleTracker } from "./attempt-session-settle.js";
 
 const mocks = vi.hoisted(() => ({
   abortable: vi.fn(),
@@ -79,7 +80,9 @@ function createFixture(options: { aborted?: boolean } = {}) {
   const markIdleTimedOut = vi.fn();
   const markStreamReady = vi.fn(() => order.push("stream-ready"));
   const setToolSearchCatalogExecutor = vi.fn(() => order.push("set-catalog"));
-  const trackPromptSettlePromise = vi.fn((promise: Promise<void>) => promise);
+  const trackPromptSettlePromise = vi.fn(
+    createEmbeddedAttemptSessionSettleTracker({ abort: async () => {} }).trackPromptSettlePromise,
+  );
 
   mocks.abortable.mockImplementation((_signal, promise) => promise);
   mocks.bindOwnedSessionTranscriptWrites.mockImplementation((_context, operation) => operation);

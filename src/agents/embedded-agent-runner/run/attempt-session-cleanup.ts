@@ -7,6 +7,7 @@ import type { guardSessionManager } from "../../session-tool-result-guard-wrappe
 import type { AgentSession } from "../../sessions/index.js";
 import { clearToolSearchCatalog, type ToolSearchCatalogRef } from "../../tool-search.js";
 import { log } from "../logger.js";
+import { hasNativeCleanupTracking } from "../native-cleanup-proof.js";
 import { flushPendingToolResultsAfterIdle } from "../wait-for-idle-before-flush.js";
 import type { EmitDiagnosticRunCompleted } from "./attempt-startup.js";
 import { flushEmbeddedAttemptTrajectoryRecorder } from "./attempt-trajectory-flush-cleanup.js";
@@ -35,6 +36,7 @@ type CleanupEmbeddedAttemptSessionInput = {
   sandboxSessionKey?: string;
   sessionAgentId: string;
   buildAbortSettlePromise: () => Promise<void> | null;
+  sealForCleanup?: () => Promise<void>;
   trajectoryRecorder: TrajectoryRecorder | null;
   trajectoryEndRecorded: boolean;
   cleanupYieldAborted: boolean;
@@ -77,7 +79,8 @@ function shouldPreservePromptErrorAfterCleanupError(params: {
 
 export async function cleanupEmbeddedAttemptSessionPhase(
   input: CleanupEmbeddedAttemptSessionInput,
-): Promise<void> {
+): Promise<boolean> {
+  let cleanupVerified = false;
   const { attempt } = input;
   const initialState = input.readState();
   if (input.trajectoryRecorder && !input.trajectoryEndRecorded) {
@@ -131,7 +134,7 @@ export async function cleanupEmbeddedAttemptSessionPhase(
     const cleanupSessionLock = await input.sessionLockController.acquireForCleanup({
       session: input.session,
     });
-    await cleanupEmbeddedAttemptResources({
+    const cleanupOutcome = await cleanupEmbeddedAttemptResources({
       removeToolResultContextGuard: input.removeToolResultContextGuard,
       flushPendingToolResultsAfterIdle,
       session: input.session,
@@ -142,10 +145,12 @@ export async function cleanupEmbeddedAttemptSessionPhase(
       // Aborted runs skip the idle wait so teardown cannot strand the lock.
       aborted: cleanupAbortLike,
       abortSettlePromise: cleanupAborted ? input.buildAbortSettlePromise() : null,
+      sealedSettlePromise: hasNativeCleanupTracking() ? input.sealForCleanup?.() : undefined,
       skipSessionFlush: input.sessionLockController.hasSessionTakeover(),
       runId: attempt.runId,
       sessionId: attempt.sessionId,
     });
+    cleanupVerified = cleanupOutcome?.verified === true;
   } catch (err) {
     cleanupError = err;
   }
@@ -180,7 +185,7 @@ export async function cleanupEmbeddedAttemptSessionPhase(
   );
 
   if (!cleanupFailure) {
-    return;
+    return cleanupVerified;
   }
   if (shouldPreservePromptError) {
     log.warn(
@@ -195,5 +200,5 @@ export async function cleanupEmbeddedAttemptSessionPhase(
       }),
     );
   }
-  await Promise.reject(toErrorObject(cleanupFailure, "Non-Error rejection"));
+  return await Promise.reject(toErrorObject(cleanupFailure, "Non-Error rejection"));
 }

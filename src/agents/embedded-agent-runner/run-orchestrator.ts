@@ -1,4 +1,3 @@
-import { hasCronDispatchOwner, runCronDispatchAttempt } from "../../state/thread-dispatch.js";
 /**
  * Embedded-agent run orchestration implementation.
  */
@@ -20,6 +19,8 @@ import {
   buildAgentHookContextIdentityFields,
 } from "../../plugins/hook-agent-context.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import { hasProtectedDispatchOwner } from "../../state/thread-dispatch.js";
+import { hasCronDispatchOwner, runCronDispatchAttempt } from "../../state/thread-dispatch.js";
 import {
   dispatchHash,
   loadDispatchConfig,
@@ -45,6 +46,11 @@ import { runEmbeddedAgentViaCliBackendIfEligible } from "./cli-backend-dispatch.
 import { waitForDeferredTurnMaintenanceForSession } from "./context-engine-maintenance.js";
 import { resolveGlobalLane, resolveSessionLane } from "./lanes.js";
 import { log } from "./logger.js";
+import { readNativeThrownCleanupReceipt } from "./native-cleanup-proof.js";
+import {
+  withNativeCleanupTracking,
+  readNativeFailedCleanupReceipt,
+} from "./native-cleanup-proof.js";
 import { executePreparedEmbeddedRun } from "./run-execution.js";
 import {
   createEmbeddedRunStageSummaryEmitter,
@@ -77,28 +83,59 @@ export function runEmbeddedAgent(
   const lifecycleGeneration =
     internalParamsInput.lifecycleGeneration ??
     captureAgentRunLifecycleGeneration(internalParamsInput.runId);
+  const cleanupIdentity = dispatchHash({
+    runId: internalParamsInput.runId,
+    sessionId: internalParamsInput.sessionId,
+    lifecycleGeneration,
+  });
+  const runPlain = () =>
+    withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
+      runEmbeddedAgentInternal({ ...internalParamsInput, config, lifecycleGeneration }),
+    );
+  const runTracked = () =>
+    hasProtectedDispatchOwner() ? withNativeCleanupTracking(cleanupIdentity, runPlain) : runPlain();
   if (hasCronDispatchOwner()) {
     return runCronDispatchAttempt({
-      sessionKey: backfillSessionKey({ config, sessionId: internalParamsInput.sessionId,
-        sessionKey: internalParamsInput.sessionKey, agentId: internalParamsInput.agentId }),
-      run: () => withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
-        runEmbeddedAgentInternal({ ...internalParamsInput, config, lifecycleGeneration })),
-      terminalReceipt: result => {
+      sessionKey: backfillSessionKey({
+        config,
+        sessionId: internalParamsInput.sessionId,
+        sessionKey: internalParamsInput.sessionKey,
+        agentId: internalParamsInput.agentId,
+      }),
+      run: runTracked,
+      failedErrorReceipt: (error) => readNativeThrownCleanupReceipt(error, cleanupIdentity),
+      failedTerminalReceipt: (result) => readNativeFailedCleanupReceipt(result, cleanupIdentity),
+      terminalReceipt: (result) => {
         const meta = result.meta;
-        if (!meta || meta.aborted || meta.yielded || meta.error || meta.pendingToolCalls?.length ||
-            !["stop", "end_turn", "completed"].includes(meta.stopReason ?? "")) return undefined;
-        return dispatchHash({ kind: "cron_attempt_terminal", runId: internalParamsInput.runId,
-          sessionKey: internalParamsInput.sessionKey, lifecycleGeneration, stopReason: meta.stopReason });
+        if (
+          !meta ||
+          meta.aborted ||
+          meta.yielded ||
+          meta.error ||
+          meta.pendingToolCalls?.length ||
+          !["stop", "end_turn", "completed"].includes(meta.stopReason ?? "")
+        )
+          return undefined;
+        return dispatchHash({
+          kind: "cron_attempt_terminal",
+          runId: internalParamsInput.runId,
+          sessionKey: internalParamsInput.sessionKey,
+          lifecycleGeneration,
+          stopReason: meta.stopReason,
+        });
       },
     });
   }
   if (hasLogicalDispatchOwner()) {
     // Inherited authority must be checked even if mutable host opt-in changed.
     return runLogicalDispatchAttempt({
-      sessionKey: backfillSessionKey({ config, sessionId: internalParamsInput.sessionId,
-        sessionKey: internalParamsInput.sessionKey, agentId: internalParamsInput.agentId }),
-      run: () => withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
-        runEmbeddedAgentInternal({ ...internalParamsInput, config, lifecycleGeneration })),
+      sessionKey: backfillSessionKey({
+        config,
+        sessionId: internalParamsInput.sessionId,
+        sessionKey: internalParamsInput.sessionKey,
+        agentId: internalParamsInput.agentId,
+      }),
+      run: runTracked,
     })!;
   }
   const dispatchConfig = loadDispatchConfig();
@@ -124,11 +161,11 @@ export function runEmbeddedAgent(
       sessionId: internalParamsInput.sessionId,
       prompt: internalParamsInput.prompt,
     },
-    run: () =>
-      withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
-        runEmbeddedAgentInternal({ ...internalParamsInput, config, lifecycleGeneration }),
-      ),
+    run: runTracked,
+    failedErrorReceipt: (error) => readNativeThrownCleanupReceipt(error, cleanupIdentity),
     terminalReceipt: (result) => {
+      const failedReceipt = readNativeFailedCleanupReceipt(result, cleanupIdentity);
+      if (failedReceipt) return failedReceipt;
       const meta = result.meta;
       if (
         !meta ||

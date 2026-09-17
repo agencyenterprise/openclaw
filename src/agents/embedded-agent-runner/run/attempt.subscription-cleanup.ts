@@ -4,6 +4,7 @@
 import { toErrorObject } from "../../../infra/errors.js";
 import type { SubscribeEmbeddedAgentSessionParams } from "../../embedded-agent-subscribe.types.js";
 import { log } from "../logger.js";
+import { isSealedSessionSettlement } from "./attempt-session-settle.js";
 import { resolveEmbeddedAbortSettleTimeoutMs } from "./attempt.abort-settle-timeout.js";
 
 /** Shared timeout for waiting on aborted model/prompt cleanup before releasing resources. */
@@ -22,9 +23,10 @@ async function waitForEmbeddedAbortSettle(params: {
   promise: Promise<unknown> | null | undefined;
   runId: string;
   sessionId: string;
-}): Promise<void> {
+  timeoutMs?: number;
+}): Promise<"settled" | "errored" | "timed_out" | "missing"> {
   if (!params.promise) {
-    return;
+    return "missing";
   }
 
   let timeout: NodeJS.Timeout | undefined;
@@ -40,7 +42,10 @@ async function waitForEmbeddedAbortSettle(params: {
         return "errored" as const;
       }),
     new Promise<"timed_out">((resolve) => {
-      timeout = setTimeout(() => resolve("timed_out"), EMBEDDED_ABORT_SETTLE_TIMEOUT_MS);
+      timeout = setTimeout(
+        () => resolve("timed_out"),
+        params.timeoutMs ?? EMBEDDED_ABORT_SETTLE_TIMEOUT_MS,
+      );
     }),
   ]);
   if (timeout) {
@@ -51,6 +56,7 @@ async function waitForEmbeddedAbortSettle(params: {
       `embedded abort settle timed out: runId=${params.runId} sessionId=${params.sessionId} timeoutMs=${EMBEDDED_ABORT_SETTLE_TIMEOUT_MS}`,
     );
   }
+  return outcome;
 }
 
 /**
@@ -84,18 +90,39 @@ export async function cleanupEmbeddedAttemptResources(params: {
   sessionLock: { release(): Promise<void> | void };
   aborted?: boolean;
   abortSettlePromise?: Promise<unknown> | null;
+  sealedSettlePromise?: Promise<void>;
   skipSessionFlush?: boolean;
   runId?: string;
   sessionId?: string;
-}): Promise<void> {
+}): Promise<{ verified: boolean }> {
+  let verified = false;
+  let cleanupFailed = false;
   let sessionLockReleaseError: unknown;
   try {
     try {
       params.removeToolResultContextGuard?.();
     } catch {
+      cleanupFailed = true;
       /* best-effort */
     }
-    if (params.aborted && params.abortSettlePromise) {
+    const settleDeadline = Date.now() + EMBEDDED_ABORT_SETTLE_TIMEOUT_MS;
+    if (params.sealedSettlePromise && isSealedSessionSettlement(params.sealedSettlePromise)) {
+      const settled = await waitForEmbeddedAbortSettle({
+        promise: params.sealedSettlePromise,
+        runId: params.runId ?? "unknown",
+        sessionId: params.sessionId ?? "unknown",
+      });
+      const agent = params.session?.agent as IdleAwareAgent | undefined;
+      if (settled === "settled" && typeof agent?.waitForIdle === "function") {
+        const idle = await waitForEmbeddedAbortSettle({
+          promise: Promise.resolve().then(() => agent.waitForIdle!()),
+          runId: params.runId ?? "unknown",
+          sessionId: params.sessionId ?? "unknown",
+          timeoutMs: Math.max(0, settleDeadline - Date.now()),
+        });
+        verified = idle === "settled";
+      }
+    } else if (params.aborted && params.abortSettlePromise) {
       await waitForEmbeddedAbortSettle({
         promise: params.abortSettlePromise,
         runId: params.runId ?? "unknown",
@@ -113,6 +140,7 @@ export async function cleanupEmbeddedAttemptResources(params: {
           ...(params.aborted ? { timeoutMs: 0 } : {}),
         });
       } catch {
+        cleanupFailed = true;
         /* best-effort */
       }
     }
@@ -129,20 +157,24 @@ export async function cleanupEmbeddedAttemptResources(params: {
   try {
     params.session?.dispose();
   } catch {
+    cleanupFailed = true;
     /* best-effort */
   }
   try {
     await params.bundleMcpRuntime?.dispose();
   } catch {
+    cleanupFailed = true;
     /* best-effort */
   }
   try {
     await params.bundleLspRuntime?.dispose();
   } catch {
+    cleanupFailed = true;
     /* best-effort */
   }
 
   if (sessionLockReleaseError) {
     throw toErrorObject(sessionLockReleaseError, "Non-Error thrown");
   }
+  return { verified: verified && !cleanupFailed };
 }
