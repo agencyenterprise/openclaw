@@ -4540,22 +4540,43 @@ async function logicalFenceFixture() {
   const dir = await mkdtemp(join(tmpdir(), "logical-reply-"));
   const databasePath = join(dir, "claims.sqlite");
   const db = new (requireNodeSqlite().DatabaseSync)(databasePath);
-  db.exec(fenceSql); chmodSync(databasePath, 0o600);
+  db.exec(fenceSql);
+  chmodSync(databasePath, 0o600);
   const scope = "slack/C123/1788816064.061969";
   db.prepare("INSERT INTO thread_fences VALUES (?,1,'OPEN',0)").run(scope);
   const config = { databasePath, scopes: { [scope]: 1 }, sessionScopes: { main: scope } };
   const configPath = join(dir, "config.json");
   writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
   vi.stubEnv("OPENCLAW_THREAD_DISPATCH_CONFIG", configPath);
-  return { db, config, scope, cleanup: async () => { db.close(); vi.unstubAllEnvs(); await rm(dir,{recursive:true,force:true}); } };
+  return {
+    db,
+    config,
+    scope,
+    cleanup: async () => {
+      db.close();
+      vi.unstubAllEnvs();
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
 }
 it("V3 busy logical reply refuses before typing, steering hook, maintenance or adoption", async () => {
   const f = await logicalFenceFixture();
   const { admitThreadDispatch, dispatchHash } = await import("../../state/thread-dispatch.js");
-  admitThreadDispatch(f.config, { claimId: "incumbent", scopeKey: f.scope, epoch: 1, kind: "native", fingerprint: dispatchHash("incumbent") });
+  admitThreadDispatch(f.config, {
+    claimId: "incumbent",
+    scopeKey: f.scope,
+    epoch: 1,
+    kind: "native",
+    fingerprint: dispatchHash("incumbent"),
+  });
   const adopted = vi.fn();
   state.beforeAgentReplyHasHooksMock.mockReturnValue(true);
-  const run = createMinimalRun({ sourceTurnId: `channel-user:v1:${"b".repeat(64)}`, shouldSteer: true, isActive: true, opts: { onTurnAdopted: adopted } });
+  const run = createMinimalRun({
+    sourceTurnId: `channel-user:v1:${"b".repeat(64)}`,
+    shouldSteer: true,
+    isActive: true,
+    opts: { onTurnAdopted: adopted },
+  });
   try {
     await expect(run.run()).rejects.toThrow("NATIVE_BUSY");
     expect(state.beforeAgentReplyRunMock).not.toHaveBeenCalled();
@@ -4564,26 +4585,98 @@ it("V3 busy logical reply refuses before typing, steering hook, maintenance or a
     expect(state.queueEmbeddedAgentMessageMock).not.toHaveBeenCalled();
     expect(adopted).not.toHaveBeenCalled();
     expect(f.db.prepare("SELECT count(*) AS n FROM thread_dispatch_claims").get()?.n).toBe(1);
-  } finally { await f.cleanup(); }
+  } finally {
+    await f.cleanup();
+  }
 });
 it("V3 actual reply final success settles the logical owner only after its body finishes", async () => {
   const f = await logicalFenceFixture();
-  state.runEmbeddedAgentMock.mockResolvedValue({ payloads: [{text:"final"}], meta: {stopReason:"stop",durationMs:1,agentMeta:{usage:{input:1,output:1}}} });
+  state.runEmbeddedAgentMock.mockResolvedValue({
+    payloads: [{ text: "final" }],
+    meta: { stopReason: "stop", durationMs: 1, agentMeta: { usage: { input: 1, output: 1 } } },
+  });
   const run = createMinimalRun({ sourceTurnId: `channel-user:v1:${"c".repeat(64)}` });
   try {
     await run.run();
     expect(state.runEmbeddedAgentMock).toHaveBeenCalledTimes(1);
     expect(f.db.prepare("SELECT state FROM thread_dispatch_claims").get()?.state).toBe("TERMINAL");
-  } finally { await f.cleanup(); }
+  } finally {
+    await f.cleanup();
+  }
 });
 it("host heartbeat actual reply final observer settles without channel source", async () => {
- const f=await logicalFenceFixture();
- const {withHostReplyDispatch}=await import("../../state/thread-dispatch.js");
- state.runEmbeddedAgentMock.mockResolvedValue({payloads:[{text:"final"}],meta:{stopReason:"stop",durationMs:1,agentMeta:{usage:{input:1,output:1}}}});
- const run=createMinimalRun();
- try {
-  await withHostReplyDispatch({sessionKey:"main",operationId:"heartbeat:actual-reply-fixture",identity:{host:true},timeoutMs:5000,run:run.run});
-  expect(state.runEmbeddedAgentMock).toHaveBeenCalledTimes(1);
-  expect(f.db.prepare("SELECT state FROM thread_dispatch_claims").get()?.state).toBe("TERMINAL");
- }finally{await f.cleanup();}
+  const f = await logicalFenceFixture();
+  const { withHostReplyDispatch } = await import("../../state/thread-dispatch.js");
+  state.runEmbeddedAgentMock.mockResolvedValue({
+    payloads: [{ text: "final" }],
+    meta: { stopReason: "stop", durationMs: 1, agentMeta: { usage: { input: 1, output: 1 } } },
+  });
+  const run = createMinimalRun();
+  try {
+    await withHostReplyDispatch({
+      sessionKey: "main",
+      operationId: "heartbeat:actual-reply-fixture",
+      identity: { host: true },
+      timeoutMs: 5000,
+      run: run.run,
+    });
+    expect(state.runEmbeddedAgentMock).toHaveBeenCalledTimes(1);
+    expect(f.db.prepare("SELECT state FROM thread_dispatch_claims").get()?.state).toBe("TERMINAL");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+it.each([
+  {
+    label: "successful silent ack with prior effects",
+    meta: { stopReason: "stop", replayInvalid: true },
+    terminal: true,
+  },
+  { label: "aborted silent ack", meta: { stopReason: "stop", aborted: true }, terminal: false },
+  {
+    label: "error silent ack",
+    meta: { stopReason: "stop", error: { kind: "fixture_error", message: "fixture" } },
+    terminal: false,
+  },
+  {
+    label: "pending tool silent ack",
+    meta: { stopReason: "stop", pendingToolCalls: [{ id: "pending", name: "fixture" }] },
+    terminal: false,
+  },
+])("host silent heartbeat completion: $label", async ({ meta, terminal }) => {
+  const f = await logicalFenceFixture();
+  const { withHostReplyDispatch, admitDispatchChild } =
+    await import("../../state/thread-dispatch.js");
+  state.runEmbeddedAgentMock.mockImplementationOnce(async () => {
+    const settled = admitDispatchChild({ kind: "fixture_effect", command: "synthetic read" });
+    settled?.();
+    return {
+      payloads: [{ text: "HEARTBEAT_OK" }],
+      meta: { durationMs: 1, agentMeta: { usage: { input: 1, output: 1 } }, ...meta },
+    };
+  });
+  const run = createMinimalRun({
+    opts: { isHeartbeat: true },
+    sessionCtx: { Provider: "heartbeat" },
+  });
+  try {
+    await withHostReplyDispatch({
+      sessionKey: "main",
+      operationId: "heartbeat:silent-real-reply",
+      identity: { host: true },
+      timeoutMs: 5000,
+      run: run.run,
+    });
+    expect(state.runEmbeddedAgentMock).toHaveBeenCalledTimes(1);
+    expect(
+      f.db.prepare("SELECT state FROM thread_dispatch_claims WHERE kind='native'").get()?.state,
+    ).toBe(terminal ? "TERMINAL" : "UNKNOWN");
+    expect(
+      f.db.prepare("SELECT state FROM thread_dispatch_claims WHERE kind='process_child'").get()
+        ?.state,
+    ).toBe("UNKNOWN");
+  } finally {
+    await f.cleanup();
+  }
 });

@@ -1680,6 +1680,7 @@ async function runReplyAgentInternal(
   }
   let runFollowupTurn = queuedRunFollowupTurn;
   let shouldDrainQueuedFollowupsAfterClear = false;
+  let observeSettledLogicalCompletion: (() => void) | undefined;
   const returnWithQueuedFollowupDrain = <T>(value: T): T => {
     shouldDrainQueuedFollowupsAfterClear = true;
     return value;
@@ -2018,6 +2019,35 @@ async function runReplyAgentInternal(
       directlySentBlockPayloads,
       terminalFailurePayload,
     } = runOutcome;
+    // Successful silent/heartbeat returns share the same terminal observation as
+    // visible replies. Emit only after the reply finally-path has settled cleanup.
+    // replayInvalid forbids replay after effects; it does not mean work is still live.
+    observeSettledLogicalCompletion = () => {
+      const terminalMeta = runResult.meta;
+      if (
+        observeLogicalCompleted &&
+        terminalMeta &&
+        !terminalMeta.aborted &&
+        !terminalMeta.yielded &&
+        !terminalMeta.error &&
+        !terminalMeta.pendingToolCalls?.length &&
+        pendingToolTasks.size === 0 &&
+        ["stop", "end_turn", "completed"].includes(terminalMeta.stopReason ?? "") &&
+        !fallbackExhausted &&
+        !terminalFailurePayload &&
+        (!replyOperation.result || replyOperation.result.kind === "completed")
+      ) {
+        observeLogicalCompleted(
+          dispatchHash({
+            kind: "logical_reply_terminal",
+            sessionKey,
+            sourceTurnId: restartRecoverySourceTurnId,
+            stopReason: terminalMeta.stopReason,
+            durationMs: terminalMeta.durationMs,
+          }),
+        );
+      }
+    };
     const { autoCompactionCount } = runOutcome;
     let { didLogHeartbeatStrip } = runOutcome;
 
@@ -3003,30 +3033,6 @@ async function runReplyAgentInternal(
     const result = returnWithQueuedFollowupDrain(
       finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
     );
-    const terminalMeta = runResult.meta;
-    if (
-      observeLogicalCompleted &&
-      terminalMeta &&
-      !terminalMeta.aborted &&
-      !terminalMeta.yielded &&
-      !terminalMeta.replayInvalid &&
-      !terminalMeta.error &&
-      !terminalMeta.pendingToolCalls?.length &&
-      ["stop", "end_turn", "completed"].includes(terminalMeta.stopReason ?? "") &&
-      !fallbackExhausted &&
-      !terminalFailurePayload &&
-      (!replyOperation.result || replyOperation.result.kind === "completed")
-    ) {
-      observeLogicalCompleted(
-        dispatchHash({
-          kind: "logical_reply_terminal",
-          sessionKey,
-          sourceTurnId: restartRecoverySourceTurnId,
-          stopReason: terminalMeta.stopReason,
-          durationMs: terminalMeta.durationMs,
-        }),
-      );
-    }
     return result;
   } catch (error) {
     // Drain/restart aborts stay silent and defer to post-restart main-session
@@ -3116,6 +3122,7 @@ async function runReplyAgentInternal(
     // Calling this twice is harmless — cleanup() is guarded by the
     // `active` flag.  Same pattern as the followup runner fix (#26881).
     typing.markDispatchIdle();
+    if (shouldDrainQueuedFollowupsAfterClear) observeSettledLogicalCompletion?.();
   }
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
