@@ -50,7 +50,9 @@ export const GATEWAY_CONTROL_PLANE_TOOLS = ["cron", "gateway"] as const;
  * callers; non-owner identity-bearing callers must not receive server-credential wrappers.
  */
 export const GATEWAY_OWNER_ONLY_CORE_TOOLS = [
-  ...GATEWAY_CONTROL_PLANE_TOOLS,
+  // PATCH:fractalai_cron_for_teammates 2026-09-21: cron is not owner-only here; SOUL A4 tells the bot to wake itself
+  // with the cron tool from teammate threads, and no commands.ownerAllowFrom is configured. Caps: scripts/wake_guard.py.
+  "gateway",
   "sessions",
   "screen",
   "terminal",
