@@ -12,12 +12,6 @@
  * A hash is reserved as pending at `message_sending`, confirmed by the internal
  * `message:sent` event on success, released on failure, and expires unconfirmed
  * after two minutes, so a retry after a failed send is never suppressed.
- *
- * A send that answers an ask reserves a second, content-independent key —
- * channel + thread root + obligation + response version (see obligation-key.ts) —
- * with the same pending/confirm/release lifecycle. That key is what catches a
- * second answer to one ask when the two answers are paraphrased differently and
- * land in different threads.
  */
 
 import { getRuntimeConfigSnapshot } from "../../../config/runtime-snapshot.js";
@@ -62,10 +56,6 @@ export function resolveOutboundDedupeConfig(cfg: OpenClawConfig | null): Outboun
       DEFAULT_OUTBOUND_DEDUPE_CONFIG.maxPerThread,
     ),
     minChars: readPositiveNumber(hookConfig?.minChars, DEFAULT_OUTBOUND_DEDUPE_CONFIG.minChars),
-    answerBurstSeconds: readPositiveNumber(
-      hookConfig?.answerBurstSeconds,
-      DEFAULT_OUTBOUND_DEDUPE_CONFIG.answerBurstSeconds,
-    ),
   };
 }
 

@@ -3,8 +3,8 @@
 // message_sending) through the outbound-dedupe guard registered as a core hook.
 //
 // The last block drives the real reply path on top of it (routeReply ->
-// sendDurableMessageBatch -> ... -> message_sending), which is the only path
-// that knows which ask a reply answers and declares it on the payload.
+// sendDurableMessageBatch -> ... -> message_sending), which declares the ask a
+// reply answers on the payload.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -46,22 +46,21 @@ import { clearInternalHooks, registerInternalHook } from "../../internal-hooks.j
 import { createOutboundSentRecorder, DEFAULT_OUTBOUND_DEDUPE_CONFIG } from "./guard.js";
 import { createOutboundDedupeHandler, registerOutboundDedupeGuard } from "./handler.js";
 import { OUTBOUND_HASHES_FILE, type OutboundHashStore } from "./hash-store.js";
-import { buildObligationKey } from "./obligation-key.js";
-import { OUTBOUND_OBLIGATIONS_FILE, type ObligationReservationStore } from "./obligation-store.js";
 
 const ANNOUNCE = "[hcom-bridge] reconciliation required: worker state drifted from hcom.db";
 const cfg = {} as OpenClawConfig;
 
-/** The 2026-09-03 leak: one ask, answered by the replay run and by the live run. */
 const SLACK_CHANNEL = "C0A3C98HS48";
 const ASK_TS = "1788479206.951729";
-const LIVE_ASK_TS = "1788479558.561999";
-const OBLIGATION_ID = `${SLACK_CHANNEL}:${ASK_TS}`;
+const ASK_SESSION = `agent:main:slack:channel:c0a3c98hs48:thread:${ASK_TS}`;
+const ACKNOWLEDGEMENT = "I'll pull the ARP capture off the pod and reply here shortly.";
 const ANSWER = "The ARP capture is on the pod under /workspace/captures, 41 MB.";
-const PARAPHRASE = "You will find the capture at /workspace/captures on the pod (41 MB).";
+/** 13:17:59 -> 13:38:20 EDT, the gap between the acknowledgement and the answer on 2026-09-22. */
+const ACK_TO_ANSWER_MS = (20 * 60 + 21) * 1_000;
 
 let workspaceDir = "";
 let sendText: ReturnType<typeof vi.fn>;
+let clockOffsetMs = 0;
 
 async function readStore(): Promise<OutboundHashStore> {
   return JSON.parse(
@@ -69,17 +68,13 @@ async function readStore(): Promise<OutboundHashStore> {
   ) as OutboundHashStore;
 }
 
-async function readObligations(): Promise<ObligationReservationStore> {
-  return JSON.parse(
-    await fs.readFile(path.join(workspaceDir, "state", OUTBOUND_OBLIGATIONS_FILE), "utf-8"),
-  ) as ObligationReservationStore;
-}
-
 beforeEach(async () => {
   workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "outbound-dedupe-durable-"));
+  clockOffsetMs = 0;
   const deps = {
     resolveWorkspaceDir: () => workspaceDir,
     resolveConfig: () => DEFAULT_OUTBOUND_DEDUPE_CONFIG,
+    now: () => new Date(Date.now() + clockOffsetMs),
   };
   registerOutboundDedupeGuard(deps);
   registerInternalHook(
@@ -195,64 +190,49 @@ describe("outbound-dedupe on the durable send path", () => {
 });
 
 describe("outbound-dedupe on the routed reply path", () => {
-  /** One run answering the ask it was given, through the real reply router. */
-  const answerAsk = (params: { sessionKey: string; text: string }) =>
+  /** One run replying to the ask it was given, through the real reply router. */
+  const replyToAsk = (text: string) =>
     routeReply({
-      payload: { text: params.text, replyToId: ASK_TS },
+      payload: { text, replyToId: ASK_TS },
       channel: "slack",
       to: `channel:${SLACK_CHANNEL}`,
-      sessionKey: params.sessionKey,
+      sessionKey: ASK_SESSION,
       cfg,
       mirror: false,
       replyKind: "final",
     });
 
-  it("carries the ask id from routeReply to the message_sending guard", async () => {
-    const result = await answerAsk({
-      sessionKey: `agent:main:slack:channel:c0a3c98hs48:thread:${ASK_TS}`,
-      text: ANSWER,
-    });
-
-    expect(result.ok).toBe(true);
-    expect(sendText).toHaveBeenCalledTimes(1);
-    const reserved = buildObligationKey({
-      channel: SLACK_CHANNEL,
-      threadRootTs: ASK_TS,
-      obligationId: OBLIGATION_ID,
-      responseVersion: 0,
-    });
-    expect(Object.keys(await readObligations())).toEqual([reserved]);
+  beforeEach(() => {
+    // Slack confirms a send with the ts of the posted message; only such a send
+    // holds its reservation for the whole window.
+    sendText
+      .mockResolvedValueOnce({ channel: "slack", messageId: "1788479300.000100" })
+      .mockResolvedValueOnce({ channel: "slack", messageId: "1788480500.000200" });
   });
 
-  it("suppresses a second run answering the same ask with different words", async () => {
-    // The leak: the replayed ask and the live re-post started two runs, so the
-    // session keys differ and neither answer is a chunk of the other. The text is
-    // paraphrased, so only the obligation key can catch it.
-    expect(
-      (
-        await answerAsk({
-          sessionKey: `agent:main:slack:channel:c0a3c98hs48:thread:${ASK_TS}`,
-          text: ANSWER,
-        })
-      ).ok,
-    ).toBe(true);
+  it("delivers the answer a run posts after acknowledging the same ask", async () => {
+    expect((await replyToAsk(ACKNOWLEDGEMENT)).ok).toBe(true);
+    await waitForConfirmedEntry(`slack:${SLACK_CHANNEL}:${ASK_TS}`);
+    clockOffsetMs += ACK_TO_ANSWER_MS;
 
-    const secondRun = await answerAsk({
-      sessionKey: `agent:main:slack:channel:c0a3c98hs48:thread:${LIVE_ASK_TS}`,
-      text: PARAPHRASE,
-    });
+    const answer = await replyToAsk(ANSWER);
+
+    expect(answer.ok).toBe(true);
+    expect(answer.messageId).toBeDefined();
+    expect(sendText).toHaveBeenCalledTimes(2);
+  });
+
+  it("still suppresses the identical reply sent twice", async () => {
+    expect((await replyToAsk(ANSWER)).ok).toBe(true);
+    await waitForConfirmedEntry(`slack:${SLACK_CHANNEL}:${ASK_TS}`);
+    clockOffsetMs += ACK_TO_ANSWER_MS;
 
     // A cancelled message_sending hook is not a routing failure, so routeReply
-    // still reports ok; the channel simply never saw the second answer.
-    expect(secondRun.ok).toBe(true);
-    expect(secondRun.messageId).toBeUndefined();
-    expect(sendText).toHaveBeenCalledTimes(1);
-  });
+    // still reports ok; the channel simply never saw the second copy.
+    const repeat = await replyToAsk(ANSWER);
 
-  it("lets the same run keep delivering the payloads of one answer", async () => {
-    const sessionKey = `agent:main:slack:channel:c0a3c98hs48:thread:${ASK_TS}`;
-    expect((await answerAsk({ sessionKey, text: ANSWER })).ok).toBe(true);
-    expect((await answerAsk({ sessionKey, text: PARAPHRASE })).ok).toBe(true);
-    expect(sendText).toHaveBeenCalledTimes(2);
+    expect(repeat.ok).toBe(true);
+    expect(repeat.messageId).toBeUndefined();
+    expect(sendText).toHaveBeenCalledTimes(1);
   });
 });

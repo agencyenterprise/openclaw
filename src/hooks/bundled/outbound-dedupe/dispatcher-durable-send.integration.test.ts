@@ -58,23 +58,25 @@ import {
 import { clearInternalHooks, registerInternalHook } from "../../internal-hooks.js";
 import { createOutboundSentRecorder, DEFAULT_OUTBOUND_DEDUPE_CONFIG } from "./guard.js";
 import { createOutboundDedupeHandler, registerOutboundDedupeGuard } from "./handler.js";
+import { OUTBOUND_HASHES_FILE, type OutboundHashStore } from "./hash-store.js";
 
 const cfg = {} as OpenClawConfig;
 const SLACK_CHANNEL = "C0A3C98HS48";
 const TARGET = `channel:${SLACK_CHANNEL}`;
 const ASK_TS = "1788479206.951729";
-const OBLIGATION_ID = `${SLACK_CHANNEL}:${ASK_TS}`;
+const ACKNOWLEDGEMENT = "I'll pull the ARP capture off the pod and reply here shortly.";
 const ANSWER = "The ARP capture is on the pod under /workspace/captures, 41 MB.";
-const PARAPHRASE = "You will find the capture at /workspace/captures on the pod (41 MB).";
-/** The run that was handed the ask, and the second run that answered it again. */
-const FIRST_RUN = `agent:main:slack:channel:c0a3c98hs48:thread:${ASK_TS}`;
-const SECOND_RUN = `agent:main:slack:channel:c0a3c98hs48:thread:1788479558.561999`;
+const ASK_SESSION = `agent:main:slack:channel:c0a3c98hs48:thread:${ASK_TS}`;
+const ASK_THREAD_KEY = `slack:${SLACK_CHANNEL}:${ASK_TS}`;
+/** 13:17:59 -> 13:38:20 EDT, the gap between the acknowledgement and the answer on 2026-09-22. */
+const ACK_TO_ANSWER_MS = (20 * 60 + 21) * 1_000;
 
 type ObservedSend = { content: string; metadata?: Record<string, unknown> };
 
 let workspaceDir = "";
 let sendText: ReturnType<typeof vi.fn>;
 let observed: ObservedSend[];
+let clockOffsetMs = 0;
 
 function ctxFor(sessionKey: string): FinalizedMsgContext {
   return {
@@ -121,6 +123,16 @@ async function runTurn(params: { sessionKey: string; text: string }) {
   });
 }
 
+/** `message:sent` settles the reservation after the send returns, so wait for it. */
+async function waitForConfirmedSend(): Promise<void> {
+  await vi.waitFor(async () => {
+    const store = JSON.parse(
+      await fs.readFile(path.join(workspaceDir, "state", OUTBOUND_HASHES_FILE), "utf-8"),
+    ) as OutboundHashStore;
+    expect(store[ASK_THREAD_KEY]?.at(-1)?.confirmedAt).toBeDefined();
+  });
+}
+
 beforeEach(async () => {
   workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "outbound-dedupe-dispatcher-"));
   observed = [];
@@ -133,9 +145,11 @@ beforeEach(async () => {
       observed.push({ content: event.content, metadata: event.metadata });
     },
   });
+  clockOffsetMs = 0;
   const deps = {
     resolveWorkspaceDir: () => workspaceDir,
     resolveConfig: () => DEFAULT_OUTBOUND_DEDUPE_CONFIG,
+    now: () => new Date(Date.now() + clockOffsetMs),
   };
   registerOutboundDedupeGuard(deps);
   registerInternalHook(
@@ -143,7 +157,13 @@ beforeEach(async () => {
     createOutboundDedupeHandler(createOutboundSentRecorder(deps)),
   );
 
-  sendText = vi.fn(async () => ({ channel: "slack", messageId: "m1" }));
+  // Slack confirms a send with the ts of the posted message; only such a send
+  // holds its reservation for the whole window.
+  let postedCount = 0;
+  sendText = vi.fn(async () => ({
+    channel: "slack",
+    messageId: `1788479300.${String(++postedCount).padStart(6, "0")}`,
+  }));
   const outbound: ChannelOutboundAdapter = {
     deliveryMode: "direct",
     sendText: sendText as ChannelOutboundAdapter["sendText"],
@@ -170,7 +190,7 @@ afterEach(async () => {
 
 describe("outbound-dedupe on the dispatcher path with durable channel delivery", () => {
   it("runs both fires of one send under one identity and sends once", async () => {
-    await runTurn({ sessionKey: FIRST_RUN, text: ANSWER });
+    await runTurn({ sessionKey: ASK_SESSION, text: ANSWER });
 
     // Both fires happened for this one reply...
     expect(observed).toHaveLength(2);
@@ -179,24 +199,24 @@ describe("outbound-dedupe on the dispatcher path with durable channel delivery",
     // ...and they name the same physical send, which is what stops the second
     // fire from reading the first fire's reservation as a duplicate.
     expect(nonces[1]).toBe(nonces[0]);
-    // The ask is declared at both fires, so the obligation half of the guard is
-    // live on the dispatcher path and not only on the routed one.
-    expect(observed.map((event) => event.metadata?.obligationId)).toEqual([
-      OBLIGATION_ID,
-      OBLIGATION_ID,
-    ]);
     // One reply, one message on the channel.
     expect(sendText).toHaveBeenCalledTimes(1);
   });
 
-  it("still cancels a second run answering the same ask in that thread", async () => {
-    await runTurn({ sessionKey: FIRST_RUN, text: ANSWER });
-    expect(sendText).toHaveBeenCalledTimes(1);
+  it("delivers the answer that follows an acknowledgement of the same ask", async () => {
+    await runTurn({ sessionKey: ASK_SESSION, text: ACKNOWLEDGEMENT });
+    await waitForConfirmedSend();
+    clockOffsetMs += ACK_TO_ANSWER_MS;
+    await runTurn({ sessionKey: ASK_SESSION, text: ANSWER });
 
-    // The 2026-09-03 leak: another run answers the same ask, paraphrased, so only
-    // the obligation key can catch it. Making the two fires idempotent must not
-    // make this pass through.
-    await runTurn({ sessionKey: SECOND_RUN, text: PARAPHRASE });
+    expect(sendText).toHaveBeenCalledTimes(2);
+  });
+
+  it("still cancels the identical reply sent again in that thread", async () => {
+    await runTurn({ sessionKey: ASK_SESSION, text: ANSWER });
+    await waitForConfirmedSend();
+    clockOffsetMs += ACK_TO_ANSWER_MS;
+    await runTurn({ sessionKey: ASK_SESSION, text: ANSWER });
 
     expect(sendText).toHaveBeenCalledTimes(1);
   });

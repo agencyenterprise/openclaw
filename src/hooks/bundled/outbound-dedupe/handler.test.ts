@@ -45,7 +45,6 @@ describe("outbound-dedupe handler", () => {
       windowHours: 6,
       maxPerThread: DEFAULT_OUTBOUND_DEDUPE_CONFIG.maxPerThread,
       minChars: 10,
-      answerBurstSeconds: DEFAULT_OUTBOUND_DEDUPE_CONFIG.answerBurstSeconds,
     });
   });
 });

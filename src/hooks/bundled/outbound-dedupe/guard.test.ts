@@ -305,3 +305,74 @@ describe("outbound-dedupe guard", () => {
     );
   });
 });
+
+describe("an acknowledgement followed by the answer to the same ask", () => {
+  // 2026-09-22, #C0C303K80UQ thread 1790097322.070849: the run posted "I'll review
+  // the ESR bundle…" at 13:17:59 EDT and its 2028-char review at 13:38:20 EDT was
+  // cancelled as "a second answer for one obligation". Both sends declared the ask
+  // C0C303K80UQ:1790097410.218249 and came from the same session.
+  const ESR_SESSION = "agent:main:slack:channel:c0c303k80uq:thread:1790097322.070849";
+  const ESR_ASK = "C0C303K80UQ:1790097410.218249";
+  const ACK = "I'll review the ESR bundle and the two papers, then reply here shortly.";
+  const ANSWER =
+    "My read: these papers sharpen the ESR question; they don't settle whether stakes change the reading.";
+  const ACK_TO_ANSWER_MS = (20 * 60 + 21) * 1_000;
+
+  function esrCtx(sessionKey = ESR_SESSION) {
+    return { channelId: "slack", conversationId: "channel:C0C303K80UQ", sessionKey };
+  }
+
+  function replyToAsk(content: string) {
+    return {
+      to: "channel:C0C303K80UQ",
+      content,
+      threadId: "1790097322.070849",
+      metadata: { obligationId: ESR_ASK },
+    };
+  }
+
+  function confirmedSend(content: string): MessageSentHookContext {
+    return {
+      to: "channel:C0C303K80UQ",
+      content,
+      success: true,
+      channelId: "slack",
+      messageId: "1790097479.244900",
+    };
+  }
+
+  it("delivers the answer that follows a confirmed acknowledgement", async () => {
+    const guard = createOutboundDedupeGuard(deps());
+    const record = createOutboundSentRecorder(deps());
+
+    expect(await guard(replyToAsk(ACK), esrCtx())).toBeUndefined();
+    await record(confirmedSend(ACK), ESR_SESSION);
+    advance(ACK_TO_ANSWER_MS);
+
+    expect(await guard(replyToAsk(ANSWER), esrCtx())).toBeUndefined();
+  });
+
+  it("delivers a reply to the same ask from another session", async () => {
+    const guard = createOutboundDedupeGuard(deps());
+    const record = createOutboundSentRecorder(deps());
+
+    expect(await guard(replyToAsk(ACK), esrCtx())).toBeUndefined();
+    await record(confirmedSend(ACK), ESR_SESSION);
+
+    const otherSession = "agent:main:slack:channel:c0c303k80uq:thread:1790097410.218249";
+    expect(await guard(replyToAsk(ANSWER), esrCtx(otherSession))).toBeUndefined();
+  });
+
+  it("still cancels the identical answer sent twice", async () => {
+    const guard = createOutboundDedupeGuard(deps());
+    const record = createOutboundSentRecorder(deps());
+
+    expect(await guard(replyToAsk(ANSWER), esrCtx())).toBeUndefined();
+    await record(confirmedSend(ANSWER), ESR_SESSION);
+    advance(ACK_TO_ANSWER_MS);
+
+    const repeat = await guard(replyToAsk(ANSWER), esrCtx());
+    expect(repeat?.cancel).toBe(true);
+    expect(repeat?.cancelReason).toContain("duplicate of a send");
+  });
+});

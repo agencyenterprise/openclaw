@@ -10,9 +10,9 @@
  * several Slack chunks and therefore name no single message.
  *
  * A reservation may only be held for the full dedupe window by a send that is
- * confirmed in this sense. Anything weaker stays pending and expires, so a
- * later answer to the same obligation is not blocked for a day by a send that
- * never reached the channel.
+ * confirmed in this sense. Anything weaker stays pending and expires, so the
+ * same text sent again later is not blocked for a day by a send that never
+ * reached the channel.
  */
 import { isSlackTs } from "../../slack-thread.js";
 
