@@ -351,8 +351,26 @@ function buildSlackRenderOptions() {
   };
 }
 
+// OpenAI web-search responses wrap citation references in private-use code points:
+// U+E200 "cite" U+E202 "turn0search1" U+E201. The references point at the provider's own
+// search results, so nothing downstream can resolve them; in Slack they render as garbage.
+// Any other private-use code point is provider scaffolding too, never text a human wrote.
+// The optional leading space lets a marker vanish without leaving "word ." or "a  b" behind.
+const PROVIDER_MARKER_RE = /( ?)(?:\uE200[^\uE201]*\uE201|[\uE000-\uF8FF])/g;
+const MARKER_BOUNDARY_RE = /[\s.,;:!?)\]]/;
+
+export function stripProviderCitationMarkers(text: string): string {
+  return text.replace(
+    PROVIDER_MARKER_RE,
+    (match: string, spaceBefore: string, offset: number, whole: string) => {
+      const next = whole.charAt(offset + match.length);
+      return next === "" || MARKER_BOUNDARY_RE.test(next) ? "" : spaceBefore;
+    },
+  );
+}
+
 function markdownToSlackMrkdwn(markdown: string, options: SlackMarkdownOptions = {}): string {
-  const ir = markdownToIR(markdown ?? "", {
+  const ir = markdownToIR(stripProviderCitationMarkers(markdown ?? ""), {
     assistantTranscriptRoleHeaders: true,
     linkify: false,
     autolink: false,
@@ -368,7 +386,8 @@ export function normalizeSlackOutboundText(markdown: string): string {
 }
 
 /** Chunk already-rendered Slack mrkdwn without splitting entities or code markers. */
-export function chunkSlackMrkdwnText(text: string, limit: number): string[] {
+export function chunkSlackMrkdwnText(renderedText: string, limit: number): string[] {
+  const text = stripProviderCitationMarkers(renderedText);
   if (text.length <= limit) {
     return [text];
   }
@@ -439,7 +458,7 @@ export function markdownToSlackMrkdwnChunks(
   limit: number,
   options: SlackMarkdownOptions = {},
 ): string[] {
-  const ir = markdownToIR(markdown ?? "", {
+  const ir = markdownToIR(stripProviderCitationMarkers(markdown ?? ""), {
     assistantTranscriptRoleHeaders: true,
     linkify: false,
     autolink: false,

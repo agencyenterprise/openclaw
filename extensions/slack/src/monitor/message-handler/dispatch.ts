@@ -61,6 +61,7 @@ import { withHarnessReceiptMetadata } from "../../bridge-marker.js";
 import { createSlackDraftStream } from "../../draft-stream.js";
 import { formatSlackError } from "../../errors.js";
 import { normalizeSlackOutboundText } from "../../format.js";
+import { isThreadDispatchHeldElsewhere } from "./thread-dispatch-refusal.js";
 import {
   compileSlackInteractiveReplies,
   isSlackInteractiveRepliesEnabled,
@@ -2371,7 +2372,10 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
     },
   );
 
-  if (statusReactionsEnabled) {
+  // A refused or busy dispatch never ran the turn: another copy of this post, or another turn
+  // on this thread, owns it and the ingress retries busy posts. Touching the reactions here would
+  // paint a healthy post as failed.
+  if (statusReactionsEnabled && !isThreadDispatchHeldElsewhere(dispatchError)) {
     if (dispatchError) {
       await statusReactions.setError();
       if (ctx.removeAckAfterReply) {

@@ -1,6 +1,11 @@
 // Slack tests cover format plugin behavior.
 import { describe, expect, it } from "vitest";
-import { markdownToSlackMrkdwnChunks, normalizeSlackOutboundText } from "./format.js";
+import {
+  chunkSlackMrkdwnText,
+  markdownToSlackMrkdwnChunks,
+  normalizeSlackOutboundText,
+  stripProviderCitationMarkers,
+} from "./format.js";
 import { escapeSlackMrkdwn } from "./monitor/mrkdwn.js";
 
 describe("normalizeSlackOutboundText", () => {
@@ -120,5 +125,35 @@ describe("escapeSlackMrkdwn", () => {
 describe("normalizeSlackOutboundText", () => {
   it("normalizes markdown for outbound send/update paths", () => {
     expect(normalizeSlackOutboundText(" **bold** ")).toBe("*bold*");
+  });
+});
+
+describe("stripProviderCitationMarkers", () => {
+  const leaked =
+    "The paper separates causal access from interpretation. \uE200cite\uE202turn2view1\uE201\n" +
+    "Whether this holds is disputed. \uE200cite\uE202turn0search0\uE202turn1view1\uE201 Next line.";
+
+  it("removes OpenAI web-search citation markers without leaving stray spaces", () => {
+    expect(stripProviderCitationMarkers(leaked)).toBe(
+      "The paper separates causal access from interpretation.\n" +
+        "Whether this holds is disputed. Next line.",
+    );
+    expect(stripProviderCitationMarkers("done.\uE200cite\uE202turn0search3\uE201")).toBe("done.");
+  });
+
+  it("removes stray private-use code points but keeps ordinary text intact", () => {
+    expect(stripProviderCitationMarkers("a\uE203b \uE206 c")).toBe("ab c");
+    expect(stripProviderCitationMarkers("a \uE200cite\uE202turn0view0\uE201b")).toBe("a b");
+    expect(stripProviderCitationMarkers("plain *text* <@U123> :tada: 2 + 2 = 4")).toBe(
+      "plain *text* <@U123> :tada: 2 + 2 = 4",
+    );
+  });
+
+  it("is applied on every Slack outbound render path", () => {
+    expect(normalizeSlackOutboundText("**bold** \uE200cite\uE202turn1view0\uE201 end")).toBe(
+      "*bold* end",
+    );
+    expect(markdownToSlackMrkdwnChunks("x \uE200cite\uE202turn1view0\uE201.", 4000)).toEqual(["x."]);
+    expect(chunkSlackMrkdwnText("y \uE200cite\uE202turn0search2\uE201.", 4000)).toEqual(["y."]);
   });
 });

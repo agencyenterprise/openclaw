@@ -34,6 +34,7 @@ import {
   buildSlackDebounceKey,
   buildTopLevelSlackConversationKey,
 } from "./message-handler/debounce-key.js";
+import { isThreadDispatchRefusal } from "./message-handler/thread-dispatch-refusal.js";
 import type { PreparedSlackMessage } from "./message-handler/types.js";
 import { createSlackThreadTsResolver } from "./thread-resolution.js";
 
@@ -83,6 +84,9 @@ function createSlackDispatchCompletion(): SlackDispatchCompletion {
 const APP_MENTION_RETRY_TTL_MS = 60_000;
 const REPLY_SESSION_INIT_CONFLICT_MESSAGE_RE = /reply session initialization conflicted for \S+/u;
 const RESTART_RECOVERY_CLAIM_BUSY_MESSAGE_RE = /restart recovery claim busy for \S+/u;
+// The thread-dispatch fence refuses a post while another turn owns the same thread. That turn
+// ends within a normal agent turn, so the post waits on the claim-busy budget instead of dying.
+const THREAD_DISPATCH_NATIVE_BUSY_MESSAGE_RE = /\bNATIVE_BUSY\b/u;
 // A lost session-init compare-and-swap settles in milliseconds, so its budget stays short.
 const SESSION_INIT_CONFLICT_RETRY_DELAYS_MS = [1_000, 2_000, 4_000] as const;
 // A busy restart-recovery claim is held for as long as the turn that owns it runs, so this
@@ -125,7 +129,10 @@ function classifySlackInboundRetryCause(error: unknown): SlackInboundRetryCause 
     current.error,
   ])) {
     const message = formatErrorMessage(candidate);
-    if (RESTART_RECOVERY_CLAIM_BUSY_MESSAGE_RE.test(message)) {
+    if (
+      RESTART_RECOVERY_CLAIM_BUSY_MESSAGE_RE.test(message) ||
+      THREAD_DISPATCH_NATIVE_BUSY_MESSAGE_RE.test(message)
+    ) {
       return "claim-busy";
     }
     if (REPLY_SESSION_INIT_CONFLICT_MESSAGE_RE.test(message)) {
@@ -235,6 +242,41 @@ function buildSeenMessageKey(
   return `${teamId ? `${teamId}:` : ""}${channelId}:${ts}`;
 }
 
+/**
+ * Slack sends a `message` copy and an `app_mention` copy of one mentioned post. When both wait
+ * in the same debounce window they flush together and would be read as two posts. Keep one per
+ * post: the `message` copy, which carries files and subtype, with the mention flag from either.
+ */
+function collapseDuplicateSlackPosts(entries: QueuedSlackInboundEntry[]): QueuedSlackInboundEntry[] {
+  const keptByPost = new Map<string, number>();
+  const collapsed: QueuedSlackInboundEntry[] = [];
+  for (const entry of entries) {
+    const postKey = buildSeenMessageKey(
+      entry.message.channel,
+      entry.message.ts,
+      entry.opts.eventScope?.teamId,
+    );
+    const keptIndex = postKey ? keptByPost.get(postKey) : undefined;
+    if (keptIndex === undefined) {
+      if (postKey) {
+        keptByPost.set(postKey, collapsed.length);
+      }
+      collapsed.push(entry);
+      continue;
+    }
+    const kept = collapsed[keptIndex];
+    const richer = kept.opts.source === "message" ? kept : entry;
+    collapsed[keptIndex] = {
+      ...richer,
+      opts: {
+        ...richer.opts,
+        wasMentioned: Boolean(kept.opts.wasMentioned || entry.opts.wasMentioned),
+      },
+    };
+  }
+  return collapsed;
+}
+
 export function createSlackMessageHandler(params: {
   ctx: SlackMonitorContext;
   account: ResolvedSlackAccount;
@@ -253,7 +295,8 @@ export function createSlackMessageHandler(params: {
       !hasSlackIngressParticipant(entry.opts) &&
       !entry.opts.eventScope &&
       shouldDebounceSlackMessage(entry.message, ctx.cfg),
-    onFlush: async (entries) => {
+    onFlush: async (flushedEntries) => {
+      const entries = collapseDuplicateSlackPosts(flushedEntries);
       const retryEntries = (sourceError: unknown): SlackInboundRetryResult => {
         const cause = classifySlackInboundRetryCause(sourceError);
         if (!cause || entries.some((entry) => entry.opts.eventScope)) {
@@ -309,7 +352,7 @@ export function createSlackMessageHandler(params: {
         retryTimer.unref?.();
         return { ...result, scheduled: true };
       };
-      const completions = entries
+      const completions = flushedEntries
         .map((entry) => entry.opts.dispatchCompletion)
         .filter((completion) => completion !== undefined);
       try {
@@ -390,15 +433,24 @@ export function createSlackMessageHandler(params: {
                 if (result && seenMessageKey) {
                   pruneAppMentionRetryKeys(Date.now());
                   if (last.opts.source === "app_mention") {
+                    if (messageDispatchedKeys.has(seenMessageKey)) {
+                      // The message copy reached dispatch while this app_mention sat in the
+                      // debouncer. Its retry allowance was consumed at the seen gate before the
+                      // message copy finished preparing, so drop it here or the post runs twice.
+                      messageDispatchedKeys.delete(seenMessageKey);
+                      appMentionRetryKeys.delete(seenMessageKey);
+                      return null;
+                    }
                     // If app_mention wins the race and dispatches first, drop the later message.
                     rememberExpiringAppMentionKey(appMentionDispatchedKeys, seenMessageKey);
-                  } else if (
-                    last.opts.source === "message" &&
-                    appMentionDispatchedKeys.has(seenMessageKey)
-                  ) {
+                  } else if (appMentionDispatchedKeys.has(seenMessageKey)) {
                     appMentionDispatchedKeys.delete(seenMessageKey);
                     appMentionRetryKeys.delete(seenMessageKey);
                     return null;
+                  } else {
+                    // The message copy dispatches first; a fallback app_mention that already
+                    // passed the seen gate must not dispatch the same post again.
+                    rememberExpiringAppMentionKey(messageDispatchedKeys, seenMessageKey);
                   }
                   appMentionRetryKeys.delete(seenMessageKey);
                 }
@@ -419,7 +471,9 @@ export function createSlackMessageHandler(params: {
             registerSlackControlUnseen(last.opts, () => {
               for (const entry of entries) {
                 const key = buildSeenMessageKey(entry.message.channel, entry.message.ts, entry.opts.eventScope?.teamId);
-                if (key) { appMentionDispatchedKeys.delete(key); appMentionRetryKeys.delete(key); appMentionPreparingKeys.delete(key); }
+                if (key) {
+                  forgetInboundCopyArbitration(key);
+                }
                 ctx.releaseSeenMessage(entry.message.channel, entry.message.ts, entry.opts.eventScope);
               }
             });
@@ -440,7 +494,13 @@ export function createSlackMessageHandler(params: {
                 messages: entries.map((entry) => entry.message),
               });
             } catch (error) {
-              if (!hasSlackIngressParticipant(last.opts) && !isRetryableSlackInboundError(error)) {
+              // A refused copy never ran the turn; only the copy that owns the turn may certify
+              // this post as delivered, or its own retry would be discarded as a duplicate.
+              if (
+                !hasSlackIngressParticipant(last.opts) &&
+                !isRetryableSlackInboundError(error) &&
+                !isThreadDispatchRefusal(error)
+              ) {
                 await recordSlackInboundMessageDeliveries({
                   accountId: ctx.accountId,
                   ...(last.opts.eventScope ? { teamId: last.opts.eventScope.teamId } : {}),
@@ -461,7 +521,7 @@ export function createSlackMessageHandler(params: {
                   entry.opts.eventScope?.teamId,
                 );
                 if (entrySeenKey) {
-                  appMentionDispatchedKeys.delete(entrySeenKey);
+                  forgetInboundCopyArbitration(entrySeenKey);
                 }
                 ctx.releaseSeenMessage(
                   entry.message.channel,
@@ -506,22 +566,25 @@ export function createSlackMessageHandler(params: {
   const appMentionRetryKeys = new Map<string, number>();
   const appMentionPreparingKeys = new Set<string>();
   const appMentionDispatchedKeys = new Map<string, number>();
+  const messageDispatchedKeys = new Map<string, number>();
 
   const pruneAppMentionRetryKeys = (rawNow: number): boolean => {
     const now = asDateTimestampMs(rawNow);
     if (now === undefined) {
       appMentionRetryKeys.clear();
       appMentionDispatchedKeys.clear();
+      messageDispatchedKeys.clear();
       return false;
     }
-    for (const [key, expiresAt] of appMentionRetryKeys) {
-      if (asDateTimestampMs(expiresAt) === undefined || expiresAt <= now) {
-        appMentionRetryKeys.delete(key);
-      }
-    }
-    for (const [key, expiresAt] of appMentionDispatchedKeys) {
-      if (asDateTimestampMs(expiresAt) === undefined || expiresAt <= now) {
-        appMentionDispatchedKeys.delete(key);
+    for (const expiringKeys of [
+      appMentionRetryKeys,
+      appMentionDispatchedKeys,
+      messageDispatchedKeys,
+    ]) {
+      for (const [key, expiresAt] of expiringKeys) {
+        if (asDateTimestampMs(expiresAt) === undefined || expiresAt <= now) {
+          expiringKeys.delete(key);
+        }
       }
     }
     return true;
@@ -540,6 +603,18 @@ export function createSlackMessageHandler(params: {
 
   const rememberAppMentionRetryKey = (key: string) => {
     rememberExpiringAppMentionKey(appMentionRetryKeys, key);
+  };
+
+  /**
+   * Forget every arbitration mark for one Slack post. Slack delivers a `message` copy and an
+   * `app_mention` copy of the same post; the marks decide which copy dispatches. Once the seen
+   * gate is released so a retry can rebuild the post, stale marks would drop that retry.
+   */
+  const forgetInboundCopyArbitration = (key: string) => {
+    appMentionRetryKeys.delete(key);
+    appMentionPreparingKeys.delete(key);
+    appMentionDispatchedKeys.delete(key);
+    messageDispatchedKeys.delete(key);
   };
 
   const consumeAppMentionRetryKey = (key: string) => {
