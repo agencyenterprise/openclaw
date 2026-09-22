@@ -8,6 +8,8 @@ import {
 import { enqueueCommandInLane, getCommandLaneSnapshot } from "../../../process/command-queue.js";
 import type { CommandQueueEnqueueOptions } from "../../../process/command-queue.types.js";
 import { withSessionPlacementTurnAdmission } from "../../session-placement-admission.js";
+import { log } from "../logger.js";
+import { beginNativeEffectPhase, nativeOwnerLogId } from "../native-cleanup-proof.js";
 import type { EmbeddedAgentRunResult } from "../types.js";
 import {
   EMBEDDED_RUN_LANE_TIMEOUT_GRACE_MS,
@@ -19,6 +21,7 @@ import type { RunEmbeddedAgentParams } from "./params.js";
 import { assertAgentHarnessRunAdmission } from "./session-bootstrap.js";
 
 type LaneParams = RunEmbeddedAgentParams & {
+  nativeCleanupIdentity?: string;
   sessionFile: string;
 };
 
@@ -32,6 +35,10 @@ export function createEmbeddedRunLaneController<TParams extends LaneParams>(opti
   setParams: (params: TParams) => void;
 }) {
   const initialParams = options.getParams();
+  const nativeCleanupIdentity = initialParams.nativeCleanupIdentity;
+  const ownerLogId = nativeCleanupIdentity ? nativeOwnerLogId(nativeCleanupIdentity) : "none";
+  const logLaneEvent = (event: string, lane: string) =>
+    log.debug(`native owner lane ${event}: lane=${lane} owner=${ownerLogId}`);
   const sessionQueuePriority = resolveEmbeddedRunSessionQueuePriority(initialParams.trigger);
   const laneTaskTimeoutMs = resolveEmbeddedRunLaneTimeoutMs(initialParams.timeoutMs);
   const laneTaskAbortController = new AbortController();
@@ -104,9 +111,13 @@ export function createEmbeddedRunLaneController<TParams extends LaneParams>(opti
       priority: sessionQueuePriority,
     };
     const taskWithCurrentLifecycle = async () => {
+      // Nothing runs before this gate except the abort check: a turn that fails
+      // here caused no effect and its claim can settle as such.
+      throwIfAborted();
+      beginNativeEffectPhase(nativeCleanupIdentity);
+      logLaneEvent("dequeue", options.globalLane);
       let params = options.getParams();
       params.onLaneWait?.({ waitMs: 0, queuedAhead: 0, waiting: false });
-      throwIfAborted();
       let lifecycleGeneration = options.getLifecycleGeneration();
       const currentLifecycleGeneration = getAgentEventLifecycleGeneration();
       const existingContext = getAgentRunContext(params.runId);
@@ -157,6 +168,7 @@ export function createEmbeddedRunLaneController<TParams extends LaneParams>(opti
       return params.enqueue(taskWithCurrentLifecycle, withLaneTimeout(withRunLaneWait(globalOpts)));
     }
     noteLaneWaitIfBusy(options.globalLane);
+    logLaneEvent("enqueue", options.globalLane);
     return enqueueCommandInLane(
       options.globalLane,
       taskWithCurrentLifecycle,
@@ -166,6 +178,7 @@ export function createEmbeddedRunLaneController<TParams extends LaneParams>(opti
   const enqueueSession = <T>(task: () => Promise<T>, opts?: CommandQueueEnqueueOptions) => {
     const sessionOpts: CommandQueueEnqueueOptions = { ...opts, priority: sessionQueuePriority };
     const taskWithLaneAdmission = () => {
+      logLaneEvent("dequeue", options.sessionLane);
       options.getParams().onLaneWait?.({ waitMs: 0, queuedAhead: 0, waiting: false });
       return task();
     };
@@ -174,6 +187,7 @@ export function createEmbeddedRunLaneController<TParams extends LaneParams>(opti
       return params.enqueue(taskWithLaneAdmission, withRunLaneWait(sessionOpts));
     }
     noteLaneWaitIfBusy(options.sessionLane);
+    logLaneEvent("enqueue", options.sessionLane);
     return enqueueCommandInLane(
       options.sessionLane,
       taskWithLaneAdmission,

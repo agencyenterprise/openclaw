@@ -7,6 +7,8 @@ export type RunEmbeddedAgentInternalParams = RunEmbeddedAgentParams & {
   authProfileStateMode?: "read-write" | "read-only";
   /** Ring-zero tool override, supplied only by the OpenClaw orchestrator. */
   systemAgentTool?: SystemAgentToolOptions;
+  /** Private cleanup-tracking identity, set only by runEmbeddedAgent. */
+  nativeCleanupIdentity?: string;
 };
 
 export type RunEmbeddedAgentParamsWithSessionFile = RunEmbeddedAgentInternalParams & {

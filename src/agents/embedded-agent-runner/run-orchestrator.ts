@@ -89,14 +89,19 @@ export function runEmbeddedAgent(
     sessionId: internalParamsInput.sessionId,
     lifecycleGeneration,
   });
-  const runPlain = () =>
+  const runPlain = (nativeCleanupIdentity?: string) =>
     withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
-      runEmbeddedAgentInternal({ ...internalParamsInput, config, lifecycleGeneration }),
+      runEmbeddedAgentInternal({
+        ...internalParamsInput,
+        config,
+        lifecycleGeneration,
+        nativeCleanupIdentity,
+      }),
     );
   const runTracked = () => {
     if (!hasProtectedDispatchOwner()) return runPlain();
     bindCurrentNativeOwnerDeadline(internalParamsInput.timeoutMs);
-    return withNativeCleanupTracking(cleanupIdentity, runPlain);
+    return withNativeCleanupTracking(cleanupIdentity, () => runPlain(cleanupIdentity));
   };
   if (hasCronDispatchOwner()) {
     return runCronDispatchAttempt({
@@ -144,9 +149,7 @@ export function runEmbeddedAgent(
   }
   const dispatchConfig = loadDispatchConfig();
   if (!dispatchConfig) {
-    return withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
-      runEmbeddedAgentInternal({ ...internalParamsInput, config, lifecycleGeneration }),
-    );
+    return runPlain();
   }
   const dispatchSessionKey = backfillSessionKey({
     config,

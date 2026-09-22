@@ -1,6 +1,7 @@
 /** Host-private cleanup evidence; never inferred from public result metadata. */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
+import { log } from "./logger.js";
 
 type Attempt = { closed: boolean; verified: boolean };
 type Context = { identity: string; closed: boolean; invalid: boolean; attempts: Set<Attempt> };
@@ -8,6 +9,19 @@ const contexts = new AsyncLocalStorage<Context>();
 const activeIdentities = new Set<string>();
 const completedErrors = new WeakMap<object, { identity: string; receipt: string }>();
 const completedResults = new WeakMap<object, { identity: string; receipt: string }>();
+
+/** Opaque short id for correlating one tracked run across log lines. */
+export function nativeOwnerLogId(identity: string): string {
+  return identity.slice(0, 12);
+}
+
+function ownerClosedError(context: Context, site: string): Error {
+  const error = new Error("NATIVE_CLEANUP_OWNER_CLOSED");
+  log.warn(
+    `native owner closed at ${site}: owner=${nativeOwnerLogId(context.identity)} stack=${error.stack ?? "unavailable"}`,
+  );
+  return error;
+}
 
 export function hasNativeCleanupTracking(): boolean {
   return contexts.getStore() !== undefined;
@@ -22,7 +36,7 @@ export function invalidateNativeCleanupTracking(): void {
 export function trackNativeCleanupDependency(promise: Promise<unknown>): void {
   const context = contexts.getStore();
   if (!context) return;
-  if (context.closed) throw new Error("NATIVE_CLEANUP_OWNER_CLOSED");
+  if (context.closed) throw ownerClosedError(context, "cleanup-dependency");
   const dependency: Attempt = { closed: false, verified: false };
   context.attempts.add(dependency);
   void promise.then(
@@ -37,12 +51,39 @@ export function trackNativeCleanupDependency(promise: Promise<unknown>): void {
   );
 }
 
+/**
+ * Gate before a tracked run's first possible effect (global-lane admission).
+ * `expectedIdentity` is the run's own tracking identity, or undefined for an
+ * untracked run; any mismatch with the current context refuses, and a closed
+ * owner refuses.
+ */
+export function beginNativeEffectPhase(expectedIdentity: string | undefined): void {
+  const context = contexts.getStore();
+  if (context?.identity !== expectedIdentity) {
+    const error = new Error("NATIVE_CLEANUP_OWNER_MISMATCH");
+    log.warn(
+      `native owner mismatch at effect phase: expected=${expectedIdentity ? nativeOwnerLogId(expectedIdentity) : "none"} current=${context ? nativeOwnerLogId(context.identity) : "none"} stack=${error.stack ?? "unavailable"}`,
+    );
+    throw error;
+  }
+  if (!context) {
+    return;
+  }
+  if (context.closed) {
+    throw ownerClosedError(context, "effect-phase");
+  }
+  log.debug(`native owner effect phase entered: owner=${nativeOwnerLogId(context.identity)}`);
+}
+
 export function beginNativeCleanupAttempt(): (verified: boolean) => void {
   const context = contexts.getStore();
   if (!context) return () => {};
-  if (context.closed) throw new Error("NATIVE_CLEANUP_OWNER_CLOSED");
+  if (context.closed) throw ownerClosedError(context, "cleanup-attempt");
   const attempt: Attempt = { closed: false, verified: false };
   context.attempts.add(attempt);
+  log.debug(
+    `native cleanup attempt begin: owner=${nativeOwnerLogId(context.identity)} attempt=${context.attempts.size}`,
+  );
   return (verified) => {
     if (attempt.closed || context.closed) throw new Error("NATIVE_CLEANUP_ATTEMPT_CLOSED");
     attempt.closed = true;
@@ -110,6 +151,9 @@ export async function withNativeCleanupTracking<T extends object>(
   } finally {
     context.closed = true;
     activeIdentities.delete(identity);
+    log.info(
+      `native owner closed: owner=${nativeOwnerLogId(identity)} attempts=${context.attempts.size} invalid=${context.invalid}`,
+    );
   }
 }
 

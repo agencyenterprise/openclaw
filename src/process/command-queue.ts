@@ -1,4 +1,5 @@
 // Command queue serializes and limits process execution for shared command lanes.
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   diagnosticLogger as diag,
   logLaneDequeue,
@@ -490,9 +491,13 @@ export function enqueueCommandInLane<T>(
   const cleaned = normalizeLane(lane);
   const warnAfterMs = opts?.warnAfterMs ?? 2_000;
   const state = getLaneState(cleaned);
+  // A queued entry is started by whichever task frees the lane; without this
+  // snapshot it would inherit that finished task's async-local owner state.
+  const runInEnqueueContext = AsyncLocalStorage.snapshot();
+  const onWait = opts?.onWait;
   return new Promise<T>((resolve, reject) => {
     enqueueLaneEntry(state, {
-      task: () => task(),
+      task: () => runInEnqueueContext(task),
       resolve: (value) => resolve(value as T),
       reject,
       enqueuedAt: Date.now(),
@@ -506,7 +511,9 @@ export function enqueueCommandInLane<T>(
       taskTimeoutAbortSignal: opts?.taskTimeoutAbortSignal,
       taskTimeoutAbortGraceMs: normalizeTaskTimeoutMs(opts?.taskTimeoutAbortGraceMs),
       taskTimeoutReleaseSignal: opts?.taskTimeoutReleaseSignal,
-      onWait: opts?.onWait,
+      onWait: onWait
+        ? (waitMs, queuedAhead) => runInEnqueueContext(onWait, waitMs, queuedAhead)
+        : undefined,
     });
     logLaneEnqueue(cleaned, getLaneDepth(state));
     drainLane(cleaned);
