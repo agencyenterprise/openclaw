@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginCandidate } from "./discovery.js";
 import { buildInstalledPluginIndexRecords } from "./installed-plugin-index-record-builder.js";
 import {
@@ -9,7 +10,9 @@ import {
   readPersistedInstalledPluginIndexInstallRecordsSync,
   writePersistedInstalledPluginIndexInstallRecords,
 } from "./installed-plugin-index-records.js";
+import type { InstalledPluginIndex } from "./installed-plugin-index-types.js";
 import {
+  createInstalledPluginEnabledLookup,
   diffInstalledPluginIndexInvalidationReasons,
   isInstalledPluginEnabled,
   loadInstalledPluginIndex,
@@ -1159,3 +1162,137 @@ describe("installed plugin index", () => {
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
+
+describe("createInstalledPluginEnabledLookup", () => {
+  function makeIndex(
+    records: Array<{
+      pluginId: string;
+      origin: "bundled" | "global" | "workspace";
+      enabled: boolean;
+      enabledByDefault?: boolean;
+    }>,
+  ): InstalledPluginIndex {
+    return {
+      plugins: records.map((record) => ({
+        ...record,
+        manifestPath: `/plugins/${record.pluginId}/openclaw.plugin.json`,
+        manifestHash: record.pluginId,
+        rootDir: `/plugins/${record.pluginId}`,
+      })),
+      diagnostics: [],
+      installRecords: {},
+    } as unknown as InstalledPluginIndex;
+  }
+
+  const index = makeIndex([
+    { pluginId: "bundled-default", origin: "bundled", enabled: true, enabledByDefault: true },
+    { pluginId: "bundled-opt-in", origin: "bundled", enabled: false },
+    { pluginId: "global-enabled", origin: "global", enabled: true },
+    { pluginId: "global-disabled", origin: "global", enabled: false },
+    { pluginId: "workspace-enabled", origin: "workspace", enabled: true },
+    { pluginId: "duplicate", origin: "global", enabled: true },
+    { pluginId: "duplicate", origin: "global", enabled: false },
+  ]);
+  const pluginIds = [
+    "bundled-default",
+    "bundled-opt-in",
+    "global-enabled",
+    "global-disabled",
+    "workspace-enabled",
+    "duplicate",
+    "missing",
+  ];
+  const configs: Array<[string, OpenClawConfig | undefined]> = [
+    ["no config", undefined],
+    ["empty config", {}],
+    [
+      "explicit entries",
+      {
+        plugins: {
+          entries: {
+            "bundled-default": { enabled: false },
+            "bundled-opt-in": { enabled: true },
+            "global-disabled": { enabled: true },
+          },
+        },
+      },
+    ],
+    ["allow list", { plugins: { allow: ["global-enabled", "duplicate"] } }],
+    ["deny list", { plugins: { deny: ["global-enabled"] } }],
+    ["plugins disabled", { plugins: { enabled: false } }],
+  ];
+
+  // Expected results come from the pre-refactor isInstalledPluginEnabled, so a
+  // shared regression in the enablement logic cannot hide behind parity alone.
+  const expectedEnabled: Record<string, Record<string, boolean>> = {
+    "no config": {
+      "bundled-default": true,
+      "bundled-opt-in": false,
+      "global-enabled": true,
+      "global-disabled": false,
+      "workspace-enabled": true,
+      duplicate: true,
+      missing: false,
+    },
+    "empty config": {
+      "bundled-default": true,
+      "bundled-opt-in": false,
+      "global-enabled": true,
+      "global-disabled": false,
+      "workspace-enabled": false,
+      duplicate: true,
+      missing: false,
+    },
+    "explicit entries": {
+      "bundled-default": false,
+      "bundled-opt-in": true,
+      "global-enabled": true,
+      "global-disabled": true,
+      "workspace-enabled": false,
+      duplicate: true,
+      missing: false,
+    },
+    "allow list": {
+      "bundled-default": false,
+      "bundled-opt-in": false,
+      "global-enabled": true,
+      "global-disabled": false,
+      "workspace-enabled": false,
+      duplicate: true,
+      missing: false,
+    },
+    "deny list": {
+      "bundled-default": true,
+      "bundled-opt-in": false,
+      "global-enabled": false,
+      "global-disabled": false,
+      "workspace-enabled": false,
+      duplicate: true,
+      missing: false,
+    },
+    "plugins disabled": {
+      "bundled-default": false,
+      "bundled-opt-in": false,
+      "global-enabled": false,
+      "global-disabled": false,
+      "workspace-enabled": false,
+      duplicate: false,
+      missing: false,
+    },
+  };
+
+  it.each(configs)("matches isInstalledPluginEnabled with %s", (label, config) => {
+    const isEnabled = createInstalledPluginEnabledLookup(index, config);
+    for (const pluginId of pluginIds) {
+      expect(isEnabled(pluginId), pluginId).toBe(isInstalledPluginEnabled(index, pluginId, config));
+    }
+    expect(
+      Object.fromEntries(pluginIds.map((pluginId) => [pluginId, isEnabled(pluginId)])),
+    ).toEqual(expectedEnabled[label]);
+  });
+
+  it("uses the first index record for duplicate plugin ids", () => {
+    expect(createInstalledPluginEnabledLookup(index)("duplicate")).toBe(true);
+    expect(createInstalledPluginEnabledLookup(index)("missing")).toBe(false);
+  });
+});

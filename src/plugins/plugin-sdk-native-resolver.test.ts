@@ -5,8 +5,11 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { beforeAll, describe, expect, it } from "vitest";
-import { installOpenClawPluginSdkNativeResolver } from "./plugin-sdk-native-resolver.js";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  installOpenClawInternalCorePackageNativeResolver,
+  installOpenClawPluginSdkNativeResolver,
+} from "./plugin-sdk-native-resolver.js";
 
 type NativeEsmLazyImportProbe = {
   status: number | null;
@@ -573,5 +576,72 @@ describe("installOpenClawPluginSdkNativeResolver", () => {
 
     const requireFromOther = createRequire(otherEntry);
     expect(() => requireFromOther.resolve("openclaw/plugin-sdk/ssrf-runtime-internal")).toThrow();
+  });
+});
+
+describe("installOpenClawInternalCorePackageNativeResolver", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function countFsProbesUnder(root: string, run: () => void): number {
+    const realRoot = fs.realpathSync(root);
+    const isUnderRoot = (candidate: unknown) =>
+      typeof candidate === "string" &&
+      (candidate.startsWith(root) || candidate.startsWith(realRoot));
+    const existsSync = vi.spyOn(fs, "existsSync");
+    const readFileSync = vi.spyOn(fs, "readFileSync");
+    try {
+      run();
+      return [...existsSync.mock.calls, ...readFileSync.mock.calls].filter(([candidate]) =>
+        isUnderRoot(candidate),
+      ).length;
+    } finally {
+      existsSync.mockRestore();
+      readFileSync.mockRestore();
+    }
+  }
+
+  it("scans the package layout once per loader module across cached-loader installs", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sdk-native-core-memo-"));
+    const { loaderModulePath } = writeFakeOpenClawPackage(root);
+    writeInternalCorePackageSource(root, "media-core", "mime.ts");
+    fs.mkdirSync(path.join(root, "src"), { recursive: true });
+    const moduleUrl = pathToFileURL(loaderModulePath).href;
+
+    const firstProbes = countFsProbesUnder(root, () => {
+      expect(installOpenClawInternalCorePackageNativeResolver({ moduleUrl })).toContain(
+        "@openclaw/media-core/mime",
+      );
+    });
+    const repeatProbes = countFsProbesUnder(root, () => {
+      for (let call = 0; call < 5; call += 1) {
+        expect(installOpenClawInternalCorePackageNativeResolver({ moduleUrl })).toContain(
+          "@openclaw/media-core/mime",
+        );
+      }
+    });
+
+    expect(firstProbes).toBeGreaterThan(0);
+    expect(repeatProbes).toBe(0);
+  });
+
+  it("refreshes the memoized layout when the full SDK resolver installs again", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sdk-native-core-refresh-"));
+    const { loaderModulePath } = writeFakeOpenClawPackage(root);
+    writeInternalCorePackageSource(root, "media-core", "mime.ts");
+    const coreSourceParent = path.join(root, "src", "core.ts");
+    fs.mkdirSync(path.dirname(coreSourceParent), { recursive: true });
+    fs.writeFileSync(coreSourceParent, "export default {};\n", "utf8");
+    const moduleUrl = pathToFileURL(loaderModulePath).href;
+
+    installOpenClawInternalCorePackageNativeResolver({ moduleUrl });
+    const addedSource = writeInternalCorePackageSource(root, "media-core", "base64.ts");
+    installOpenClawPluginSdkNativeResolver({ modulePath: loaderModulePath });
+    installOpenClawInternalCorePackageNativeResolver({ moduleUrl });
+
+    expect(
+      fs.realpathSync(createRequire(coreSourceParent).resolve("@openclaw/media-core/base64")),
+    ).toBe(fs.realpathSync(addedSource));
   });
 });

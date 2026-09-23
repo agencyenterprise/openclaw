@@ -5,7 +5,7 @@ import { resolveProviderAuthAliasMap } from "../agents/provider-auth-aliases.js"
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { normalizePluginsConfig } from "../plugins/config-state.js";
 import { getCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata-snapshot.js";
-import { isInstalledPluginEnabled } from "../plugins/installed-plugin-index.js";
+import { createInstalledPluginEnabledLookup } from "../plugins/installed-plugin-index.js";
 import type { PluginManifestRecord } from "../plugins/manifest-registry.js";
 import {
   isWorkspacePluginAllowedByConfig,
@@ -227,17 +227,26 @@ function resolveManifestProviderAuthEnvVarCandidatesFromSnapshot(
   return candidates;
 }
 
+// An empty installed index carries no enablement state, so every snapshot plugin participates.
+function resolveSnapshotPluginEnabledLookup(
+  snapshot: PluginMetadataSnapshot,
+  config: OpenClawConfig | undefined,
+): (pluginId: string) => boolean {
+  if (snapshot.index.plugins.length === 0) {
+    return () => true;
+  }
+  return createInstalledPluginEnabledLookup(snapshot.index, config);
+}
+
 function resolveManifestProviderAuthEvidenceFromSnapshot(
   params: ProviderEnvVarLookupParams | undefined,
   snapshot: PluginMetadataSnapshot,
   aliases: Readonly<Record<string, string>>,
 ): Record<string, ProviderAuthEvidence[]> {
   const evidenceByProvider: Record<string, ProviderAuthEvidence[]> = {};
+  const isPluginEnabled = resolveSnapshotPluginEnabledLookup(snapshot, params?.config);
   for (const plugin of snapshot.plugins) {
-    if (
-      snapshot.index.plugins.length > 0 &&
-      !isInstalledPluginEnabled(snapshot.index, plugin.id, params?.config)
-    ) {
+    if (!isPluginEnabled(plugin.id)) {
       continue;
     }
     if (!shouldUsePluginProviderAuthEvidence(plugin, params)) {
@@ -264,11 +273,9 @@ function resolveManifestSetupProviderFallbackRefsFromSnapshot(
   aliases: Readonly<Record<string, string>>,
 ): string[] {
   const refs = new Set<string>();
+  const isPluginEnabled = resolveSnapshotPluginEnabledLookup(snapshot, params?.config);
   for (const plugin of snapshot.plugins) {
-    if (
-      snapshot.index.plugins.length > 0 &&
-      !isInstalledPluginEnabled(snapshot.index, plugin.id, params?.config)
-    ) {
+    if (!isPluginEnabled(plugin.id)) {
       continue;
     }
     if (plugin.setup?.requiresRuntime === false) {

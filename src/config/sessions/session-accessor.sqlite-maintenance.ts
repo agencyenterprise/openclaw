@@ -28,6 +28,11 @@ import {
 } from "./session-accessor.sqlite-lifecycle-state.js";
 import type { SqliteSessionEntryMaintenancePlan } from "./session-accessor.sqlite-lifecycle-types.js";
 import {
+  forgetSettledSqliteSessionMaintenance,
+  isSqliteSessionMaintenanceSettled,
+  recordSettledSqliteSessionMaintenance,
+} from "./session-accessor.sqlite-maintenance-settled.js";
+import {
   cloneSessionEntry,
   getSessionKysely,
   resolveSqliteScope,
@@ -53,6 +58,10 @@ import {
 import type { SessionEntry } from "./types.js";
 
 // Entry pruning and disk-budget owner. Produces plans inside writes; finalizes archives afterward.
+
+function emptySqliteSessionEntryMaintenancePlan(): SqliteSessionEntryMaintenancePlan {
+  return { entryRemovals: [], promptReportOrphanSweep: false, stateDeletePlans: [] };
+}
 
 function collectSqliteSessionMaintenanceBaseKeys(
   store: Record<string, SessionEntry>,
@@ -137,22 +146,21 @@ export function previewSqliteSessionDiskBudget(params: {
   return { diskBudget, removedKeys };
 }
 
-function hasStaleSqliteSessionEntryCandidate(
+// Index-only read of `idx_agent_session_entries_updated_at`; no entry JSON.
+function readStaleSqliteSessionEntryKeys(
   database: OpenClawAgentDatabase,
   pruneAfterMs: number,
-  preserveKeys: ReadonlySet<string> | undefined,
-): boolean {
+): string[] {
   const cutoffMs = Date.now() - pruneAfterMs;
   const db = getSessionKysely(database.db);
-  const rows = executeSqliteQuerySync(
+  return executeSqliteQuerySync(
     database.db,
     db
       .selectFrom("session_entries")
       .select("session_key")
       .where("updated_at", "<", cutoffMs)
       .orderBy("updated_at", "asc"),
-  ).rows;
-  return rows.some((row) => !preserveKeys?.has(normalizeStoreSessionKey(row.session_key)));
+  ).rows.map((row) => row.session_key);
 }
 
 /**
@@ -200,19 +208,24 @@ export function applySqliteSessionEntryMaintenance(
   },
 ): SqliteSessionEntryMaintenancePlan {
   if (params.skipMaintenance) {
-    return { entryRemovals: [], promptReportOrphanSweep: false, stateDeletePlans: [] };
+    return emptySqliteSessionEntryMaintenancePlan();
   }
   const maintenance = params.maintenanceConfig ?? resolveMaintenanceConfig();
   if (maintenance.mode === "warn") {
-    return { entryRemovals: [], promptReportOrphanSweep: false, stateDeletePlans: [] };
+    forgetSettledSqliteSessionMaintenance(database);
+    return emptySqliteSessionEntryMaintenancePlan();
   }
 
   const entryCount = readSqliteSessionEntryCount(database);
+  const staleKeys = readStaleSqliteSessionEntryKeys(database, maintenance.pruneAfterMs);
+  if (params.forceMaintenance === true) {
+    forgetSettledSqliteSessionMaintenance(database);
+  } else if (isSqliteSessionMaintenanceSettled(database, maintenance, { entryCount, staleKeys })) {
+    return emptySqliteSessionEntryMaintenancePlan();
+  }
   const preserveCandidateKeys = collectSessionMaintenancePreserveKeys([params.activeSessionKey]);
-  const hasStaleCandidate = hasStaleSqliteSessionEntryCandidate(
-    database,
-    maintenance.pruneAfterMs,
-    preserveCandidateKeys,
+  const hasStaleCandidate = staleKeys.some(
+    (key) => !preserveCandidateKeys?.has(normalizeStoreSessionKey(key)),
   );
   // O(1) header read, never a table scan: see mayExceedSqliteSessionDiskBudget().
   // A database whose live pages already fit the budget cannot hold session JSON
@@ -234,7 +247,7 @@ export function applySqliteSessionEntryMaintenance(
       force: params.forceMaintenance,
     });
   if (!shouldLoadStore) {
-    return { entryRemovals: [], promptReportOrphanSweep: false, stateDeletePlans: [] };
+    return emptySqliteSessionEntryMaintenancePlan();
   }
 
   const db = getSessionKysely(database.db);
@@ -306,14 +319,26 @@ export function applySqliteSessionEntryMaintenance(
       preserveKeys,
     });
   }
-  if (mayExceedDiskBudget) {
-    enforceSqliteSessionDiskBudgetInStore({
-      database,
-      store,
-      maintenance,
-      preserveKeys,
-      onRemoveEntry: rememberRemovedEntry,
-    });
+  const diskBudget = mayExceedDiskBudget
+    ? enforceSqliteSessionDiskBudgetInStore({
+        database,
+        store,
+        maintenance,
+        preserveKeys,
+        onRemoveEntry: rememberRemovedEntry,
+      })
+    : null;
+
+  if (removedKeys.size === 0) {
+    if (params.forceMaintenance !== true) {
+      recordSettledSqliteSessionMaintenance(database, maintenance, {
+        diskBudget,
+        entryCount,
+        staleKeys,
+        store,
+      });
+    }
+    return { entryRemovals: [], promptReportOrphanSweep: true, stateDeletePlans: [] };
   }
 
   const referencedSessionIds = collectProjectedReferencedSqliteSessionIds({

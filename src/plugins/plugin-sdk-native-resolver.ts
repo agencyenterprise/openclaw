@@ -293,14 +293,42 @@ function listPluginSdkNativeAliases(
     });
 }
 
-function listInternalCorePackageNativeAliases(
-  options: InstallOpenClawPluginSdkNativeResolverOptions,
-): Array<{
+type InternalCorePackageNativeAlias = {
   request: string;
   target: string;
   parentRoots: string[];
-}> {
-  const packageRoot = resolveLoaderPackageRootFromModulePath(resolveLoaderModulePath(options));
+};
+
+// Keyed by loader module path. The package layout behind a loaded module does
+// not change while the process runs, and module loaders ask for these aliases
+// on every cached-loader lookup, so the filesystem walk runs once per module.
+const internalCorePackageNativeAliasesByModulePath = new Map<
+  string,
+  readonly InternalCorePackageNativeAlias[]
+>();
+
+function listInternalCorePackageNativeAliases(
+  options: InstallOpenClawPluginSdkNativeResolverOptions,
+): InternalCorePackageNativeAlias[] {
+  const modulePath = resolveLoaderModulePath(options);
+  const aliases = scanInternalCorePackageNativeAliases(modulePath);
+  internalCorePackageNativeAliasesByModulePath.set(modulePath, aliases);
+  return aliases;
+}
+
+function listMemoizedInternalCorePackageNativeAliases(
+  options: InstallOpenClawPluginSdkNativeResolverOptions,
+): readonly InternalCorePackageNativeAlias[] {
+  const memoized = internalCorePackageNativeAliasesByModulePath.get(
+    resolveLoaderModulePath(options),
+  );
+  return memoized ?? listInternalCorePackageNativeAliases(options);
+}
+
+function scanInternalCorePackageNativeAliases(
+  modulePath: string,
+): InternalCorePackageNativeAlias[] {
+  const packageRoot = resolveLoaderPackageRootFromModulePath(modulePath);
   const parentRoots = ["src", "scripts", "packages", "test"]
     .map((segment) => path.join(packageRoot, segment))
     .filter((candidate) => fs.existsSync(candidate))
@@ -309,11 +337,7 @@ function listInternalCorePackageNativeAliases(
     return [];
   }
 
-  const aliases: Array<{
-    request: string;
-    target: string;
-    parentRoots: string[];
-  }> = [];
+  const aliases: InternalCorePackageNativeAlias[] = [];
   const internalCorePackageAliases = [
     ...INTERNAL_CORE_PACKAGE_ALIASES,
     ...["normalization-core", "acp-core"].map((packageDir) => ({
@@ -417,7 +441,7 @@ export function installOpenClawPluginSdkNativeResolver(
 export function installOpenClawInternalCorePackageNativeResolver(
   options: Pick<InstallOpenClawPluginSdkNativeResolverOptions, "moduleUrl"> = {},
 ): string[] {
-  for (const alias of listInternalCorePackageNativeAliases(options)) {
+  for (const alias of listMemoizedInternalCorePackageNativeAliases(options)) {
     registerNativeAlias(alias);
   }
   installResolver();

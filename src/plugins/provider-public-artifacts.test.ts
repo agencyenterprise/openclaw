@@ -27,6 +27,20 @@ function writeExternalPolicyFixture(): string {
   return pluginRoot;
 }
 
+function writeBundledPolicyPlugin(
+  bundledPluginsDir: string,
+  pluginId: string,
+  providers: string[],
+): void {
+  const pluginDir = path.join(bundledPluginsDir, pluginId);
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(pluginDir, "openclaw.plugin.json"),
+    JSON.stringify({ id: pluginId, configSchema: { type: "object" }, providers }),
+  );
+  fs.writeFileSync(path.join(pluginDir, "index.js"), "export default { register() {} };\n", "utf8");
+}
+
 describe("provider public artifacts", () => {
   const originalBundledPluginsDir = process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
   const originalTrustBundledPluginsDir = process.env.OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR;
@@ -582,6 +596,192 @@ describe("provider public artifacts", () => {
           requestTransportOverrides: "none",
         },
       ],
+    });
+  });
+
+  describe("default bundled manifest scan memo", () => {
+    async function loadPolicyModuleWithScanSpy(scope: string) {
+      const bundledPluginsDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "openclaw-provider-policy-memo-"),
+      );
+      writeBundledPolicyPlugin(bundledPluginsDir, "alpha-plugin", ["alpha-provider"]);
+      writeBundledPolicyPlugin(bundledPluginsDir, "beta-plugin", ["beta-provider"]);
+      process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = bundledPluginsDir;
+      process.env.OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR = "1";
+
+      const scans: unknown[][] = [];
+      vi.doMock("./manifest-registry.js", async (importOriginal) => {
+        const actual = await importOriginal<typeof import("./manifest-registry.js")>();
+        return {
+          ...actual,
+          loadPluginManifestRegistry: (
+            ...args: Parameters<typeof actual.loadPluginManifestRegistry>
+          ) => {
+            scans.push(args);
+            return actual.loadPluginManifestRegistry(...args);
+          },
+        };
+      });
+      vi.doMock("./public-surface-loader.js", () => ({
+        loadBundledPluginPublicArtifactModuleSync: ({ dirName }: { dirName: string }) => {
+          if (!["aardvark-plugin", "alpha-plugin", "beta-plugin"].includes(dirName)) {
+            throw new Error(`Unable to resolve bundled plugin public surface ${dirName}`);
+          }
+          return { resolveThinkingProfile: () => ({ levels: [{ id: dirName }] }) };
+        },
+      }));
+
+      const policyModule = await importFreshModule<typeof import("./provider-public-artifacts.js")>(
+        import.meta.url,
+        `./provider-public-artifacts.js?scope=${scope}`,
+      );
+      const lifecycle = await import("./plugin-metadata-lifecycle.js");
+      const resolveOwnerLevel = (providerId: string) =>
+        policyModule
+          .resolveBundledProviderPolicySurface(providerId)
+          ?.resolveThinkingProfile?.({ provider: providerId, modelId: "demo" })
+          ?.levels.map((level) => level.id);
+      return { bundledPluginsDir, scans, lifecycle, resolveOwnerLevel };
+    }
+
+    it("scans bundled manifests once across repeated per-provider lookups", async () => {
+      const { bundledPluginsDir, scans, resolveOwnerLevel } =
+        await loadPolicyModuleWithScanSpy("memo-repeat");
+      try {
+        for (let pass = 0; pass < 3; pass += 1) {
+          expect(resolveOwnerLevel("alpha-provider")).toEqual(["alpha-plugin"]);
+          expect(resolveOwnerLevel("beta-provider")).toEqual(["beta-plugin"]);
+          expect(resolveOwnerLevel("unowned-provider")).toBeUndefined();
+        }
+        expect(scans).toHaveLength(1);
+      } finally {
+        fs.rmSync(bundledPluginsDir, { force: true, recursive: true });
+      }
+    });
+
+    it("rescans after the plugin metadata lifecycle clears process memos", async () => {
+      const { bundledPluginsDir, scans, lifecycle, resolveOwnerLevel } =
+        await loadPolicyModuleWithScanSpy("memo-lifecycle");
+      try {
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["alpha-plugin"]);
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["alpha-plugin"]);
+        expect(scans).toHaveLength(1);
+
+        lifecycle.clearPluginMetadataLifecycleCaches();
+
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["alpha-plugin"]);
+        expect(resolveOwnerLevel("beta-provider")).toEqual(["beta-plugin"]);
+        expect(scans).toHaveLength(2);
+      } finally {
+        fs.rmSync(bundledPluginsDir, { force: true, recursive: true });
+      }
+    });
+
+    it("rescans when a bundled plugin directory is added", async () => {
+      const { bundledPluginsDir, scans, resolveOwnerLevel } =
+        await loadPolicyModuleWithScanSpy("memo-added-plugin");
+      try {
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["alpha-plugin"]);
+        expect(scans).toHaveLength(1);
+
+        writeBundledPolicyPlugin(bundledPluginsDir, "aardvark-plugin", ["alpha-provider"]);
+
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["aardvark-plugin"]);
+        expect(scans).toHaveLength(2);
+      } finally {
+        fs.rmSync(bundledPluginsDir, { force: true, recursive: true });
+      }
+    });
+
+    it("rescans when a manifest appears in an existing bundled directory", async () => {
+      const { bundledPluginsDir, scans, resolveOwnerLevel } =
+        await loadPolicyModuleWithScanSpy("memo-repaired-manifest");
+      try {
+        fs.mkdirSync(path.join(bundledPluginsDir, "aardvark-plugin"));
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["alpha-plugin"]);
+        expect(scans).toHaveLength(1);
+
+        writeBundledPolicyPlugin(bundledPluginsDir, "aardvark-plugin", ["alpha-provider"]);
+
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["aardvark-plugin"]);
+        expect(scans).toHaveLength(2);
+      } finally {
+        fs.rmSync(bundledPluginsDir, { force: true, recursive: true });
+      }
+    });
+
+    it("rescans when a bundled plugin is removed", async () => {
+      const { bundledPluginsDir, scans, resolveOwnerLevel } =
+        await loadPolicyModuleWithScanSpy("memo-removed-plugin");
+      try {
+        expect(resolveOwnerLevel("beta-provider")).toEqual(["beta-plugin"]);
+        fs.rmSync(path.join(bundledPluginsDir, "beta-plugin"), { recursive: true });
+
+        expect(resolveOwnerLevel("beta-provider")).toBeUndefined();
+        expect(scans).toHaveLength(2);
+      } finally {
+        fs.rmSync(bundledPluginsDir, { force: true, recursive: true });
+      }
+    });
+
+    it("rescans after an installed plugin index write", async () => {
+      const { bundledPluginsDir, scans, resolveOwnerLevel } =
+        await loadPolicyModuleWithScanSpy("memo-index-write");
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-provider-policy-index-"));
+      const { writePersistedInstalledPluginIndexSync } =
+        await import("./installed-plugin-index-store.js");
+      const { closeOpenClawStateDatabaseForTest } = await import("../state/openclaw-state-db.js");
+      try {
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["alpha-plugin"]);
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["alpha-plugin"]);
+        expect(scans).toHaveLength(1);
+
+        writePersistedInstalledPluginIndexSync(
+          {
+            version: 1,
+            hostContractVersion: "test",
+            compatRegistryVersion: "test",
+            migrationVersion: 1,
+            policyHash: "test",
+            generatedAtMs: 0,
+            installRecords: {},
+            plugins: [],
+            diagnostics: [],
+          },
+          { stateDir },
+        );
+
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["alpha-plugin"]);
+        expect(scans).toHaveLength(2);
+      } finally {
+        closeOpenClawStateDatabaseForTest();
+        fs.rmSync(stateDir, { force: true, recursive: true });
+        fs.rmSync(bundledPluginsDir, { force: true, recursive: true });
+      }
+    });
+
+    it("rescans when discovery-relevant env changes", async () => {
+      const { bundledPluginsDir, scans, resolveOwnerLevel } =
+        await loadPolicyModuleWithScanSpy("memo-env");
+      const originalStateDir = process.env.OPENCLAW_STATE_DIR;
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-provider-policy-state-"));
+      try {
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["alpha-plugin"]);
+        expect(scans).toHaveLength(1);
+
+        process.env.OPENCLAW_STATE_DIR = stateDir;
+
+        expect(resolveOwnerLevel("alpha-provider")).toEqual(["alpha-plugin"]);
+        expect(scans).toHaveLength(2);
+      } finally {
+        if (originalStateDir === undefined) {
+          delete process.env.OPENCLAW_STATE_DIR;
+        } else {
+          process.env.OPENCLAW_STATE_DIR = originalStateDir;
+        }
+        fs.rmSync(stateDir, { force: true, recursive: true });
+        fs.rmSync(bundledPluginsDir, { force: true, recursive: true });
+      }
     });
   });
 });

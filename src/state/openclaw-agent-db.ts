@@ -1,5 +1,5 @@
 // OpenClaw agent database stores agent-scoped persisted runtime state.
-import { chmodSync, existsSync, lstatSync, mkdirSync, statSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, statSync, type BigIntStats } from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
@@ -147,6 +147,8 @@ type OpenClawAgentMetadataDatabase = Pick<OpenClawAgentKyselyDatabase, "schema_m
 type OpenClawAgentRegistryDatabase = Pick<OpenClawStateKyselyDatabase, "agent_databases">;
 
 const cachedDatabases = new Map<string, OpenClawAgentDatabase>();
+/** Resolved path -> identity of the file whose last full integrity check in this process passed. */
+const verifiedAgentDatabaseIdentities = new Map<string, string>();
 
 type ExistingSchemaMeta = {
   agentId: string | null;
@@ -974,9 +976,87 @@ function assertAgentDatabaseIntegrityBeforeMutation(
   pathname: string,
 ): void {
   database.exec(`PRAGMA busy_timeout = ${OPENCLAW_SQLITE_BUSY_TIMEOUT_MS};`);
+  const resolvedPath = path.resolve(pathname);
+  const identityBeforeCheck = readSqliteFileIdentity(resolvedPath);
   // Writable open permits interrupted journal recovery. Schema and connection
   // setup must wait until full table/index consistency is proven afterward.
+  // In WAL mode a crashed writer leaves only uncommitted frames that readers
+  // ignore, and the wal-index stays valid while this process's cached writer
+  // holds the same verified file open. Extra connections then skip the full
+  // check, which reads every page and blocks for seconds on multi-GB files.
+  if (
+    identityBeforeCheck !== undefined &&
+    isOpenClawAgentDatabaseOpen(resolvedPath) &&
+    verifiedAgentDatabaseIdentities.get(resolvedPath) === identityBeforeCheck &&
+    readSqliteJournalMode(database) === "wal"
+  ) {
+    return;
+  }
   assertSqliteIntegrity(database, pathname);
+  if (
+    identityBeforeCheck !== undefined &&
+    readSqliteFileIdentity(resolvedPath) === identityBeforeCheck
+  ) {
+    verifiedAgentDatabaseIdentities.set(resolvedPath, identityBeforeCheck);
+  }
+}
+
+function readSqliteJournalMode(database: DatabaseSync): string {
+  const row = database.prepare("PRAGMA journal_mode;").get() as
+    | { journal_mode?: unknown }
+    | undefined;
+  return String(row?.journal_mode ?? "").toLowerCase();
+}
+
+/**
+ * Identify one physical database file. Birth time guards against inode reuse
+ * after delete-and-recreate; without it the file cannot be identified safely.
+ */
+function readSqliteFileIdentity(pathname: string): string | undefined {
+  let stat: BigIntStats;
+  try {
+    stat = statSync(pathname, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+  if (stat.birthtimeNs === 0n) {
+    return undefined;
+  }
+  return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
+}
+
+/**
+ * Open a read-only connection for an off-thread reader in a process whose
+ * writable connection owns integrity checks, migrations and WAL maintenance.
+ */
+export function openOpenClawAgentDatabaseReader(
+  options: OpenClawAgentDatabaseOptions,
+): DatabaseSync {
+  const agentId = normalizeAgentId(options.agentId);
+  const pathname = resolveOpenClawAgentSqlitePath({ ...options, agentId });
+  const sqlite = requireNodeSqlite();
+  const db = new sqlite.DatabaseSync(pathname, { readOnly: true });
+  try {
+    db.exec(`PRAGMA busy_timeout = ${OPENCLAW_SQLITE_BUSY_TIMEOUT_MS};`);
+    const metadata = readExistingSchemaMeta(db);
+    if (!metadata) {
+      throw new Error(`OpenClaw agent database ${pathname} has no schema ownership metadata.`);
+    }
+    assertExistingSchemaOwner(metadata, agentId, pathname);
+    const userVersion = readSqliteUserVersion(db);
+    if (userVersion !== OPENCLAW_AGENT_SCHEMA_VERSION) {
+      throw new Error(
+        `OpenClaw agent database ${pathname} uses schema version ${userVersion}; readers require ${OPENCLAW_AGENT_SCHEMA_VERSION}.`,
+      );
+    }
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 }
 
 /** Open or return a cached per-agent database after schema and owner validation. */
@@ -997,6 +1077,7 @@ export function openOpenClawAgentDatabase(
   }
   if (cached) {
     // A closed handle can leave Kysely and WAL helpers cached; clear both before reopening.
+    verifiedAgentDatabaseIdentities.delete(pathname);
     cached.walMaintenance.close();
     clearNodeSqliteKyselyCacheForDatabase(cached.db);
     cachedDatabases.delete(pathname);
@@ -1120,6 +1201,7 @@ export function runOpenClawAgentWriteTransaction<T>(
 let unregisterExitClose: (() => void) | null = null;
 
 function closeCachedOpenClawAgentDatabase(database: OpenClawAgentDatabase): void {
+  verifiedAgentDatabaseIdentities.delete(database.path);
   database.walMaintenance.close();
   clearNodeSqliteKyselyCacheForDatabase(database.db);
   if (database.db.isOpen) {

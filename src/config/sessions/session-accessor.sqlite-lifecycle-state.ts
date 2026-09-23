@@ -215,6 +215,10 @@ export function deleteMaterializedSqliteSessionStatePlans(
   database: OpenClawAgentDatabase,
   plans: readonly MaterializedSqliteSessionStateDeletePlan[],
 ): SessionLifecycleArchivedTranscript[] {
+  if (plans.length === 0) {
+    // Revalidation parses every entry; with nothing to delete it only blocks.
+    return [];
+  }
   const archivedTranscripts: SessionLifecycleArchivedTranscript[] = [];
   const referencedSessionIds = readReferencedSqliteSessionIds(database);
   for (const plan of plans) {

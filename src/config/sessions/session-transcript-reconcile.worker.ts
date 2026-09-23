@@ -1,9 +1,8 @@
 /** Worker entrypoint for transcript parsing and active-branch resolution only. */
+import type { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
-import {
-  closeOpenClawAgentDatabaseByPath,
-  openOpenClawAgentDatabase,
-} from "../../state/openclaw-agent-db.js";
+import { clearNodeSqliteKyselyCacheForDatabase } from "../../infra/kysely-sync.js";
+import { openOpenClawAgentDatabaseReader } from "../../state/openclaw-agent-db.js";
 import { listSessionsNeedingTranscriptIndexReconcile } from "./session-transcript-index.js";
 import {
   prepareSessionTranscriptProjection,
@@ -169,17 +168,20 @@ async function streamPreparedProjection(plan: PreparedSessionTranscriptProjectio
 }
 
 async function run(): Promise<void> {
+  let db: DatabaseSync | undefined;
   try {
-    const database = openOpenClawAgentDatabase({
+    // The parent thread owns the writable connection, its integrity checks and
+    // migrations; this worker only reads snapshots and streams plans back.
+    db = openOpenClawAgentDatabaseReader({
       agentId: reconcileInput.agentId,
       path: reconcileInput.path,
     });
     const sessionIds = orderSessionIds(
-      listSessionsNeedingTranscriptIndexReconcile(database.db),
+      listSessionsNeedingTranscriptIndexReconcile(db),
       reconcileInput.preferredSessionId,
     );
     for (const sessionId of sessionIds) {
-      const plan = prepareSessionTranscriptProjection(database.db, sessionId);
+      const plan = prepareSessionTranscriptProjection(db, sessionId);
       if (plan) {
         await streamPreparedProjection(plan);
       }
@@ -191,8 +193,14 @@ async function run(): Promise<void> {
       error: error instanceof Error ? error.message : String(error),
     } satisfies SessionTranscriptReconcileWorkerMessage);
   } finally {
-    closeOpenClawAgentDatabaseByPath(reconcileInput.path);
-    port.close();
+    try {
+      if (db) {
+        clearNodeSqliteKyselyCacheForDatabase(db);
+        db.close();
+      }
+    } finally {
+      port.close();
+    }
   }
 }
 

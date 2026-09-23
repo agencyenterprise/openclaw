@@ -114,18 +114,57 @@ export function isInstalledPluginEnabled(
   config?: OpenClawConfig,
 ): boolean {
   const record = getInstalledPluginRecord(index, pluginId);
-  if (!record) {
-    return false;
+  return record
+    ? isInstalledPluginRecordEnabled(record, resolvePluginsConfigContext(config))
+    : false;
+}
+
+/**
+ * Builds an enablement predicate for checking many plugins against one index and config.
+ * Record lookup and plugin config normalization run once instead of once per plugin.
+ * The predicate snapshots the index records and config at creation; build a new one
+ * after mutating either.
+ */
+export function createInstalledPluginEnabledLookup(
+  index: InstalledPluginIndex,
+  config?: OpenClawConfig,
+): (pluginId: string) => boolean {
+  const recordsById = new Map<string, InstalledPluginIndexRecord>();
+  for (const record of index.plugins) {
+    if (!recordsById.has(record.pluginId)) {
+      recordsById.set(record.pluginId, record);
+    }
   }
-  if (!config) {
+  const configContext = resolvePluginsConfigContext(config);
+  return (pluginId) => {
+    const record = recordsById.get(pluginId);
+    return record ? isInstalledPluginRecordEnabled(record, configContext) : false;
+  };
+}
+
+type PluginsConfigContext = {
+  rootConfig: OpenClawConfig;
+  normalizedConfig: ReturnType<typeof normalizePluginsConfig>;
+};
+
+function resolvePluginsConfigContext(config?: OpenClawConfig): PluginsConfigContext | undefined {
+  return config
+    ? { rootConfig: config, normalizedConfig: normalizePluginsConfig(config.plugins) }
+    : undefined;
+}
+
+function isInstalledPluginRecordEnabled(
+  record: InstalledPluginIndexRecord,
+  configContext: PluginsConfigContext | undefined,
+): boolean {
+  if (!configContext) {
     return record.enabled;
   }
-  const normalizedConfig = normalizePluginsConfig(config?.plugins);
   const state = resolveEffectivePluginActivationState({
     id: record.pluginId,
     origin: record.origin,
-    config: normalizedConfig,
-    rootConfig: config,
+    config: configContext.normalizedConfig,
+    rootConfig: configContext.rootConfig,
     enabledByDefault: isPluginEnabledByDefaultForPlatform(record),
   });
   return state.enabled && (record.enabled || state.explicitlyEnabled);

@@ -240,22 +240,60 @@ function resolveMemoryEmbeddingProviderRequirement(params: {
   };
 }
 
-function resolveMemoryIndexManagerCacheKey(params: {
+/** Shape of resolveMemoryCoreLocalServiceHostIdentity output: "none" or a numeric id. */
+const LOCAL_SERVICE_HOST_IDENTITY_PATTERN = /^(?:none|\d+)$/u;
+
+type MemoryIndexManagerCacheKeyParams = {
   agentId: string;
   workspaceDir: string;
   settings: ResolvedMemorySearchConfig;
   providerRequirement: MemoryEmbeddingProviderRequirement;
   purpose: MemoryIndexManagerPurpose;
   acquireLocalService?: MemoryCoreAcquireLocalService;
-}): string {
+};
+
+function resolveMemoryIndexManagerCacheKeyPrefix(params: MemoryIndexManagerCacheKeyParams): string {
   return [
     params.agentId,
     params.workspaceDir,
     JSON.stringify(params.settings),
     JSON.stringify(params.providerRequirement),
+  ].join(":");
+}
+
+function resolveMemoryIndexManagerCacheKey(params: MemoryIndexManagerCacheKeyParams): string {
+  return [
+    resolveMemoryIndexManagerCacheKeyPrefix(params),
     resolveMemoryCoreLocalServiceHostIdentity(params.acquireLocalService),
     params.purpose,
   ].join(":");
+}
+
+/**
+ * A caller without a local-service host needs nothing a hosted manager lacks,
+ * so it reuses any cached manager that differs only by host. Keying such
+ * callers separately made them evict and reopen the shared manager each turn.
+ */
+async function findCachedManagerForHostlessCaller(
+  params: MemoryIndexManagerCacheKeyParams,
+): Promise<MemoryIndexManager | undefined> {
+  const prefix = `${resolveMemoryIndexManagerCacheKeyPrefix(params)}:`;
+  const suffix = `:${params.purpose}`;
+  const differsOnlyByHost = (key: string) =>
+    key.startsWith(prefix) &&
+    key.endsWith(suffix) &&
+    LOCAL_SERVICE_HOST_IDENTITY_PATTERN.test(key.slice(prefix.length, key.length - suffix.length));
+  for (const [key, manager] of INDEX_CACHE) {
+    if (differsOnlyByHost(key)) {
+      return manager;
+    }
+  }
+  for (const [key, pending] of INDEX_CACHE_PENDING) {
+    if (differsOnlyByHost(key)) {
+      return await pending;
+    }
+  }
+  return undefined;
 }
 
 function isMemoryIndexManagerCacheKeyInScope(
@@ -408,15 +446,22 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       agentId,
       settings,
     });
-    const key = resolveMemoryIndexManagerCacheKey({
+    const keyParams: MemoryIndexManagerCacheKeyParams = {
       agentId,
       workspaceDir,
       settings,
       providerRequirement,
       purpose,
       acquireLocalService: params.acquireLocalService,
-    });
+    };
+    const key = resolveMemoryIndexManagerCacheKey(keyParams);
     const transient = purpose === "status" || purpose === "cli";
+    if (!transient && !params.acquireLocalService) {
+      const hostedManager = await findCachedManagerForHostlessCaller(keyParams);
+      if (hostedManager) {
+        return hostedManager;
+      }
+    }
     if (!transient) {
       await closeMemoryIndexManagersForScope({
         agentId,

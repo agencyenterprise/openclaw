@@ -1639,6 +1639,47 @@ describe("memory index", () => {
     expect(Object.is(secondAgain, second)).toBe(true);
   });
 
+  it("serves hostless callers from the hosted manager instead of reopening it", async () => {
+    const cfg = createCfg({});
+    const acquireLocalService = vi.fn(async () => undefined);
+    const hosted = requireManager(
+      await getMemorySearchManager({ cfg, agentId: "main", acquireLocalService }),
+    );
+    managersForCleanup.add(hosted);
+
+    const hostless = requireManager(await getMemorySearchManager({ cfg, agentId: "main" }));
+    managersForCleanup.add(hostless);
+    const hostedAgain = requireManager(
+      await getMemorySearchManager({ cfg, agentId: "main", acquireLocalService }),
+    );
+    managersForCleanup.add(hostedAgain);
+
+    expect(Object.is(hostless, hosted)).toBe(true);
+    expect(Object.is(hostedAgain, hosted)).toBe(true);
+  });
+
+  it("stops alternating reopens after one hosted open when hostless opens first", async () => {
+    const cfg = createCfg({});
+    const acquireLocalService = vi.fn(async () => undefined);
+    const hostlessFirst = requireManager(await getMemorySearchManager({ cfg, agentId: "main" }));
+    managersForCleanup.add(hostlessFirst);
+    const hosted = requireManager(
+      await getMemorySearchManager({ cfg, agentId: "main", acquireLocalService }),
+    );
+    managersForCleanup.add(hosted);
+
+    const turns = [];
+    for (let turn = 0; turn < 3; turn += 1) {
+      turns.push(requireManager(await getMemorySearchManager({ cfg, agentId: "main" })));
+      turns.push(
+        requireManager(await getMemorySearchManager({ cfg, agentId: "main", acquireLocalService })),
+      );
+    }
+
+    expect(Object.is(hosted, hostlessFirst)).toBe(false);
+    expect(turns.every((manager) => Object.is(manager, hosted))).toBe(true);
+  });
+
   it("retries embedding provider close before releasing the manager", async () => {
     providerCloseFailuresRemaining = 1;
     const cfg = createCfg({

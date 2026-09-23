@@ -174,7 +174,8 @@ export function normalizeResolvedMaintenanceConfigInput(
   };
 }
 
-function resolveSessionEntryMaintenanceHighWater(maxEntries: number): number {
+/** Entry count at which batched (non-forced) maintenance caps the store back to `maxEntries`. */
+export function resolveSessionEntryMaintenanceHighWater(maxEntries: number): number {
   if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
     return 1;
   }
@@ -316,6 +317,27 @@ export function pruneStaleModelRunEntries(
     });
   }
   return pruned;
+}
+
+/**
+ * Earliest time `pruneStaleEntries` or `pruneStaleModelRunEntries` could remove
+ * this entry, or `undefined` when it never ages out (no `updatedAt`).
+ * Preservation is the caller's concern; this only mirrors the age rules.
+ */
+export function resolveSessionEntryPruneAtMs(params: {
+  key: string;
+  entry: SessionEntry;
+  pruneAfterMs: number;
+  modelRunPruneAfterMs: number | null;
+}): number | undefined {
+  if (params.entry.updatedAt == null) {
+    return undefined;
+  }
+  const maxAgeMs =
+    params.modelRunPruneAfterMs != null && isGatewayModelRunSessionKey(params.key)
+      ? Math.min(params.pruneAfterMs, params.modelRunPruneAfterMs)
+      : params.pruneAfterMs;
+  return params.entry.updatedAt + maxAgeMs;
 }
 
 const DEFAULT_QUOTA_SUSPENSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
