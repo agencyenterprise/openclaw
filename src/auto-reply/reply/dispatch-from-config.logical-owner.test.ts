@@ -74,7 +74,7 @@ it.each([false,true])("higher owner waits for actual received-hook settlement (r
     attempts++;expect(db.prepare("SELECT count(*) AS n FROM thread_dispatch_claims WHERE kind='native'").get()?.n).toBe(1);
     if(attempts===1)throw new FailoverError("fixture rate limited before provider effect",{reason:"rate_limit",provider:"openai",model:"gpt-4.1-mini"});
     return "fixture final";
-  }})!});
+  },refused:()=>"refused"})!});
   expect(attempts).toBe(2);
   complete(dispatchHash("actual nested final observer"));entered();return {text:"final"};
  }}));

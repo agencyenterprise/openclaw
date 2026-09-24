@@ -194,12 +194,15 @@ it("V3 keeps one logical owner across actual embedded fallback attempts with the
   const { runWithModelFallback } = await import("../model-fallback.js");
   const { FailoverError } = await import("../failover-error.js");
   const { makeModelFallbackCfg } = await import("../test-helpers/model-fallback-config-fixture.js");
+  const { beginNativeCleanupAttempt } = await import("./native-cleanup-proof.js");
   let calls = 0;
   let lateChild: (() => void) | undefined;
   runEmbeddedAgentViaCliBackendIfEligible.mockImplementation(async () => {
     calls++;
     expect(db.prepare("SELECT count(*) AS n FROM thread_dispatch_claims WHERE kind='native'").get()?.n).toBe(1);
     if (calls === 1) throw new FailoverError("fixture rate limited before effect", { reason: "rate_limit", provider: "openai", model: "gpt-4.1-mini" });
+    // Stands in for the native embedded attempt, which verifies its own cleanup.
+    beginNativeCleanupAttempt()(true);
     return dispatchResult;
   });
   try {

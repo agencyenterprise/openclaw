@@ -88,3 +88,13 @@ export { loadDispatchConfig } from "../state/thread-dispatch.js";
 export { createChannelIngressQueue } from "../channels/message/ingress-queue.js";
 
 export { withNativeControlProbe } from "../state/thread-dispatch.js";
+
+export {
+  beginLogicalDispatchEffect,
+  markLogicalDispatchAccountingUnavailable,
+} from "../state/thread-dispatch.js";
+export type {
+  LogicalEffectHandle,
+  LogicalEffectOutcome,
+  LogicalEffectReport,
+} from "../state/thread-dispatch.js";

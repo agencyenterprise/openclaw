@@ -34,7 +34,7 @@ function setup() {
   return db;
 }
 const key = "agent:main:main";
-it("host dispatch rejects session mismatch and late continuation", async () => {
+it("host dispatch rejects session mismatch and refuses a late continuation without running it", async () => {
   const db = setup();
   let late: (() => Promise<unknown>) | undefined;
   let release!: () => void;
@@ -59,6 +59,7 @@ it("host dispatch rejects session mismatch and late continuation", async () => {
           run: async () => {
             throw new Error("late effect ran");
           },
+          refused: () => "refused",
         }),
       );
       return withLogicalReplyDispatch({
@@ -72,7 +73,7 @@ it("host dispatch rejects session mismatch and late continuation", async () => {
     },
   });
   release();
-  await expect(pending).rejects.toThrow("THREAD_DISPATCH_REFUSED");
+  await expect(pending).resolves.toBe("refused");
   expect(db.prepare("SELECT state FROM thread_dispatch_claims").get()?.state).toBe("TERMINAL");
   db.close();
 });

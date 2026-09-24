@@ -1,6 +1,9 @@
 /** Host-private cleanup evidence; never inferred from public result metadata. */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
+import { isAbortError } from "../../infra/abort-signal.js";
+import { claimNativeCleanupRecorder } from "../../state/native-cleanup-evidence.js";
+import { isTimeoutError } from "../failover-error.js";
 import { log } from "./logger.js";
 
 type Attempt = { closed: boolean; verified: boolean };
@@ -9,6 +12,8 @@ const contexts = new AsyncLocalStorage<Context>();
 const activeIdentities = new Set<string>();
 const completedErrors = new WeakMap<object, { identity: string; receipt: string }>();
 const completedResults = new WeakMap<object, { identity: string; receipt: string }>();
+// Held only here: the capability to vouch for a run's ended cleanup to thread dispatch.
+const recordNativeCleanup = claimNativeCleanupRecorder();
 
 /** Opaque short id for correlating one tracked run across log lines. */
 export function nativeOwnerLogId(identity: string): string {
@@ -91,6 +96,37 @@ export function beginNativeCleanupAttempt(): (verified: boolean) => void {
   };
 }
 
+function everyCleanupVerified(context: Context): boolean {
+  return !context.invalid && [...context.attempts].every((a) => a.closed && a.verified);
+}
+
+function cleanupReceipt(kind: string, context: Context): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ kind, identity: context.identity, attempts: context.attempts.size }))
+    .digest("hex");
+}
+
+/** Vouches to thread dispatch that the run returning or throwing `outcome` has ended. */
+function recordEndedRun(outcome: object, identity: string, receipt: string): void {
+  if (recordNativeCleanup) {
+    recordNativeCleanup(outcome, identity, receipt);
+  } else {
+    log.error(
+      `native cleanup recorder was claimed elsewhere; run carries no ended-run proof: owner=${nativeOwnerLogId(identity)}`,
+    );
+  }
+}
+
+/**
+ * A run that threw has ended when every cleanup attempt it began was verified,
+ * including a run that threw before it began any (for example a failover error
+ * from auth or model setup). An abort or timeout interrupted it, so it does not
+ * count, and nor does a run whose tracking was invalidated (CLI-backend dispatch).
+ */
+function thrownRunEnded(error: Error, context: Context): boolean {
+  return everyCleanupVerified(context) && !isAbortError(error) && !isTimeoutError(error);
+}
+
 export async function withNativeCleanupTracking<T extends object>(
   identity: string,
   run: () => Promise<T>,
@@ -103,23 +139,11 @@ export async function withNativeCleanupTracking<T extends object>(
     context.closed = true;
     completedResults.delete(result);
     completedErrors.delete(result);
-    if (
-      !context.invalid &&
-      context.attempts.size > 0 &&
-      [...context.attempts].every((a) => a.closed && a.verified)
-    ) {
-      completedResults.set(result, {
-        identity,
-        receipt: createHash("sha256")
-          .update(
-            JSON.stringify({
-              kind: "native_cleanup_settled",
-              identity,
-              attempts: context.attempts.size,
-            }),
-          )
-          .digest("hex"),
-      });
+    recordNativeCleanup?.(result, identity, undefined);
+    if (context.attempts.size > 0 && everyCleanupVerified(context)) {
+      const receipt = cleanupReceipt("native_cleanup_settled", context);
+      completedResults.set(result, { identity, receipt });
+      recordEndedRun(result, identity, receipt);
     }
     return result;
   } catch (error) {
@@ -127,25 +151,16 @@ export async function withNativeCleanupTracking<T extends object>(
     if (error instanceof Error) {
       completedErrors.delete(error);
       completedResults.delete(error);
-    }
-    if (
-      error instanceof Error &&
-      !context.invalid &&
-      context.attempts.size > 0 &&
-      [...context.attempts].every((a) => a.closed && a.verified)
-    ) {
-      completedErrors.set(error, {
-        identity,
-        receipt: createHash("sha256")
-          .update(
-            JSON.stringify({
-              kind: "native_failed_cleanup_settled",
-              identity,
-              attempts: context.attempts.size,
-            }),
-          )
-          .digest("hex"),
-      });
+      recordNativeCleanup?.(error, identity, undefined);
+      if (context.attempts.size > 0 && everyCleanupVerified(context)) {
+        completedErrors.set(error, {
+          identity,
+          receipt: cleanupReceipt("native_failed_cleanup_settled", context),
+        });
+      }
+      if (thrownRunEnded(error, context)) {
+        recordEndedRun(error, identity, cleanupReceipt("native_thrown_run_ended", context));
+      }
     }
     throw error;
   } finally {
@@ -157,37 +172,51 @@ export async function withNativeCleanupTracking<T extends object>(
   }
 }
 
-export function readNativeFailedCleanupReceipt(
+type RunMetaView = {
+  aborted?: boolean;
+  yielded?: boolean;
+  pendingToolCalls?: unknown[];
+  stopReason?: string;
+  timeoutPhase?: unknown;
+  error?: unknown;
+};
+
+/** The settled-cleanup proof of a returned, non-handoff run, with its public meta. */
+function readSettledRunProof(
   result: object,
   identity: string,
-): string | undefined {
+): { receipt: string; meta: RunMetaView } | undefined {
   const proof = completedResults.get(result);
-  const meta = (
-    result as {
-      meta?: {
-        aborted?: boolean;
-        yielded?: boolean;
-        pendingToolCalls?: unknown[];
-        stopReason?: string;
-        error?: unknown;
-      };
-    }
-  ).meta;
+  const meta = (result as { meta?: RunMetaView }).meta;
   if (
     !proof ||
     proof.identity !== identity ||
     !meta ||
     meta.yielded ||
     meta.pendingToolCalls?.length
-  )
+  ) {
     return undefined;
+  }
+  return { receipt: proof.receipt, meta };
+}
+
+export function readNativeFailedCleanupReceipt(
+  result: object,
+  identity: string,
+): string | undefined {
+  const settled = readSettledRunProof(result, identity);
+  if (!settled) {
+    return undefined;
+  }
+  const { meta } = settled;
   if (
     !meta.aborted &&
     !meta.error &&
     !["aborted", "timeout", "error", "restart", "rpc"].includes(meta.stopReason ?? "")
-  )
+  ) {
     return undefined;
-  return proof.receipt;
+  }
+  return settled.receipt;
 }
 
 export function readNativeThrownCleanupReceipt(

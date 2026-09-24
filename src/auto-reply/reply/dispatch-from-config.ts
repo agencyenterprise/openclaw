@@ -319,6 +319,11 @@ export async function dispatchReplyFromConfig(
           prompt: params.ctx.RawBody ?? params.ctx.CommandBody ?? params.ctx.Body ?? "",
           abortSignal: params.replyOptions?.abortSignal,
           run,
+          // A nested dispatch that arrives after its host turn settled runs nothing.
+          refused: () => {
+            messageAuditTerminal?.note("skipped", { reason: "logical_turn_settled" });
+            return { queuedFinal: false, counts: params.dispatcher.getQueuedCounts() };
+          },
         });
     if (controlProbe) completeNativeControlProbe();
     messageAuditTerminal?.finishSuccess(result);

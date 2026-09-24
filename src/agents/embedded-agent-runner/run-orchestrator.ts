@@ -26,7 +26,7 @@ import {
   dispatchHash,
   loadDispatchConfig,
   hasLogicalDispatchOwner,
-  runLogicalDispatchAttempt,
+  runLogicalNativeAttempt,
   withThreadDispatch,
 } from "../../state/thread-dispatch.js";
 import { resolveUserPath } from "../../utils.js";
@@ -47,8 +47,8 @@ import { runEmbeddedAgentViaCliBackendIfEligible } from "./cli-backend-dispatch.
 import { waitForDeferredTurnMaintenanceForSession } from "./context-engine-maintenance.js";
 import { resolveGlobalLane, resolveSessionLane } from "./lanes.js";
 import { log } from "./logger.js";
-import { readNativeThrownCleanupReceipt } from "./native-cleanup-proof.js";
 import {
+  readNativeThrownCleanupReceipt,
   withNativeCleanupTracking,
   readNativeFailedCleanupReceipt,
 } from "./native-cleanup-proof.js";
@@ -69,6 +69,11 @@ import { createRecoveryMessageActionTurnCapability } from "./run/recovery-messag
 import { resolveInitialEmbeddedRunModel } from "./run/runtime-resolution.js";
 import { assertAgentHarnessRunAdmission, backfillSessionKey } from "./run/session-bootstrap.js";
 import type { EmbeddedAgentRunResult } from "./types.js";
+
+/** A native run refused because its logical turn was already settled: nothing ran, nothing to deliver. */
+function refusedAfterTurnSettled(): EmbeddedAgentRunResult {
+  return { payloads: [], meta: { durationMs: 0, aborted: true, livenessState: "abandoned" } };
+}
 
 export function runEmbeddedAgent(
   paramsInput: RunEmbeddedAgentParams,
@@ -137,7 +142,7 @@ export function runEmbeddedAgent(
   }
   if (hasLogicalDispatchOwner()) {
     // Inherited authority must be checked even if mutable host opt-in changed.
-    return runLogicalDispatchAttempt({
+    return runLogicalNativeAttempt({
       sessionKey: backfillSessionKey({
         config,
         sessionId: internalParamsInput.sessionId,
@@ -145,6 +150,8 @@ export function runEmbeddedAgent(
         agentId: internalParamsInput.agentId,
       }),
       run: runTracked,
+      cleanupIdentity,
+      refused: refusedAfterTurnSettled,
     })!;
   }
   const dispatchConfig = loadDispatchConfig();

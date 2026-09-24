@@ -19,6 +19,7 @@ import {
   runWithAgentRingZeroTools,
 } from "../agent-tools.ring-zero-context.js";
 import { resolveConversationCapabilityProfile } from "../conversation-capability-profile.js";
+import { beginNativeCleanupAttempt } from "../embedded-agent-runner/native-cleanup-proof.js";
 import type {
   EmbeddedRunAttemptParams,
   EmbeddedRunAttemptResult,
@@ -503,7 +504,9 @@ export async function runAgentHarnessAttempt(
   }
 
   try {
-    return await runWithDiagnosticTraceContext(harnessTrace, runAttempt);
+    return await runPluginHarnessCleanupAttempt(() =>
+      runWithDiagnosticTraceContext(harnessTrace, runAttempt),
+    );
   } catch (error) {
     log.warn(`${harness.label} failed; not falling back to embedded OpenClaw backend`, {
       harnessId: harness.id,
@@ -512,6 +515,37 @@ export async function runAgentHarnessAttempt(
       error: formatErrorMessage(error),
     });
     throw error;
+  }
+}
+
+/**
+ * The embedded OpenClaw attempt verifies its own cleanup; a plugin harness runs
+ * outside it, so its attempt counts as cleaned up when the harness returned it
+ * ended on its own: not aborted and not timed out. A throw leaves it unverified.
+ */
+function pluginHarnessAttemptEnded(result: EmbeddedRunAttemptResult): boolean {
+  return !(
+    result.aborted ||
+    result.externalAbort ||
+    result.timedOut ||
+    result.idleTimedOut ||
+    result.timedOutDuringCompaction ||
+    result.timedOutDuringToolExecution ||
+    result.timedOutByRunBudget
+  );
+}
+
+async function runPluginHarnessCleanupAttempt(
+  run: () => Promise<EmbeddedRunAttemptResult>,
+): Promise<EmbeddedRunAttemptResult> {
+  const finish = beginNativeCleanupAttempt();
+  let verified = false;
+  try {
+    const result = await run();
+    verified = pluginHarnessAttemptEnded(result);
+    return result;
+  } finally {
+    finish(verified);
   }
 }
 

@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { emitAgentEvent } from "../../infra/agent-events.js";
+import { readThrownCleanupProof } from "../../state/native-cleanup-evidence.js";
+import { FailoverError } from "../failover-error.js";
 import { resolveEmbeddedCliBackendDispatchEligibility } from "./cli-backend-dispatch-eligibility.js";
 import { runEmbeddedAgentViaCliBackendIfEligible } from "./cli-backend-dispatch.js";
+import { withNativeCleanupTracking } from "./native-cleanup-proof.js";
 import type { RunEmbeddedAgentParams } from "./run/params.js";
 import type { EmbeddedAgentRunResult } from "./types.js";
 
@@ -317,6 +320,28 @@ describe("runEmbeddedAgentViaCliBackendIfEligible gate", () => {
   it("keeps the passthrough when no claude-cli backend is registered", async () => {
     resolveRuntimeCliBackends.mockReturnValue([]);
     expect(await runGate()).toBeUndefined();
+  });
+});
+
+describe("runEmbeddedAgentViaCliBackendIfEligible native cleanup proof", () => {
+  const identity = "cli-dispatch-cleanup-identity";
+  async function thrownAfterGate(overrides: Partial<RunEmbeddedAgentParams>): Promise<unknown> {
+    const failover = new FailoverError("fixture rate limited", { reason: "rate_limit" });
+    const run = withNativeCleanupTracking(identity, async () => {
+      await runEmbeddedAgentViaCliBackendIfEligible(baseRunParams(overrides));
+      throw failover;
+    });
+    await expect(run).rejects.toBe(failover);
+    return failover;
+  }
+
+  it("a dispatched CLI run cannot vouch that it ended", async () => {
+    expect(readThrownCleanupProof(await thrownAfterGate({}), identity)).toBeUndefined();
+  });
+
+  it("a run the gate keeps on the native path still can", async () => {
+    const error = await thrownAfterGate({ cliBackendDispatch: undefined });
+    expect(readThrownCleanupProof(error, identity)).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 

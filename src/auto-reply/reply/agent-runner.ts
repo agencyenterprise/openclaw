@@ -1177,6 +1177,8 @@ export async function runReplyAgent(
     sourceTurnId: readChannelSourceTurnId(params.sessionCtx),
     prompt: params.transcriptCommandBody ?? params.commandBody,
     run: (observeCompleted) => runReplyAgentInternal(params, observeCompleted),
+    // A nested reply that arrives after its turn settled runs nothing and replies nothing.
+    refused: () => undefined,
   });
 }
 

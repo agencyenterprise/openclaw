@@ -19,6 +19,7 @@ import { normalizeToolName } from "../tool-policy.js";
 import { isToolResultError } from "../tool-result-error.js";
 import { resolveEmbeddedCliBackendDispatchEligibility } from "./cli-backend-dispatch-eligibility.js";
 import { createCliDispatchTranscriptRecorder } from "./cli-backend-dispatch-transcript.js";
+import { invalidateNativeCleanupTracking } from "./native-cleanup-proof.js";
 import type { RunEmbeddedAgentParams } from "./run/params.js";
 import type { EmbeddedAgentRunResult } from "./types.js";
 
@@ -39,7 +40,12 @@ export async function runEmbeddedAgentViaCliBackendIfEligible(
   params: RunEmbeddedAgentParams,
 ): Promise<EmbeddedAgentRunResult | undefined> {
   const dispatch = resolveEmbeddedCliBackendDispatch(params);
-  return dispatch ? await runEmbeddedAgentViaCliBackend(params, dispatch) : undefined;
+  if (!dispatch) {
+    return undefined;
+  }
+  // The CLI backend runs outside the native cleanup tracker: it cannot vouch that the run ended.
+  invalidateNativeCleanupTracking();
+  return await runEmbeddedAgentViaCliBackend(params, dispatch);
 }
 
 /** Applies the opt-in and transcript-path gates on top of shared eligibility. */

@@ -23,29 +23,29 @@ it('two trusted attempts share exactly one logical claim; same source cannot rep
  const {db,args}=fixture();let effects=0;
  try{
  await withLogicalReplyDispatch({...args,run:async(done)=>{
-  for(let i=0;i<2;i++)await runLogicalDispatchAttempt({sessionKey:'session',run:async()=>{effects++;}});
+  for(let i=0;i<2;i++)await runLogicalDispatchAttempt({sessionKey:'session',run:async()=>{effects++;},refused:()=>undefined});
   done(dispatchHash('done'));return 'answer';
  }});
  expect(effects).toBe(2);expect(db.prepare('SELECT state FROM thread_dispatch_claims').all()).toEqual([{state:'TERMINAL'}]);
  await expect(withLogicalReplyDispatch({...args,run:async()=>{effects++;}})).rejects.toThrow('THREAD_DISPATCH_REFUSED');expect(effects).toBe(2);
  }finally{db.close();}
 });
-it('late inherited asynchronous context cannot launch after outer terminal',async()=>{
+it('late inherited asynchronous context is refused without launching after outer terminal',async()=>{
  const {db,args}=fixture();let release!:()=>void;const barrier=new Promise<void>(r=>release=r);let late!:Promise<unknown>;let effects=0;
  try{
  await withLogicalReplyDispatch({...args,run:async(done)=>{
-  late=(async()=>{await barrier;return runLogicalDispatchAttempt({sessionKey:'session',run:async()=>{effects++;}});})();
+  late=(async()=>{await barrier;return runLogicalDispatchAttempt({sessionKey:'session',run:async()=>{effects++;return 'ran';},refused:()=>'refused'});})();
   done(dispatchHash('done'));
  }});
- const rejected=expect(late).rejects.toThrow('THREAD_DISPATCH_REFUSED');release();await rejected;expect(effects).toBe(0);
+ release();await expect(late).resolves.toBe('refused');expect(effects).toBe(0);
  }finally{db.close();}
 });
 it('scope mismatch and drained fence reject inside otherwise valid private context',async()=>{
  const {db,args,scope}=fixture();let effects=0;
  try{await withLogicalReplyDispatch({...args,run:async()=>{
-  expect(()=>runLogicalDispatchAttempt({sessionKey:'other',run:async()=>{effects++;}})).toThrow('THREAD_DISPATCH_REFUSED');
+  expect(()=>runLogicalDispatchAttempt({sessionKey:'other',run:async()=>{effects++;},refused:()=>undefined})).toThrow('THREAD_DISPATCH_REFUSED');
   db.prepare("UPDATE thread_fences SET state='DRAINING' WHERE scope_key=?").run(scope);
-  expect(()=>runLogicalDispatchAttempt({sessionKey:'session',run:async()=>{effects++;}})).toThrow('THREAD_DISPATCH_REFUSED');
+  expect(()=>runLogicalDispatchAttempt({sessionKey:'session',run:async()=>{effects++;},refused:()=>undefined})).toThrow('THREAD_DISPATCH_REFUSED');
  }});expect(effects).toBe(0);expect(db.prepare('SELECT state FROM thread_dispatch_claims').get()).toEqual({state:'UNKNOWN'});
  }finally{db.close();}
 });
@@ -56,7 +56,7 @@ it('completion callback followed by outer failure never settles terminal',async(
  }finally{db.close();}
 });
 it('plain caller fields cannot forge inherited capability',()=>{
- const fake={sessionKey:'session',owner:{claimId:'fake'},sourceTurnId:'channel-user:v1:'+'a'.repeat(64),run:async()=>{throw new Error('must not execute');}};
+ const fake={sessionKey:'session',owner:{claimId:'fake'},sourceTurnId:'channel-user:v1:'+'a'.repeat(64),run:async()=>{throw new Error('must not execute');},refused:()=>{throw new Error('must not execute');}};
  expect(runLogicalDispatchAttempt(fake)).toBeUndefined();
 });
 it('source shape rejected before any effects; source identity cannot change replay fingerprint',async()=>{

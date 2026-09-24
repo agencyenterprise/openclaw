@@ -5,6 +5,10 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { generateSecureInt } from "../../infra/secure-random.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { SilentReplyConversationType } from "../../shared/silent-reply-policy.js";
+import {
+  beginLogicalDispatchEffect,
+  type LogicalEffectReport,
+} from "../../state/thread-dispatch.js";
 import { sleep } from "../../utils.js";
 import { copyReplyPayloadMetadata, getReplyPayloadMetadata } from "../reply-payload.js";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
@@ -55,6 +59,17 @@ type ReplyDispatchDeliverer = (
 ) => Promise<unknown>;
 
 export type { ReplyDispatchBeforeDeliver };
+
+/**
+ * Only a started delivery can have reached the channel. A started delivery that
+ * failed is judged by the transport requests it made (see LogicalEffectReport).
+ */
+function toLogicalEffectReport(outcome: ReplyDispatchDeliveryOutcome): LogicalEffectReport {
+  if (outcome === "delivered") {
+    return "completed";
+  }
+  return outcome === "failed-deliver" ? "failed" : "not_sent";
+}
 
 const DEFAULT_HUMAN_DELAY_MIN_MS = 800;
 const DEFAULT_HUMAN_DELAY_MAX_MS = 2500;
@@ -431,6 +446,7 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
       }
       return false;
     }
+    const threadDispatchEffect = beginLogicalDispatchEffect(`reply-dispatcher ${kind}`);
     queuedCounts[kind] += 1;
     pending += 1;
     const deliveryOutcomeTracker = deliveryOutcomeTrackers.get(payload);
@@ -473,7 +489,8 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
           deliverPayload = copyReplyPayloadMetadata(normalized, deliverPayload);
         }
         deliveryStarted = true;
-        await options.deliver(deliverPayload, dispatchInfo);
+        const deliver = () => options.deliver(deliverPayload, dispatchInfo);
+        await (threadDispatchEffect ? threadDispatchEffect.run(deliver) : deliver());
         deliveryOutcome = "delivered";
       })
       .catch((err: unknown) => {
@@ -485,6 +502,7 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
         const dispatchInfo = buildReplyDispatchRuntimeInfo(normalized, kind);
         deliveryOutcomeTracker?.resolve(deliveryOutcome);
         deliveryOutcomeTrackers.delete(payload);
+        threadDispatchEffect?.settle(toLogicalEffectReport(deliveryOutcome));
         try {
           options.onDeliverySettled?.(dispatchInfo);
         } catch (err: unknown) {

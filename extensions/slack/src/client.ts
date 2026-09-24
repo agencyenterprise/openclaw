@@ -8,6 +8,10 @@ import {
   resolveSlackWriteClientOptions,
   SLACK_WRITE_RETRY_OPTIONS,
 } from "./client-options.js";
+import { installSlackWriteAccounting } from "./slack-write-accounting.js";
+
+// Every WebClient, including Bolt's, sends through the patched transport.
+installSlackWriteAccounting();
 
 const SLACK_WRITE_CLIENT_CACHE_MAX = 32;
 const slackWriteClientCache = new Map<string, WebClient>();

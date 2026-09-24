@@ -14,6 +14,8 @@ vi.mock("@slack/web-api", () => {
     this.token = token;
     this.options = options;
   });
+  // client.ts wraps the real transport at import; the mock must expose it too.
+  WebClient.prototype.makeRequest = vi.fn();
   return { WebClient };
 });
 

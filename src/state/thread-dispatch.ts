@@ -5,6 +5,19 @@ import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
+import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import {
+  beginLedgerAttempt,
+  ledgerAcceptsAttempts,
+  beginLedgerEffect,
+  createLogicalTurnLedger,
+  sealLogicalTurnLedger,
+  settleLogicalTurnLedger,
+  warnLateOperation,
+  type LogicalEffectHandle,
+  type LogicalTurnLedger,
+} from "./logical-turn-ledger.js";
+import { readEndedCleanupProof, readThrownCleanupProof } from "./native-cleanup-evidence.js";
 import {
   captureNativeOwner,
   inspectNativeOwner,
@@ -557,6 +570,12 @@ export function readNativePreAdmissionRefusal(
 ): NativePreAdmissionRefusal | undefined {
   return typeof error === "object" && error !== null ? preAdmissionRefusals.get(error) : undefined;
 }
+export type {
+  LogicalEffectHandle,
+  LogicalEffectOutcome,
+  LogicalEffectReport,
+} from "./logical-turn-ledger.js";
+export { markLogicalDispatchAccountingUnavailable } from "./logical-turn-ledger.js";
 type LogicalDispatchContext = {
   owner: DispatchContext;
   sessionKey: string;
@@ -566,8 +585,14 @@ type LogicalDispatchContext = {
   observeCompleted: (receipt: string) => void;
   hooks: Promise<boolean>[];
   acceptingHooks: boolean;
+  ledger: LogicalTurnLedger;
 };
-const logicalDispatchContext = new AsyncLocalStorage<LogicalDispatchContext>();
+// Process-wide: plugins loaded through jiti get their own copy of this module, and
+// their sends must still see the owner that core opened.
+const logicalDispatchContext = resolveGlobalSingleton(
+  Symbol.for("openclaw.threadDispatch.logicalDispatchContext"),
+  () => new AsyncLocalStorage<LogicalDispatchContext>(),
+);
 export const hasLogicalDispatchOwner = (): boolean =>
   logicalDispatchContext.getStore() !== undefined;
 type LogicalReplyParams<T> = {
@@ -579,6 +604,12 @@ type LogicalReplyParams<T> = {
   abortSignal?: AbortSignal;
   timeoutMs?: number;
 };
+/**
+ * `refused`: what a nested dispatch resolves to when it arrives after its owner's
+ * turn was settled and is refused without running. Without it the refused
+ * result is `undefined`, which the overloads add to the result type.
+ */
+type RefusableLogicalReplyParams<T> = LogicalReplyParams<T> & { refused?: () => T };
 export function trackLogicalDispatchHook(task: () => Promise<unknown>): boolean {
   const logical = logicalDispatchContext.getStore();
   if (!logical || (logical.role !== "dispatch" && logical.role !== "host")) return false;
@@ -595,6 +626,16 @@ export function trackLogicalDispatchHook(task: () => Promise<unknown>): boolean 
   }
   return true;
 }
+/**
+ * Registers one channel send (`operation` names it in log lines) started inside
+ * the current logical owner. Returns the handle that records its outcome, or
+ * undefined when the send runs untracked: outside a logical owner, or after the
+ * turn's settlement was decided (logged, never thrown).
+ */
+export function beginLogicalDispatchEffect(operation: string): LogicalEffectHandle | undefined {
+  const logical = logicalDispatchContext.getStore();
+  return logical ? beginLedgerEffect(logical.ledger, operation) : undefined;
+}
 function waitLogicalHooks(hooks: Promise<boolean>[], signal?: AbortSignal): Promise<boolean[]> {
   if (!signal) return Promise.all(hooks);
   return new Promise((resolve, reject) => {
@@ -609,7 +650,13 @@ function waitLogicalHooks(hooks: Promise<boolean>[], signal?: AbortSignal): Prom
       .finally(() => signal.removeEventListener("abort", abort));
   });
 }
-export function withLogicalReplyDispatch<T>(params: LogicalReplyParams<T>): Promise<T> {
+export function withLogicalReplyDispatch<T>(
+  params: LogicalReplyParams<T> & { refused: () => T },
+): Promise<T>;
+export function withLogicalReplyDispatch<T>(params: LogicalReplyParams<T>): Promise<T | undefined>;
+export function withLogicalReplyDispatch<T>(
+  params: RefusableLogicalReplyParams<T>,
+): Promise<T | undefined> {
   const parent = logicalDispatchContext.getStore();
   if (parent) {
     if (
@@ -619,9 +666,10 @@ export function withLogicalReplyDispatch<T>(params: LogicalReplyParams<T>): Prom
     )
       refuse();
     parent.replyEntered = true;
-    return runLogicalDispatchAttempt({
+    return runLogicalDispatchAttempt<T | undefined>({
       sessionKey: params.sessionKey,
       run: () => params.run(parent.observeCompleted),
+      refused: params.refused ?? (() => undefined),
     })!;
   }
   return withLogicalOwner(params, "reply");
@@ -675,12 +723,21 @@ export function bindHostReplyDispatchSession(sessionKey: string): void {
     refuse();
   context.sessionKey = sessionKey;
 }
-export function withLogicalChannelDispatch<T>(params: LogicalReplyParams<T>): Promise<T> {
+export function withLogicalChannelDispatch<T>(
+  params: LogicalReplyParams<T> & { refused: () => T },
+): Promise<T>;
+export function withLogicalChannelDispatch<T>(
+  params: LogicalReplyParams<T>,
+): Promise<T | undefined>;
+export function withLogicalChannelDispatch<T>(
+  params: RefusableLogicalReplyParams<T>,
+): Promise<T | undefined> {
   const parent = logicalDispatchContext.getStore();
   if (parent?.role === "host") {
-    return runLogicalDispatchAttempt({
+    return runLogicalDispatchAttempt<T | undefined>({
       sessionKey: params.sessionKey,
       run: () => params.run(parent.observeCompleted),
+      refused: params.refused ?? (() => undefined),
     })!;
   }
   if (parent) refuse();
@@ -730,7 +787,12 @@ async function withLogicalOwner<T>(
           role,
           hooks: [],
           acceptingHooks: true,
+          ledger: createLogicalTurnLedger(claimId, scopeKey),
           observeCompleted: (receipt) => {
+            if (logical.ledger.sealed) {
+              warnLateOperation(logical.ledger, "completion", "ignored");
+              return;
+            }
             if (typeof receipt !== "string" || !shaPattern.test(receipt) || completedReceipt)
               refuse();
             completedReceipt = receipt;
@@ -752,10 +814,26 @@ async function withLogicalOwner<T>(
               if ((await waitLogicalHooks(batch, params.abortSignal)).some((ok) => !ok))
                 throw new Error("THREAD_DISPATCH_HOOK_FAILED");
             }
+            const settlement = await settleLogicalTurnLedger(
+              logical.ledger,
+              completedReceipt !== undefined,
+              params.abortSignal,
+            );
+            completedReceipt = settlement
+              ? (completedReceipt ??
+                dispatchHash({
+                  kind: "logical_turn_ended_settled",
+                  sourceTurnId,
+                  sessionKey,
+                  ...settlement,
+                }))
+              : undefined;
             if (params.abortSignal?.aborted) throw new Error("THREAD_DISPATCH_ABORTED");
             return result;
           } finally {
             logical.acceptingHooks = false;
+            // A throw or abort settles UNKNOWN: nothing more may start in the turn either way.
+            sealLogicalTurnLedger(logical.ledger);
           }
         });
       },
@@ -772,17 +850,70 @@ async function withLogicalOwner<T>(
   }
 }
 
+/**
+ * A nested reply or channel dispatch inside the logical owner. Once the turn's
+ * settlement has started it does not run: it is logged and resolves to
+ * `refused()`, so no detached caller sees a throw or a rejection.
+ */
 export function runLogicalDispatchAttempt<T>(params: {
   sessionKey?: string;
   run: () => Promise<T>;
+  refused: () => T;
 }): Promise<T> | undefined {
   const logical = logicalDispatchContext.getStore();
   if (!logical) return undefined;
+  if (!ledgerAcceptsAttempts(logical.ledger)) {
+    warnLateOperation(logical.ledger, "dispatch-attempt", "refused");
+    return Promise.resolve().then(params.refused);
+  }
+  admitLogicalAttempt(logical, params.sessionKey);
+  // Admission linearizes above. Drain can follow, but cannot cancel this already admitted promise.
+  return params.run();
+}
+
+/**
+ * A native run attempt inside the logical owner. When it returns or throws, the
+ * ledger reads the ended-run cleanup proof the native cleanup tracker recorded for
+ * its result or error under `cleanupIdentity`: a turn settles TERMINAL only if
+ * every attempt carries one and the last one returned. Once the turn's
+ * settlement has started the attempt does not run: it is logged and resolves to
+ * `refused()`, so the one-native-turn fence holds and no detached caller sees a
+ * throw or a rejection.
+ */
+export function runLogicalNativeAttempt<T>(params: {
+  sessionKey?: string;
+  run: () => Promise<T>;
+  cleanupIdentity: string;
+  refused: () => T;
+}): Promise<T> | undefined {
+  const logical = logicalDispatchContext.getStore();
+  if (!logical) {
+    return undefined;
+  }
+  if (!ledgerAcceptsAttempts(logical.ledger)) {
+    warnLateOperation(logical.ledger, "native-attempt", "refused");
+    return Promise.resolve().then(params.refused);
+  }
+  admitLogicalAttempt(logical, params.sessionKey);
+  const ended = beginLedgerAttempt(logical.ledger);
+  return params.run().then(
+    (result) => {
+      ended("returned", readEndedCleanupProof(result, params.cleanupIdentity));
+      return result;
+    },
+    (error: unknown) => {
+      ended("threw", readThrownCleanupProof(error, params.cleanupIdentity));
+      throw error;
+    },
+  );
+}
+
+function admitLogicalAttempt(logical: LogicalDispatchContext, sessionKey: string | undefined) {
   const { config, claim } = logical.owner;
   if (
     dispatchContext.getStore() !== logical.owner ||
-    params.sessionKey !== logical.sessionKey ||
-    resolveDispatchScope(config, params.sessionKey) !== claim.scopeKey ||
+    sessionKey !== logical.sessionKey ||
+    resolveDispatchScope(config, sessionKey) !== claim.scopeKey ||
     config.scopes[claim.scopeKey] !== claim.epoch
   )
     refuse();
@@ -806,8 +937,6 @@ export function runLogicalDispatchAttempt<T>(params: {
     )
       refuse();
   });
-  // Admission linearizes above. Drain can follow, but cannot cancel this already admitted promise.
-  return params.run();
 }
 
 // Persisted cron origin owns the logical turn; detached session keys are execution identities.

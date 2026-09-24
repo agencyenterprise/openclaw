@@ -6,8 +6,10 @@ import { OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST } from "../../context-engine/host
 import type { ContextEngine } from "../../context-engine/types.js";
 import { createOpenClawCodingTools } from "../../plugin-sdk/agent-harness.js";
 import { mintSecretSentinel } from "../../secrets/sentinel.js";
+import { readEndedCleanupProof } from "../../state/native-cleanup-evidence.js";
 import { isHostScopedAgentToolActive } from "../agent-tools.ring-zero-context.js";
 import { testing as cliBackendsTesting } from "../cli-backends.test-support.js";
+import { withNativeCleanupTracking } from "../embedded-agent-runner/native-cleanup-proof.js";
 import type {
   EmbeddedRunAttemptParams,
   EmbeddedRunAttemptResult,
@@ -2677,6 +2679,52 @@ describe("selectAgentHarness", () => {
         agentHarnessRuntimeOverride: "google-gemini-cli",
       }),
     ).toThrow('Requested agent harness "google-gemini-cli" is not registered');
+  });
+});
+
+describe("plugin harness cleanup proof", () => {
+  function registerCodexHarness(runAttempt: AgentHarness["runAttempt"]): void {
+    registerAgentHarness(
+      {
+        id: "codex",
+        label: "Codex",
+        supports: () => ({ supported: true, priority: 100 }),
+        runAttempt,
+      },
+      { ownerPluginId: "codex" },
+    );
+  }
+
+  async function proofAfterPluginAttempt(): Promise<string | undefined> {
+    const identity = "plugin-harness-run";
+    const params = createAttemptParams(providerRuntimeConfig("codex", "codex"));
+    const result = await withNativeCleanupTracking(identity, async () => {
+      await runAgentHarnessAttempt(params).catch(() => undefined);
+      return { meta: {} };
+    });
+    return readEndedCleanupProof(result, identity);
+  }
+
+  it("a plugin attempt that ended on its own carries an ended-run proof", async () => {
+    registerCodexHarness(async () => createAttemptResult("codex"));
+    expect(await proofAfterPluginAttempt()).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it.each([
+    { name: "aborted", patch: { aborted: true } },
+    { name: "timed out", patch: { timedOut: true } },
+    { name: "idle timed out", patch: { idleTimedOut: true } },
+    { name: "timed out during a tool", patch: { timedOutDuringToolExecution: true } },
+  ])("a plugin attempt that was $name carries no proof", async ({ patch }) => {
+    registerCodexHarness(async () => ({ ...createAttemptResult("codex"), ...patch }));
+    expect(await proofAfterPluginAttempt()).toBeUndefined();
+  });
+
+  it("a plugin attempt that threw carries no proof", async () => {
+    registerCodexHarness(async () => {
+      throw new Error("codex app-server lost");
+    });
+    expect(await proofAfterPluginAttempt()).toBeUndefined();
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
