@@ -1,8 +1,10 @@
 // Slack tests cover provider reconnect loop behavior.
+import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getSlackClient, getSlackTestState, resetSlackTestState } from "../monitor.test-helpers.js";
 
 const { monitorSlackProvider } = await import("./provider.js");
+const { SlackSocketAppDiscardedError } = await import("./provider-support.js");
 const slackTestState = getSlackTestState();
 
 describe("slack socket reconnect loop", () => {
@@ -105,6 +107,183 @@ describe("slack socket reconnect loop", () => {
         "last SDK log: socket-mode:socket-mode failed to retrieve WSS URL slack error: missing_scope; needed: connections:write",
       ),
     );
+  });
+
+  function emitSocketEvent(event: string, ...args: unknown[]) {
+    const listeners = (slackTestState.socketModeClient?.on.mock.calls ?? [])
+      .filter(([name]) => name === event)
+      .map(([, listener]) => listener);
+    const latest = listeners.at(-1);
+    if (!latest) {
+      throw new Error(`no ${event} listener registered`);
+    }
+    latest(...args);
+  }
+
+  it("reconnects itself after the connected socket closes", async () => {
+    const controller = new AbortController();
+    const log = vi.fn();
+    const run = monitorSlackProvider({
+      botToken: "bot-token",
+      appToken: "app-token",
+      abortSignal: controller.signal,
+      config: slackTestState.config,
+      runtime: { log, error: vi.fn(), exit: vi.fn() },
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(slackTestState.appStartMock).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith("slack socket mode connected");
+
+    emitSocketEvent("disconnected");
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(slackTestState.appStopMock).toHaveBeenCalledTimes(1);
+    expect(slackTestState.appStartMock).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("slack socket disconnected (disconnect); reconnecting in"),
+    );
+    expect(log).toHaveBeenCalledWith("slack socket mode connected (reconnect 1)");
+
+    controller.abort();
+    await expect(run).resolves.toBeUndefined();
+  });
+
+  it("abandons a start that never connects and starts a fresh connection", async () => {
+    const controller = new AbortController();
+    const runtimeError = vi.fn();
+    const log = vi.fn();
+    slackTestState.appStartMock.mockImplementationOnce(() => new Promise(() => {}));
+
+    const run = monitorSlackProvider({
+      botToken: "bot-token",
+      appToken: "app-token",
+      abortSignal: controller.signal,
+      config: slackTestState.config,
+      runtime: { log, error: runtimeError, exit: vi.fn() },
+    });
+
+    await vi.advanceTimersByTimeAsync(89_000);
+    expect(slackTestState.appStopMock).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(runtimeError).toHaveBeenCalledWith(
+      expect.stringContaining("Slack Socket Mode did not connect within 90s"),
+    );
+    expect(slackTestState.appStopMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(slackTestState.appStartMock).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith("slack socket mode connected");
+
+    controller.abort();
+    await expect(run).resolves.toBeUndefined();
+  });
+
+  function startMonitor(controller: AbortController, log = vi.fn(), error = vi.fn()) {
+    return monitorSlackProvider({
+      botToken: "bot-token",
+      appToken: "app-token",
+      abortSignal: controller.signal,
+      config: slackTestState.config,
+      runtime: { log, error, exit: vi.fn() },
+    });
+  }
+
+  it("does not restart the app until a timed-out stop has finished", async () => {
+    const controller = new AbortController();
+    const runtimeError = vi.fn();
+    let stopFinishedAt: number | undefined;
+    const startedAt: number[] = [];
+    slackTestState.appStartMock.mockImplementation(async () => {
+      startedAt.push(Date.now());
+    });
+    slackTestState.appStopMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            stopFinishedAt = Date.now();
+            resolve();
+          }, 15_000);
+        }),
+    );
+    const run = startMonitor(controller, vi.fn(), runtimeError);
+
+    await vi.advanceTimersByTimeAsync(0);
+    emitSocketEvent("disconnected");
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(startedAt).toHaveLength(1);
+    expect(runtimeError).toHaveBeenCalledWith(
+      expect.stringContaining("slack socket mode stop timed_out"),
+    );
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(startedAt).toHaveLength(2);
+    expect(startedAt[1]).toBeGreaterThanOrEqual(stopFinishedAt ?? Number.POSITIVE_INFINITY);
+
+    controller.abort();
+    await expect(run).resolves.toBeUndefined();
+  });
+
+  it("gives up the app when a timed-out stop never finishes", async () => {
+    const controller = new AbortController();
+    const runtimeError = vi.fn();
+    slackTestState.appStopMock.mockImplementation(() => new Promise(() => {}));
+    const outcome = startMonitor(controller, vi.fn(), runtimeError).then(
+      () => "resolved",
+      (err: unknown) => err,
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    emitSocketEvent("disconnected");
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(await outcome).toBeInstanceOf(SlackSocketAppDiscardedError);
+    expect(slackTestState.appStartMock).toHaveBeenCalledTimes(1);
+    expect(runtimeError).toHaveBeenCalledWith(
+      expect.stringContaining("was still running 20s after it timed out"),
+    );
+  });
+
+  it.each([
+    [
+      "app.stop() rejects",
+      () => {
+        slackTestState.appStopMock.mockRejectedValue(new Error("stop failed"));
+      },
+      "Slack app.stop() failed",
+    ],
+    [
+      "the old websocket cannot be terminated",
+      () => {
+        Object.assign(slackTestState.socketModeClient ?? {}, {
+          websocket: {
+            readyState: 1,
+            websocket: new EventEmitter(),
+            terminate: () => {
+              throw new Error("terminate exploded");
+            },
+          },
+        });
+      },
+      "the old Slack websocket could not be terminated",
+    ],
+  ])("gives up the app when %s", async (_label, breakStop, reason) => {
+    const controller = new AbortController();
+    const runtimeError = vi.fn();
+    const outcome = startMonitor(controller, vi.fn(), runtimeError).then(
+      () => "resolved",
+      (err: unknown) => err,
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    breakStop();
+    emitSocketEvent("disconnected");
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    const err = await outcome;
+    expect(err).toBeInstanceOf(SlackSocketAppDiscardedError);
+    expect(String(err)).toContain(reason);
+    expect(slackTestState.appStartMock).toHaveBeenCalledTimes(1);
   });
 
   it("keeps degraded identity health after a recoverable reconnect", async () => {

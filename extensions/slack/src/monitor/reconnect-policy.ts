@@ -13,7 +13,17 @@ export const SLACK_SOCKET_RECONNECT_POLICY = {
   jitter: 0.25,
 } as const;
 
-type SlackSocketDisconnectEvent = "disconnect" | "unable_to_socket_mode_start" | "error";
+type SlackSocketDisconnectEvent = "disconnect" | "error" | "stalled";
+
+export type SlackSocketDisconnect = {
+  event: SlackSocketDisconnectEvent;
+  error?: unknown;
+};
+
+export type SlackSocketLivenessOptions = {
+  checkIntervalMs: number;
+  staleAfterMs: number;
+};
 
 type EmitterLike = {
   on: (event: string, listener: (...args: unknown[]) => void) => unknown;
@@ -23,14 +33,20 @@ type EmitterLike = {
 const SLACK_SOCKET_SHARED_CONNECTION_DOCS_URL =
   "https://docs.slack.dev/apis/events-api/using-socket-mode#using-multiple-connections";
 const SLACK_SOCKET_HELLO_MARKER = Buffer.from('"hello"');
+const SLACK_SOCKET_DISCONNECT_MARKER = Buffer.from('"disconnect"');
 
-function getSocketEmitter(app: unknown): EmitterLike | null {
+function getSocketClient(app: unknown): object | null {
   const receiver = (app as { receiver?: unknown }).receiver;
   const client =
     receiver && typeof receiver === "object"
       ? (receiver as { client?: unknown }).client
       : undefined;
-  if (!client || typeof client !== "object") {
+  return client && typeof client === "object" ? client : null;
+}
+
+function getSocketEmitter(app: unknown): EmitterLike | null {
+  const client = getSocketClient(app);
+  if (!client) {
     return null;
   }
   const on = (client as { on?: unknown }).on;
@@ -54,15 +70,24 @@ function isBufferArray(value: unknown): value is Buffer[] {
   return Array.isArray(value) && value.every((entry) => Buffer.isBuffer(entry));
 }
 
-function resolveSlackSocketModeConnectionCount(message: unknown): number | undefined {
-  const buffer = Buffer.isBuffer(message)
+function toMessageBuffer(message: unknown): Buffer | undefined {
+  return Buffer.isBuffer(message)
     ? message
     : message instanceof ArrayBuffer
       ? Buffer.from(message)
       : isBufferArray(message)
         ? Buffer.concat(message)
         : undefined;
-  if (!buffer?.includes(SLACK_SOCKET_HELLO_MARKER)) {
+}
+
+// Only Slack's control envelopes are parsed; the marker check keeps event traffic cheap.
+function parseSlackSocketControlMessage(
+  message: unknown,
+  marker: Buffer,
+  type: "hello" | "disconnect",
+): Record<string, unknown> | undefined {
+  const buffer = toMessageBuffer(message);
+  if (!buffer?.includes(marker)) {
     return undefined;
   }
   let payload: unknown;
@@ -71,8 +96,28 @@ function resolveSlackSocketModeConnectionCount(message: unknown): number | undef
   } catch {
     return undefined;
   }
-  const count = isRecord(payload) && payload.type === "hello" ? payload.num_connections : undefined;
+  return isRecord(payload) && payload.type === type ? payload : undefined;
+}
+
+function resolveSlackSocketModeConnectionCount(message: unknown): number | undefined {
+  const count = parseSlackSocketControlMessage(
+    message,
+    SLACK_SOCKET_HELLO_MARKER,
+    "hello",
+  )?.num_connections;
   return typeof count === "number" && Number.isSafeInteger(count) && count >= 0 ? count : undefined;
+}
+
+function resolveSlackSocketModeDisconnectReason(message: unknown): string | undefined {
+  const payload = parseSlackSocketControlMessage(
+    message,
+    SLACK_SOCKET_DISCONNECT_MARKER,
+    "disconnect",
+  );
+  if (!payload) {
+    return undefined;
+  }
+  return typeof payload.reason === "string" && payload.reason ? payload.reason : "unspecified";
 }
 
 export function formatSlackSocketModeSharedConnectionWarning(activeConnections: number): string {
@@ -87,6 +132,7 @@ export function formatSlackSocketModeSharedConnectionWarning(activeConnections: 
 export function registerSlackSocketModeConnectionDiagnostics(params: {
   app: unknown;
   onSharedConnection: (activeConnections: number) => void;
+  onDisconnectRequested?: (reason: string) => void;
 }): () => void {
   const emitter = getSocketEmitter(params.app);
   if (!emitter) {
@@ -94,7 +140,15 @@ export function registerSlackSocketModeConnectionDiagnostics(params: {
   }
   let hasWarned = false;
   const listener = (message: unknown, isBinary?: unknown) => {
-    if (isBinary === true || hasWarned) {
+    if (isBinary === true) {
+      return;
+    }
+    const disconnectReason = resolveSlackSocketModeDisconnectReason(message);
+    if (disconnectReason !== undefined) {
+      params.onDisconnectRequested?.(disconnectReason);
+      return;
+    }
+    if (hasWarned) {
       return;
     }
     const activeConnections = resolveSlackSocketModeConnectionCount(message);
@@ -113,10 +167,7 @@ export function registerSlackSocketModeConnectionDiagnostics(params: {
 export function waitForSlackSocketDisconnect(
   app: unknown,
   abortSignal?: AbortSignal,
-): Promise<{
-  event: SlackSocketDisconnectEvent;
-  error?: unknown;
-}> {
+): Promise<SlackSocketDisconnect> {
   return new Promise((resolve) => {
     const emitter = getSocketEmitter(app);
     if (!emitter) {
@@ -127,28 +178,76 @@ export function waitForSlackSocketDisconnect(
     }
 
     const disconnectListener = () => resolveOnce({ event: "disconnect" });
-    const startFailListener = (error?: unknown) =>
-      resolveOnce({ event: "unable_to_socket_mode_start", error });
     const errorListener = (error: unknown) => resolveOnce({ event: "error", error });
     const abortListener = () => resolveOnce({ event: "disconnect" });
 
     const cleanup = () => {
       emitter.off("disconnected", disconnectListener);
-      emitter.off("unable_to_socket_mode_start", startFailListener);
       emitter.off("error", errorListener);
       abortSignal?.removeEventListener("abort", abortListener);
     };
 
-    const resolveOnce = (value: { event: SlackSocketDisconnectEvent; error?: unknown }) => {
+    const resolveOnce = (value: SlackSocketDisconnect) => {
       cleanup();
       resolve(value);
     };
 
     emitter.on("disconnected", disconnectListener);
-    emitter.on("unable_to_socket_mode_start", startFailListener);
     emitter.on("error", errorListener);
     abortSignal?.addEventListener("abort", abortListener, { once: true });
   });
+}
+
+function requireSocketOpenProbe(app: unknown): () => boolean {
+  const client = getSocketClient(app);
+  const websocket = client ? (Reflect.get(client, "websocket") as { isActive?: unknown }) : null;
+  if (!client || typeof websocket?.isActive !== "function") {
+    throw new Error(
+      "unsupported @slack/socket-mode client: no websocket with isActive() after a successful start",
+    );
+  }
+  return () => {
+    const current = Reflect.get(client, "websocket") as { isActive?: () => unknown } | undefined;
+    return current?.isActive?.() === true;
+  };
+}
+
+/**
+ * Resolve with a "stalled" disconnect once the Socket Mode websocket has not been
+ * OPEN for `staleAfterMs`, as seen by polls every `checkIntervalMs` (so detection
+ * takes up to `staleAfterMs + checkIntervalMs`). The SDK can sit in CONNECTING or
+ * CLOSING without ever emitting a close; this turns any such wedge into an
+ * ordinary reconnect.
+ */
+export function watchSlackSocketLiveness(
+  app: unknown,
+  options: SlackSocketLivenessOptions,
+): { promise: Promise<SlackSocketDisconnect>; cancel: () => void } {
+  const isOpen = requireSocketOpenProbe(app);
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const promise = new Promise<SlackSocketDisconnect>((resolve) => {
+    let closedSince: number | undefined;
+    timer = setInterval(() => {
+      if (isOpen()) {
+        closedSince = undefined;
+        return;
+      }
+      const now = Date.now();
+      closedSince ??= now;
+      const closedForMs = now - closedSince;
+      if (closedForMs >= options.staleAfterMs) {
+        clearInterval(timer);
+        resolve({
+          event: "stalled",
+          error: new Error(
+            `Slack Socket Mode websocket not open for ${Math.round(closedForMs / 1000)}s`,
+          ),
+        });
+      }
+    }, options.checkIntervalMs);
+    timer.unref?.();
+  });
+  return { promise, cancel: () => clearInterval(timer) };
 }
 
 /**

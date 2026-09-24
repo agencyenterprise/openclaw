@@ -34,6 +34,7 @@ type SlackTestState = {
     (params: { entries: string[] }) => Promise<Array<{ input: string; resolved: boolean }>>
   >;
   socketModeLogger?: { error: (...args: unknown[]) => void };
+  socketModeClient?: { on: Mock<(event: string, listener: (...args: unknown[]) => void) => void> };
   createSlackStartupAuthClientMock: Mock<SlackStartupAuthClientFactory>;
   createSlackStartupAuthClientActual?: SlackStartupAuthClientFactory;
 };
@@ -52,6 +53,7 @@ const slackTestState: SlackTestState = vi.hoisted(() => ({
   upsertPairingRequestMock: vi.fn(),
   resolveSlackUserAllowlistMock: vi.fn(),
   socketModeLogger: undefined,
+  socketModeClient: undefined,
   createSlackStartupAuthClientMock: vi.fn(),
 }));
 
@@ -240,6 +242,7 @@ export function resetSlackTestState(config: Record<string, unknown> = defaultSla
   slackInboundDeliveryTestCache.clear();
   slackTestState.config = config;
   slackTestState.socketModeLogger = undefined;
+  slackTestState.socketModeClient = undefined;
   slackTestState.appStartMock.mockReset().mockResolvedValue(undefined);
   slackTestState.appStopMock.mockReset().mockResolvedValue(undefined);
   slackTestState.sendMock.mockReset().mockResolvedValue(undefined);
@@ -400,12 +403,17 @@ vi.mock("@slack/bolt", () => {
   class SocketModeReceiver {
     client = {
       ...slackClient,
+      start: vi.fn(),
+      disconnect: vi.fn(),
+      retrieveWSSURL: vi.fn(),
+      websocket: { isActive: () => true },
       on: vi.fn(),
       off: vi.fn(),
     };
 
     constructor(args: { logger?: { error: (...args: unknown[]) => void } }) {
       slackTestState.socketModeLogger = args.logger;
+      slackTestState.socketModeClient = this.client;
     }
   }
   return {

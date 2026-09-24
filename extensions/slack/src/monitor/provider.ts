@@ -80,6 +80,9 @@ import {
   resolveSlackBoltInterop,
   startSlackSocketAndWaitForDisconnect,
   type SlackBoltResolvedExports,
+  ensureSlackAppReusableAfterStop,
+  SlackSocketAppDiscardedError,
+  type SlackSocketStopResult,
 } from "./provider-support.js";
 import {
   formatSlackSocketModeSharedConnectionWarning,
@@ -137,6 +140,23 @@ function resolveStableSlackUserAllowlistEntries(entries: string[]): SlackUserRes
     }
   }
   return resolved;
+}
+
+function describeSlackSocketForceClose(stop: SlackSocketStopResult): string {
+  if (!stop.forcedClose) {
+    return "no websocket was open";
+  }
+  if (stop.forceCloseError === undefined) {
+    return "terminated the old websocket";
+  }
+  return `terminating the old websocket failed (${formatUnknownError(stop.forceCloseError)}); it may still be open`;
+}
+
+function formatSlackSocketConnectedMessage(params: { degraded: boolean; connectionCount: number }) {
+  const base = params.degraded
+    ? "slack socket mode connected (degraded identity)"
+    : "slack socket mode connected";
+  return params.connectionCount > 1 ? `${base} (reconnect ${params.connectionCount - 1})` : base;
 }
 
 function formatSlackSocketReconnectMessage(params: {
@@ -367,8 +387,22 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
   // a race where the library's internal ping timeout fires disconnect() before
   // shuttingDown is set, causing orphaned reconnects with leaked ping intervals.
   // See: openclaw/openclaw#56508
-  const gracefulStop = async () => {
-    await gracefulStopSlackApp(app);
+  const gracefulStop = () => gracefulStopSlackApp(app);
+  const stopSocketBeforeRetry = async () => {
+    const stop = await gracefulStop();
+    if (stop.outcome === "stopped" && !stop.forcedClose) {
+      return;
+    }
+    const detail = stop.error === undefined ? "" : ` (${formatUnknownError(stop.error)})`;
+    runtime.error?.(
+      `slack socket mode stop ${stop.outcome}${detail}; ` + describeSlackSocketForceClose(stop),
+    );
+    try {
+      await ensureSlackAppReusableAfterStop(stop);
+    } catch (err) {
+      runtime.error?.(`slack socket mode: ${formatUnknownError(err)}`);
+      throw err;
+    }
   };
 
   const slackHttpHandler =
@@ -403,6 +437,11 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
           app,
           onSharedConnection: (activeConnections) => {
             runtime.log?.(warn(formatSlackSocketModeSharedConnectionWarning(activeConnections)));
+          },
+          onDisconnectRequested: (reason) => {
+            runtime.log?.(
+              warn(`slack socket mode: Slack requested a disconnect (reason: ${reason})`),
+            );
           },
         })
       : () => {};
@@ -754,7 +793,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     if (!opts.abortSignal?.aborted) void durableMonitor?.start();
     if (slackMode === "socket") {
       let reconnectAttempts = 0;
-      let hasLoggedSocketConnected = false;
+      let connectionCount = 0;
       while (!opts.abortSignal?.aborted) {
         try {
           const disconnect = await startSlackSocketAndWaitForDisconnect({
@@ -762,15 +801,14 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
             abortSignal: opts.abortSignal,
             onStarted: () => {
               reconnectAttempts = 0;
+              connectionCount += 1;
               publishSlackConnectedStatus(opts.setStatus, identityHealth);
-              if (!hasLoggedSocketConnected) {
-                hasLoggedSocketConnected = true;
-                runtime.log?.(
-                  identityHealth.healthState === "degraded"
-                    ? "slack socket mode connected (degraded identity)"
-                    : "slack socket mode connected",
-                );
-              }
+              runtime.log?.(
+                formatSlackSocketConnectedMessage({
+                  degraded: identityHealth.healthState === "degraded",
+                  connectionCount,
+                }),
+              );
             },
           });
           if (!disconnect) {
@@ -803,13 +841,16 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
               }),
             ),
           );
-          await gracefulStop();
+          await stopSocketBeforeRetry();
           try {
             await sleepWithAbort(delayMs, opts.abortSignal);
           } catch {
             break;
           }
         } catch (err) {
+          if (err instanceof SlackSocketAppDiscardedError) {
+            throw err;
+          }
           if (isNonRecoverableSlackAuthError(err)) {
             runtime.error?.(
               `slack socket mode failed to start due to non-recoverable auth error — skipping channel (${formatUnknownError(err)})`,
@@ -826,6 +867,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
               sdkContext: socketModeLogger.getLastMessage(),
             }),
           );
+          await stopSocketBeforeRetry();
           try {
             await sleepWithAbort(delayMs, opts.abortSignal);
           } catch {

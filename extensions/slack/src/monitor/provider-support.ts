@@ -1,9 +1,16 @@
 // Slack provider module implements model/runtime integration.
+import { AsyncLocalStorage } from "node:async_hooks";
 import { asOptionalRecord as asRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { SlackChannelResolution } from "../resolve-channels.js";
 import type { SlackUserResolution } from "../resolve-users.js";
 import type { SlackIdentityHealth } from "./enterprise-install.js";
-import { formatUnknownError, waitForSlackSocketDisconnect } from "./reconnect-policy.js";
+import {
+  formatUnknownError,
+  type SlackSocketDisconnect,
+  type SlackSocketLivenessOptions,
+  waitForSlackSocketDisconnect,
+  watchSlackSocketLiveness,
+} from "./reconnect-policy.js";
 
 type SlackAppConstructor = typeof import("@slack/bolt").App;
 type SlackHttpReceiverConstructor = typeof import("@slack/bolt").HTTPReceiver;
@@ -19,11 +26,23 @@ type SlackSdkLogLevel = ReturnType<SlackSdkLogger["getLevel"]>;
 type SlackSocketModeLogger = SlackSdkLogger & {
   getLastMessage: () => string | undefined;
 };
-type SlackSocketDisconnect = Awaited<ReturnType<typeof waitForSlackSocketDisconnect>>;
 
 const OPENCLAW_SLACK_CLIENT_PING_TIMEOUT_MS = 15_000;
-const OPENCLAW_SLACK_SOCKET_START_FAILED_EVENT = "unable_to_socket_mode_start";
-const OPENCLAW_SLACK_NATIVE_RECONNECT_OBSERVER_KEY = "__openclawNativeReconnectFailureObserver";
+// Reconnects are owned by OpenClaw's monitor loop, never by the SDK: the SDK's
+// native reconnect runs at debug log level, never reports back, and can wait
+// forever (no HTTP timeout on apps.connections.open, no websocket handshake
+// timeout, no bound on "disconnect before hello" loops).
+// Every Socket Mode connection attempt is bounded by these limits.
+const SLACK_SOCKET_OPEN_HTTP_TIMEOUT_MS = 20_000;
+export const SLACK_SOCKET_CONNECT_TIMEOUT_MS = 90_000;
+export const SLACK_SOCKET_STOP_TIMEOUT_MS = 10_000;
+/** After a stop timed out, how long a reconnect waits for it to finish before the app is discarded. */
+export const SLACK_SOCKET_STOP_SETTLE_TIMEOUT_MS = 20_000;
+const SLACK_SOCKET_CLIENT_METHODS = ["start", "disconnect", "retrieveWSSURL", "on", "off"] as const;
+export const SLACK_SOCKET_LIVENESS: SlackSocketLivenessOptions = {
+  checkIntervalMs: 5_000,
+  staleAfterMs: 60_000,
+};
 const SLACK_SOCKET_PONG_TIMEOUT_WARNING_PREFIX = "A pong wasn't received from the server";
 const SLACK_SOCKET_PING_TIMEOUT_WARNING_PREFIX = "A ping wasn't received from the server";
 const SLACK_SOCKET_LOG_LEVEL_IGNORED_WARNING_RE =
@@ -55,64 +74,68 @@ function isConstructorFunction<
   return typeof value === "function";
 }
 
-function installSlackNativeReconnectFailureObserver(receiver: unknown) {
-  if (!receiver || typeof receiver !== "object") {
-    return;
-  }
-  const client = Reflect.get(receiver, "client");
-  if (!client || typeof client !== "object") {
-    return;
-  }
-  if (Reflect.get(client, OPENCLAW_SLACK_NATIVE_RECONNECT_OBSERVER_KEY)) {
-    return;
-  }
-  const delayReconnectAttempt = Reflect.get(client, "delayReconnectAttempt");
-  const emit = Reflect.get(client, "emit");
-  if (typeof delayReconnectAttempt !== "function" || typeof emit !== "function") {
-    return;
-  }
+const supersedePendingStartsByClient = new WeakMap<object, () => void>();
 
-  Reflect.set(client, OPENCLAW_SLACK_NATIVE_RECONNECT_OBSERVER_KEY, true);
-  Reflect.set(
-    client,
-    "delayReconnectAttempt",
-    function patchedDelayReconnectAttempt(this: object, callback: unknown) {
-      if (typeof callback !== "function") {
-        return delayReconnectAttempt.call(this, callback);
-      }
-      const failureCount = Number(Reflect.get(this, "numOfConsecutiveReconnectionFailures") ?? 0);
-      const nextFailureCount = failureCount + 1;
-      Reflect.set(this, "numOfConsecutiveReconnectionFailures", nextFailureCount);
-      const pingTimeoutMs = Number(Reflect.get(this, "clientPingTimeoutMS"));
-      const delayMs =
-        (Number.isFinite(pingTimeoutMs) && pingTimeoutMs >= 0
-          ? pingTimeoutMs
-          : OPENCLAW_SLACK_CLIENT_PING_TIMEOUT_MS) * nextFailureCount;
-      const logger = Reflect.get(this, "logger") as { debug?: (message: string) => void };
-      logger?.debug?.(
-        `Before trying to reconnect, this client will wait for ${delayMs} milliseconds`,
-      );
-      return new Promise((resolve, reject) => {
-        setTimeout(() => {
-          if (Reflect.get(this, "shuttingDown")) {
-            logger?.debug?.("Client shutting down, will not attempt reconnect.");
-            resolve(undefined);
-            return;
-          }
-          logger?.debug?.("Continuing with reconnect...");
-          emit.call(this, "reconnecting");
-          Promise.resolve(callback.call(this)).then(resolve, (error: unknown) => {
-            if (callback === Reflect.get(this, "start")) {
-              emit.call(this, OPENCLAW_SLACK_SOCKET_START_FAILED_EVENT, error);
-              resolve(undefined);
-              return;
-            }
-            reject(toLintErrorObject(error, "Non-Error rejection"));
-          });
-        }, delayMs);
-      });
-    },
+/**
+ * A connection attempt that outlives its deadline (or a stop) must not open a
+ * socket later. Each start() gets its own attempt token, carried through its
+ * async work by AsyncLocalStorage; each start, disconnect and stop moves the
+ * current token on. A start whose token is no longer current rejects when its
+ * WSS URL arrives, and again at the "connecting" emit that start() fires right
+ * before ws.connect(), so a superseded start never connects.
+ */
+function discardSupersededSlackSocketStarts(receiver: unknown) {
+  const client =
+    receiver && typeof receiver === "object" ? Reflect.get(receiver, "client") : undefined;
+  const [start, disconnect, retrieveWSSURL, on, off] = SLACK_SOCKET_CLIENT_METHODS.map((name) =>
+    client && typeof client === "object" ? Reflect.get(client, name) : undefined,
   );
+  if (
+    !client ||
+    typeof client !== "object" ||
+    typeof start !== "function" ||
+    typeof disconnect !== "function" ||
+    typeof retrieveWSSURL !== "function" ||
+    typeof on !== "function" ||
+    typeof off !== "function"
+  ) {
+    throw new Error(
+      `unsupported @slack/socket-mode client: expected methods ${SLACK_SOCKET_CLIENT_METHODS.join(", ")}`,
+    );
+  }
+  let generation = 0;
+  const attempt = new AsyncLocalStorage<number>();
+  const requireCurrentAttempt = (step: string) => {
+    const token = attempt.getStore();
+    if (token === undefined) {
+      throw new Error(`unsupported @slack/socket-mode client: ${step} outside start()`);
+    }
+    if (token !== generation) {
+      throw new Error("Slack Socket Mode connection attempt was superseded; it will not connect");
+    }
+  };
+  supersedePendingStartsByClient.set(client, () => {
+    generation += 1;
+  });
+  Reflect.set(client, "start", function startNextGeneration(this: object) {
+    generation += 1;
+    return attempt.run(generation, () => start.call(this));
+  });
+  Reflect.set(client, "disconnect", function disconnectCurrentGeneration(this: object) {
+    generation += 1;
+    return disconnect.call(this);
+  });
+  Reflect.set(client, "retrieveWSSURL", async function retrieveForCurrentAttempt(this: object) {
+    const url: unknown = await retrieveWSSURL.call(this);
+    requireCurrentAttempt("retrieveWSSURL");
+    return url;
+  });
+  on.call(client, "connecting", () => requireCurrentAttempt("connecting"));
+}
+
+/** Make every in-flight start of this client stale, so none of them can connect later. */
+function supersedePendingSlackSocketStarts(client: object) {
+  supersedePendingStartsByClient.get(client)?.();
 }
 
 function createSlackRelayReceiver(): SlackReceiver {
@@ -319,12 +342,13 @@ export function createSlackBoltApp(params: {
   const socketModeLogger = createSlackSocketModeLogger();
   const socketModeReceiverOptions: SlackSocketModeReceiverOptions = {
     appToken: params.appToken ?? "",
-    autoReconnectEnabled: true,
+    autoReconnectEnabled: false,
     clientPingTimeout:
       params.socketMode?.clientPingTimeout ?? OPENCLAW_SLACK_CLIENT_PING_TIMEOUT_MS,
     logger: socketModeLogger,
     installerOptions: {
-      clientOptions: params.clientOptions,
+      // A copy: the SDK mutates its client options, and apps.connections.open needs a timeout.
+      clientOptions: { ...params.clientOptions, timeout: SLACK_SOCKET_OPEN_HTTP_TIMEOUT_MS },
     },
   };
   if (params.socketMode?.serverPingTimeout !== undefined) {
@@ -341,7 +365,7 @@ export function createSlackBoltApp(params: {
     | undefined;
   if (params.slackMode === "socket") {
     receiver = new params.interop.SocketModeReceiver(socketModeReceiverOptions);
-    installSlackNativeReconnectFailureObserver(receiver);
+    discardSupersededSlackSocketStarts(receiver);
   } else if (params.slackMode === "http") {
     receiver = new params.interop.HTTPReceiver({
       signingSecret: params.signingSecret ?? "",
@@ -386,27 +410,84 @@ function createSlackSocketDisconnectWaiter(app: unknown, abortSignal?: AbortSign
       waiterAbortController.abort();
       abortSignal?.removeEventListener("abort", relayAbort);
     },
-    complete: () => {
-      abortSignal?.removeEventListener("abort", relayAbort);
-    },
   };
+}
+
+export class SlackSocketConnectTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Slack Socket Mode did not connect within ${Math.round(timeoutMs / 1000)}s`);
+    this.name = "SlackSocketConnectTimeoutError";
+  }
+}
+
+/** Resolves "aborted" when the abort signal fires first; the caller's stop cleans up. */
+async function awaitSlackSocketStart(
+  start: Promise<unknown>,
+  timeoutMs: number,
+  abortSignal?: AbortSignal,
+): Promise<"started" | "aborted"> {
+  // A start that loses the race settles later; its outcome is superseded.
+  start.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new SlackSocketConnectTimeoutError(timeoutMs)), timeoutMs);
+  });
+  const aborted = new Promise<"aborted">((resolve) => {
+    onAbort = () => resolve("aborted");
+    if (abortSignal?.aborted) {
+      onAbort();
+    }
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([start.then(() => "started" as const), deadline, aborted]);
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) {
+      abortSignal?.removeEventListener("abort", onAbort);
+    }
+  }
+}
+
+async function waitForSlackSocketLoss(
+  app: unknown,
+  disconnectWaiter: ReturnType<typeof createSlackSocketDisconnectWaiter>,
+  liveness: SlackSocketLivenessOptions,
+): Promise<SlackSocketDisconnect> {
+  const watcher = watchSlackSocketLiveness(app, liveness);
+  try {
+    return await Promise.race([disconnectWaiter.promise, watcher.promise]);
+  } finally {
+    watcher.cancel();
+  }
 }
 
 export async function startSlackSocketAndWaitForDisconnect(params: {
   app: { start: () => unknown };
   abortSignal?: AbortSignal;
   onStarted?: () => void;
+  connectTimeoutMs?: number;
+  liveness?: SlackSocketLivenessOptions;
 }) {
   const disconnectWaiter = createSlackSocketDisconnectWaiter(params.app, params.abortSignal);
   try {
-    await Promise.resolve(params.app.start());
-    if (params.abortSignal?.aborted) {
+    const started = await awaitSlackSocketStart(
+      Promise.resolve(params.app.start()),
+      params.connectTimeoutMs ?? SLACK_SOCKET_CONNECT_TIMEOUT_MS,
+      params.abortSignal,
+    );
+    if (started === "aborted" || params.abortSignal?.aborted) {
       disconnectWaiter.cancel();
       return null;
     }
     params.onStarted?.();
-    const disconnect = await disconnectWaiter.promise;
-    disconnectWaiter.complete();
+    const disconnect = await waitForSlackSocketLoss(
+      params.app,
+      disconnectWaiter,
+      params.liveness ?? SLACK_SOCKET_LIVENESS,
+    );
+    disconnectWaiter.cancel();
     return disconnect;
   } catch (err) {
     await Promise.resolve();
@@ -431,6 +512,8 @@ function isMissingSocketStartErrorDetail(err: unknown): boolean {
   );
 }
 
+type SlackSocketHandle = { readyState?: number; terminate?: () => void };
+
 function resolveSlackSocketShutdownClient(app: unknown): SlackSocketShutdownClient | undefined {
   if (!app || typeof app !== "object") {
     return undefined;
@@ -446,12 +529,155 @@ function resolveSlackSocketShutdownClient(app: unknown): SlackSocketShutdownClie
   return client as SlackSocketShutdownClient;
 }
 
-export async function gracefulStopSlackApp(app: { stop: () => unknown }) {
+/**
+ * SlackWebSocket.terminate() calls removeAllListeners() on its ws and then
+ * terminates it. Terminating a ws that is still in its handshake makes ws emit
+ * an "error"; with no listener that is an uncaught exception, which exits the
+ * gateway. So an "error" guard is attached before the termination and re-attached
+ * by every removeAllListeners() call made during it: there is no moment when the
+ * ws has no error listener. The guard stays on the dead ws afterwards, because
+ * ws emits the handshake abort on a later tick.
+ */
+function terminateSlackWebSocket(socket: SlackSocketHandle & { terminate: () => void }) {
+  const ws: unknown = Reflect.get(socket, "websocket");
+  const on = ws && typeof ws === "object" ? Reflect.get(ws, "on") : undefined;
+  const removeAllListeners =
+    ws && typeof ws === "object" ? Reflect.get(ws, "removeAllListeners") : undefined;
+  if (typeof on !== "function" || typeof removeAllListeners !== "function") {
+    throw new Error("unsupported @slack/socket-mode client: websocket has no underlying ws");
+  }
+  const target = ws as object;
+  const consumeTerminationError = () => {};
+  on.call(target, "error", consumeTerminationError);
+  const ownDescriptor = Object.getOwnPropertyDescriptor(target, "removeAllListeners");
+  const installed = Reflect.defineProperty(target, "removeAllListeners", {
+    configurable: true,
+    writable: true,
+    value: function keepErrorGuard(this: object, ...args: unknown[]) {
+      const result: unknown = removeAllListeners.apply(this, args);
+      on.call(this, "error", consumeTerminationError);
+      return result;
+    },
+  });
+  if (!installed) {
+    throw new Error("could not guard the Slack websocket's error listener; not terminating it");
+  }
+  let terminated: { ok: true } | { ok: false; error: unknown } = { ok: true };
+  try {
+    socket.terminate();
+  } catch (error) {
+    terminated = { ok: false, error };
+  }
+  const restored = ownDescriptor
+    ? Reflect.defineProperty(target, "removeAllListeners", ownDescriptor)
+    : Reflect.deleteProperty(target, "removeAllListeners");
+  if (!terminated.ok) {
+    throw terminated.error;
+  }
+  if (!restored) {
+    throw new Error("could not restore the Slack websocket's removeAllListeners");
+  }
+}
+
+export type SlackSocketStopResult = {
+  outcome: "stopped" | "failed" | "timed_out";
+  error?: unknown;
+  /** The old websocket was still present after stop and was terminated here. */
+  forcedClose: boolean;
+  /** Terminating the old websocket threw; it may still be open. */
+  forceCloseError?: unknown;
+  /** app.stop() itself (rejects if it fails), still pending after `outcome` "timed_out". */
+  settled: Promise<void>;
+};
+
+export class SlackSocketAppDiscardedError extends Error {
+  constructor(reason: string) {
+    super(`${reason}; discarding this Slack app so the channel restarts with a fresh one`);
+    this.name = "SlackSocketAppDiscardedError";
+  }
+}
+
+/**
+ * The same app is reused for the next connection only when its stop is known to be
+ * over and no old websocket can survive: app.stop() fulfilled (if it timed out, it
+ * must fulfill within `settleTimeoutMs`) and any forced close succeeded. A stop that
+ * rejected may still tear down later, and a failed forced close may leave a live
+ * socket, so both throw SlackSocketAppDiscardedError, as does a stop still running.
+ */
+export async function ensureSlackAppReusableAfterStop(
+  stop: SlackSocketStopResult,
+  settleTimeoutMs = SLACK_SOCKET_STOP_SETTLE_TIMEOUT_MS,
+): Promise<void> {
+  if (stop.forceCloseError !== undefined) {
+    throw new SlackSocketAppDiscardedError("the old Slack websocket could not be terminated");
+  }
+  if (stop.outcome === "failed") {
+    throw new SlackSocketAppDiscardedError("Slack app.stop() failed");
+  }
+  if (stop.outcome === "stopped") {
+    return;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const gaveUp = new Promise<"hung">((resolve) => {
+    timer = setTimeout(() => resolve("hung"), settleTimeoutMs);
+  });
+  const settled = stop.settled.then(
+    () => "stopped" as const,
+    () => "failed" as const,
+  );
+  try {
+    const late = await Promise.race([settled, gaveUp]);
+    if (late === "hung") {
+      throw new SlackSocketAppDiscardedError(
+        `Slack app.stop() was still running ${Math.round(settleTimeoutMs / 1000)}s after it timed out`,
+      );
+    }
+    if (late === "failed") {
+      throw new SlackSocketAppDiscardedError("Slack app.stop() failed after it timed out");
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function gracefulStopSlackApp(
+  app: { stop: () => unknown },
+  timeoutMs = SLACK_SOCKET_STOP_TIMEOUT_MS,
+): Promise<SlackSocketStopResult> {
   const socketClient = resolveSlackSocketShutdownClient(app);
   if (socketClient) {
     socketClient.shuttingDown = true;
+    supersedePendingSlackSocketStarts(socketClient);
   }
-  await Promise.resolve(app.stop()).catch(() => undefined);
+  const stopCall = Promise.resolve().then(() => app.stop());
+  const stopped = stopCall.then(
+    () => ({ outcome: "stopped" as const }),
+    (error: unknown) => ({ outcome: "failed" as const, error }),
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<{ outcome: "timed_out" }>((resolve) => {
+    timer = setTimeout(() => resolve({ outcome: "timed_out" }), timeoutMs);
+  });
+  let outcome: { outcome: SlackSocketStopResult["outcome"]; error?: unknown };
+  try {
+    outcome = await Promise.race([stopped, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+  const result = { ...outcome, settled: stopCall.then(() => undefined) };
+  result.settled.catch(() => undefined);
+  const socket = socketClient
+    ? (Reflect.get(socketClient, "websocket") as SlackSocketHandle | undefined)
+    : undefined;
+  if (socket?.readyState === undefined || typeof socket.terminate !== "function") {
+    return { ...result, forcedClose: false };
+  }
+  try {
+    terminateSlackWebSocket(socket as SlackSocketHandle & { terminate: () => void });
+    return { ...result, forcedClose: true };
+  } catch (forceCloseError) {
+    return { ...result, forcedClose: true, forceCloseError };
+  }
 }
 
 function formatSlackResolvedLabel(params: {

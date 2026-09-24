@@ -1,6 +1,11 @@
 // Slack tests cover provider.interop plugin behavior.
+import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { createSlackBoltApp, resolveSlackBoltInterop } from "./provider-support.js";
+import {
+  createSlackBoltApp,
+  gracefulStopSlackApp,
+  resolveSlackBoltInterop,
+} from "./provider-support.js";
 
 describe("resolveSlackBoltInterop", () => {
   function FakeApp() {}
@@ -128,15 +133,24 @@ describe("createSlackBoltApp", () => {
     }
   }
 
+  class FakeSocketModeClient {
+    start = vi.fn();
+    disconnect = vi.fn();
+    retrieveWSSURL = vi.fn();
+    on = vi.fn();
+    off = vi.fn();
+  }
+
   class FakeSocketModeReceiver {
     args: Record<string, unknown>;
+    client = new FakeSocketModeClient();
 
     constructor(args: Record<string, unknown>) {
       this.args = args;
     }
   }
 
-  it("uses SocketModeReceiver with native reconnects and shared client options", () => {
+  it("uses SocketModeReceiver without native reconnects and a bounded socket client", () => {
     const clientOptions = { teamId: "T1" };
     const { app, receiver } = createSlackBoltApp({
       interop: {
@@ -158,13 +172,14 @@ describe("createSlackBoltApp", () => {
     expect(receiverLogger.warn).toBeTypeOf("function");
     expect(receiverArgs).toEqual({
       appToken: "xapp-test",
-      autoReconnectEnabled: true,
+      autoReconnectEnabled: false,
       clientPingTimeout: 15_000,
       logger: receiverLogger,
       installerOptions: {
-        clientOptions,
+        clientOptions: { teamId: "T1", timeout: 20_000 },
       },
     });
+    expect(clientOptions).toEqual({ teamId: "T1" });
     expect(app).toBeInstanceOf(FakeApp);
     expect((app as unknown as FakeApp).args).toEqual({
       token: "xoxb-test",
@@ -286,29 +301,57 @@ describe("createSlackBoltApp", () => {
     }
   });
 
-  it("routes native reconnect start failures through the socket disconnect event", async () => {
-    const startError = new Error("invalid_auth");
-    class FakeSocketModeClient {
-      emitted: unknown[][] = [];
-      clientPingTimeoutMS = 0;
-      numOfConsecutiveReconnectionFailures = 0;
-      logger = { debug: () => undefined };
-      shuttingDown = false;
-      start = async () => {
-        throw startError;
-      };
+  it("refuses a Socket Mode client without the methods the reconnect guard needs", () => {
+    class FakeBareSocketModeReceiver {
+      client = { start: vi.fn(), on: vi.fn(), off: vi.fn() };
+    }
+    expect(() =>
+      createSlackBoltApp({
+        interop: {
+          App: FakeApp as never,
+          HTTPReceiver: FakeHTTPReceiver as never,
+          SocketModeReceiver: FakeBareSocketModeReceiver as never,
+        },
+        slackMode: "socket",
+        botToken: "xoxb-test",
+        appToken: "xapp-test",
+        slackWebhookPath: "/slack/events",
+        clientOptions: {},
+      }),
+    ).toThrow("unsupported @slack/socket-mode client");
+  });
 
-      delayReconnectAttempt(callback: (this: FakeSocketModeClient) => Promise<unknown>) {
-        return Promise.resolve(callback.call(this));
+  function createGuardedSocketClient() {
+    const urlRequests: Array<(url: string) => void> = [];
+    const assignGates: Array<Promise<void>> = [];
+    // Mirrors SocketModeClient.start(): fetch the URL, assign the websocket,
+    // emit "connecting", then connect.
+    class FakeGuardedSocketModeClient extends EventEmitter {
+      opened: string[] = [];
+      disconnects = 0;
+      websocket: { options: { url: string } } | null = null;
+
+      retrieveWSSURL() {
+        return new Promise<string>((resolve) => {
+          urlRequests.push(resolve);
+        });
       }
 
-      emit(event: string, ...args: unknown[]) {
-        this.emitted.push([event, ...args]);
+      async start() {
+        const url = await this.retrieveWSSURL();
+        await assignGates.shift();
+        this.websocket = { options: { url } };
+        this.emit("connecting");
+        this.opened.push(url);
+      }
+
+      async disconnect() {
+        this.disconnects += 1;
       }
     }
-    class FakeObservedSocketModeReceiver {
+    class FakeGuardedSocketModeReceiver {
       args: Record<string, unknown>;
-      client = new FakeSocketModeClient();
+      client = new FakeGuardedSocketModeClient();
 
       constructor(args: Record<string, unknown>) {
         this.args = args;
@@ -318,7 +361,7 @@ describe("createSlackBoltApp", () => {
       interop: {
         App: FakeApp as never,
         HTTPReceiver: FakeHTTPReceiver as never,
-        SocketModeReceiver: FakeObservedSocketModeReceiver as never,
+        SocketModeReceiver: FakeGuardedSocketModeReceiver as never,
       },
       slackMode: "socket",
       botToken: "xoxb-test",
@@ -326,20 +369,109 @@ describe("createSlackBoltApp", () => {
       slackWebhookPath: "/slack/events",
       clientOptions: {},
     });
+    const client = (receiver as unknown as FakeGuardedSocketModeReceiver).client;
+    return { client, receiver, urlRequests, assignGates };
+  }
 
-    const client = (receiver as unknown as FakeObservedSocketModeReceiver).client;
+  it("discards a WSS URL fetched for a superseded socket start", async () => {
+    const { client, urlRequests } = createGuardedSocketClient();
 
-    await expect(client.delayReconnectAttempt(client.start)).resolves.toBeUndefined();
-    await expect(
-      client.delayReconnectAttempt(async () => {
-        throw new Error("transient");
+    const stoppedStart = client.start();
+    await client.disconnect();
+    urlRequests[0]?.("wss://stopped");
+    await expect(stoppedStart).rejects.toThrow("superseded");
+
+    const olderStart = client.start();
+    const newerStart = client.start();
+    urlRequests[1]?.("wss://older");
+    urlRequests[2]?.("wss://newer");
+    await expect(olderStart).rejects.toThrow("superseded");
+    await expect(newerStart).resolves.toBeUndefined();
+
+    expect(client.opened).toEqual(["wss://newer"]);
+    expect(client.disconnects).toBe(1);
+  });
+
+  it("keeps a current start valid when a stale start returns the same URL", async () => {
+    const { client, urlRequests, assignGates } = createGuardedSocketClient();
+    let releaseAssign = () => {};
+    assignGates.push(
+      new Promise<void>((resolve) => {
+        releaseAssign = resolve;
       }),
-    ).rejects.toThrow("transient");
-    expect(client.emitted).toEqual([
-      ["reconnecting"],
-      ["unable_to_socket_mode_start", startError],
-      ["reconnecting"],
-    ]);
+    );
+
+    const olderStart = client.start();
+    const newerStart = client.start();
+    urlRequests[1]?.("wss://same");
+    await vi.waitFor(() => expect(assignGates).toHaveLength(0));
+    urlRequests[0]?.("wss://same");
+    await expect(olderStart).rejects.toThrow("superseded");
+    releaseAssign();
+
+    await expect(newerStart).resolves.toBeUndefined();
+    expect(client.opened).toEqual(["wss://same"]);
+  });
+
+  it("refuses to connect a start superseded after its URL was accepted", async () => {
+    const { client, urlRequests, assignGates } = createGuardedSocketClient();
+    let releaseAssign = () => {};
+    assignGates.push(
+      new Promise<void>((resolve) => {
+        releaseAssign = resolve;
+      }),
+    );
+
+    const start = client.start();
+    urlRequests[0]?.("wss://accepted-then-superseded");
+    await vi.waitFor(() => expect(assignGates).toHaveLength(0));
+    await client.disconnect();
+    releaseAssign();
+
+    await expect(start).rejects.toThrow("superseded");
+    expect(client.opened).toEqual([]);
+  });
+
+  it("makes a pending start stale as soon as the app is stopped", async () => {
+    const { client, receiver, urlRequests } = createGuardedSocketClient();
+    const app = { receiver, stop: vi.fn(() => new Promise(() => {})) };
+
+    const start = client.start();
+    const stop = gracefulStopSlackApp(app, 5);
+    urlRequests[0]?.("wss://late-after-stop");
+
+    await expect(start).rejects.toThrow("superseded");
+    await expect(stop).resolves.toMatchObject({ outcome: "timed_out", forcedClose: false });
+    expect(client.opened).toEqual([]);
+  });
+
+  it("fails loudly when the client connects outside start()", async () => {
+    const { client } = createGuardedSocketClient();
+
+    expect(() => client.emit("connecting")).toThrow(
+      "unsupported @slack/socket-mode client: connecting outside start()",
+    );
+  });
+
+  it("refuses a stale start that got the same URL as the current one", async () => {
+    const { client, urlRequests, assignGates } = createGuardedSocketClient();
+    let releaseOld = () => {};
+    assignGates.push(
+      new Promise<void>((resolve) => {
+        releaseOld = resolve;
+      }),
+    );
+
+    const olderStart = client.start();
+    urlRequests[0]?.("wss://same");
+    await vi.waitFor(() => expect(assignGates).toHaveLength(0));
+    const newerStart = client.start();
+    urlRequests[1]?.("wss://same");
+    await expect(newerStart).resolves.toBeUndefined();
+    releaseOld();
+
+    await expect(olderStart).rejects.toThrow("superseded");
+    expect(client.opened).toEqual(["wss://same"]);
   });
 
   it("passes Socket Mode ping/pong options through Slack's public receiver API", () => {
@@ -368,13 +500,13 @@ describe("createSlackBoltApp", () => {
     expect(receiverLogger.warn).toBeTypeOf("function");
     expect(receiverArgs).toEqual({
       appToken: "xapp-test",
-      autoReconnectEnabled: true,
+      autoReconnectEnabled: false,
       clientPingTimeout: 20_000,
       serverPingTimeout: 45_000,
       pingPongLoggingEnabled: true,
       logger: receiverLogger,
       installerOptions: {
-        clientOptions,
+        clientOptions: { teamId: "T1", timeout: 20_000 },
       },
     });
   });
