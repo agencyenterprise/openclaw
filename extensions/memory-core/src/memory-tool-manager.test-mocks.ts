@@ -158,6 +158,10 @@ export function getMemorySyncMockCalls(): number {
   return stubManager.sync.mock.calls.length;
 }
 
+export function getMemorySyncMockArgs(): unknown[] {
+  return stubManager.sync.mock.calls.map((call) => call[0]);
+}
+
 export function getMemoryCloseMockCalls(): number {
   return stubManager.close.mock.calls.length;
 }

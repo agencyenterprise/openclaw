@@ -10,6 +10,7 @@ import {
   getMemorySearchManagerMockCalls,
   getMemorySearchManagerMockConfigs,
   getMemorySearchManagerMockParams,
+  getMemorySyncMockArgs,
   getMemorySyncMockCalls,
   resetMemoryToolMockState,
   setMemoryBackend,
@@ -884,7 +885,7 @@ describe("memory_search unavailable payloads", () => {
     expect(getMemoryCloseMockCalls()).toBe(1);
   });
 
-  it("forces a sync and retries once when the first search has zero hits", async () => {
+  it("syncs changed files without a forced full reindex before retrying a zero-hit search", async () => {
     let searchCalls = 0;
     setMemorySearchImpl(async () => {
       searchCalls += 1;
@@ -915,6 +916,8 @@ describe("memory_search unavailable payloads", () => {
       "MEMORY.md",
     );
     expect(searchCalls).toBe(2);
+    // A forced reindex blocks the gateway event loop for minutes on a large agent DB.
+    expect(getMemorySyncMockArgs()).toEqual([{ reason: "search" }]);
   });
 
   it("keeps the zero-hit bootstrap retry for one-shot qmd searches", async () => {

@@ -810,7 +810,7 @@ export function createMemorySearchTool(options: {
                   await runWithDefaultDeadline(async () => {
                     // Sync may join shared/background manager maintenance and has
                     // no request-cancellation contract. Bound only this tool's wait.
-                    await activeMemory.manager.sync?.({ reason: "search", force: true });
+                    await activeMemory.manager.sync?.({ reason: "search" });
                   });
                   rawResults = await searchActiveMemory();
                   pausedIndexIdentityReason = resolvePausedMemoryIndexIdentityReason(
