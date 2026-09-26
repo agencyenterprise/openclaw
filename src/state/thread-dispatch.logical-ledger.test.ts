@@ -453,7 +453,10 @@ it("an attempt that joins the ledger during the send drain is read again at the 
   const proven = beginLedgerAttempt(ledger);
   proven("returned", "a".repeat(64));
   const send = beginLedgerEffect(ledger, "test send")!;
-  const settlement = settleLogicalTurnLedger(ledger, true);
+  const settlement = settleLogicalTurnLedger(ledger, {
+    kind: "returned",
+    observedCompletion: true,
+  });
   expect(ledgerAcceptsAttempts(ledger)).toBe(false);
   // Bypasses admission, as a race past it would: the attempt is still running.
   const raced = beginLedgerAttempt(ledger);
@@ -735,7 +738,7 @@ it.each([
   }
 });
 
-it("a turn that throws settles UNKNOWN; later sends from its context run untracked", async () => {
+it("a turn that throws with nothing in flight settles TERMINAL; later sends from its context run untracked", async () => {
   const { db, turn, state } = fixture();
   let releaseLate!: () => void;
   let late!: Promise<void>;
@@ -753,7 +756,7 @@ it("a turn that throws settles UNKNOWN; later sends from its context run untrack
         },
       }),
     ).rejects.toThrow("turn failed");
-    expect(state()).toEqual([{ state: "UNKNOWN" }]);
+    expect(state()).toEqual([{ state: "TERMINAL" }]);
     releaseLate();
     await late;
   } finally {

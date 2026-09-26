@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { requireNodeSqlite } from '../infra/node-sqlite.js';
-import { dispatchHash, runLogicalDispatchAttempt, withLogicalReplyDispatch, type DispatchConfig } from './thread-dispatch.js';
+import { beginLogicalDispatchEffect, dispatchHash, runLogicalDispatchAttempt, withLogicalReplyDispatch, type DispatchConfig } from './thread-dispatch.js';
 const roots: string[]=[];
 afterEach(()=> {vi.unstubAllEnvs();for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
 function fixture(){
@@ -49,10 +49,12 @@ it('scope mismatch and drained fence reject inside otherwise valid private conte
  }});expect(effects).toBe(0);expect(db.prepare('SELECT state FROM thread_dispatch_claims').get()).toEqual({state:'UNKNOWN'});
  }finally{db.close();}
 });
-it('completion callback followed by outer failure never settles terminal',async()=>{
+it('an outer failure after the completion callback settles on the failed turn evidence, not on the callback',async()=>{
  const {db,args}=fixture();try{
  await expect(withLogicalReplyDispatch({...args,run:async(done)=>{done(dispatchHash('done'));throw new Error('outer failure');}})).rejects.toThrow('outer failure');
- expect(db.prepare('SELECT state FROM thread_dispatch_claims').get()).toEqual({state:'UNKNOWN'});
+ expect(db.prepare('SELECT state FROM thread_dispatch_claims').get()).toEqual({state:'TERMINAL'});
+ await expect(withLogicalReplyDispatch({...args,sourceTurnId:'channel-user:v1:'+'b'.repeat(64),run:async(done)=>{beginLogicalDispatchEffect('send')!.settle('unknown');done(dispatchHash('done'));throw new Error('outer failure');}})).rejects.toThrow('outer failure');
+ expect(db.prepare('SELECT state FROM thread_dispatch_claims ORDER BY rowid').all()).toEqual([{state:'TERMINAL'},{state:'UNKNOWN'}]);
  }finally{db.close();}
 });
 it('plain caller fields cannot forge inherited capability',()=>{

@@ -28,6 +28,29 @@ export function buildTopLevelSlackConversationKey(
   return `slack:${accountId}:${teamId ? `${teamId}:` : ""}${message.channel}:${senderId}`;
 }
 
+function resolveSlackThreadScope(message: SlackMessageEvent): string {
+  const messageTs = message.ts ?? message.event_ts;
+  return message.thread_ts
+    ? `${message.channel}:${message.thread_ts}`
+    : message.parent_user_id && messageTs
+      ? `${message.channel}:maybe-thread:${messageTs}`
+      : messageTs && !isSlackDirectMessageChannel(message.channel)
+        ? `${message.channel}:${messageTs}`
+        : message.channel;
+}
+
+/** One key per conversation thread, shared by every sender posting in it. */
+export function buildSlackThreadKey(
+  message: SlackMessageEvent,
+  accountId: string,
+  teamId?: string,
+): string | null {
+  if (!message.channel) {
+    return null;
+  }
+  return `slack:${accountId}:${teamId ? `${teamId}:` : ""}${resolveSlackThreadScope(message)}`;
+}
+
 export function buildSlackDebounceKey(
   message: SlackMessageEvent,
   accountId: string,
@@ -37,13 +60,5 @@ export function buildSlackDebounceKey(
   if (!senderId) {
     return null;
   }
-  const messageTs = message.ts ?? message.event_ts;
-  const threadKey = message.thread_ts
-    ? `${message.channel}:${message.thread_ts}`
-    : message.parent_user_id && messageTs
-      ? `${message.channel}:maybe-thread:${messageTs}`
-      : messageTs && !isSlackDirectMessageChannel(message.channel)
-        ? `${message.channel}:${messageTs}`
-        : message.channel;
-  return `slack:${accountId}:${teamId ? `${teamId}:` : ""}${threadKey}:${senderId}`;
+  return `slack:${accountId}:${teamId ? `${teamId}:` : ""}${resolveSlackThreadScope(message)}:${senderId}`;
 }

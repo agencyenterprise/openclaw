@@ -41,6 +41,8 @@ it("while unavailable, every turn in the process settles UNKNOWN", async () => {
   markLogicalDispatchAccountingUnavailable("slack: WebClient.makeRequest is missing");
   for (const scope of ["slack/C1/1.1", "slack/C2/2.2"]) {
     const ledger = createLogicalTurnLedger(`claim-${scope}`, scope);
-    await expect(settleLogicalTurnLedger(ledger, true)).resolves.toBeUndefined();
+    await expect(
+      settleLogicalTurnLedger(ledger, { kind: "returned", observedCompletion: true }),
+    ).resolves.toBeUndefined();
   }
 });

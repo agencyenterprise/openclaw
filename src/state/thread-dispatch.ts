@@ -5,12 +5,16 @@ import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
   beginLedgerAttempt,
   ledgerAcceptsAttempts,
+  ledgerHasWorkInFlight,
   beginLedgerEffect,
   createLogicalTurnLedger,
+  leaveLogicalTurnUnknown,
+  LOGICAL_EFFECT_SETTLE_TIMEOUT_MS,
   sealLogicalTurnLedger,
   settleLogicalTurnLedger,
   warnLateOperation,
@@ -18,6 +22,11 @@ import {
   type LogicalTurnLedger,
 } from "./logical-turn-ledger.js";
 import { readEndedCleanupProof, readThrownCleanupProof } from "./native-cleanup-evidence.js";
+import {
+  countLiveChildClaims,
+  releaseFinishedUnknownClaim,
+  rememberFinishedUnknownClaim,
+} from "./native-finished-release.js";
 import {
   captureNativeOwner,
   inspectNativeOwner,
@@ -37,7 +46,12 @@ type NativeControlProbe = {
   disposition: "HANDLED" | "NOT_HANDLED" | "UNVERIFIED";
   receipt?: NativeControlReceipt;
 };
-const nativeControlProbe = new AsyncLocalStorage<NativeControlProbe>();
+// All fence state is process-wide: plugins loaded through jiti get their own copy of this
+// module, and an owner opened by one copy must be the owner every other copy sees.
+const nativeControlProbe = resolveGlobalSingleton(
+  Symbol.for("openclaw.threadDispatch.nativeControlProbe"),
+  () => new AsyncLocalStorage<NativeControlProbe>(),
+);
 /** Private host control capability; no message field can activate this path. */
 export async function withNativeControlProbe(run: () => Promise<unknown>): Promise<{
   disposition: "HANDLED" | "NOT_HANDLED" | "UNVERIFIED";
@@ -102,7 +116,10 @@ type DispatchContext = {
   childIndex: number;
   closed?: boolean;
 };
-const dispatchContext = new AsyncLocalStorage<DispatchContext | { unconfigured: true }>();
+const dispatchContext = resolveGlobalSingleton(
+  Symbol.for("openclaw.threadDispatch.dispatchContext"),
+  () => new AsyncLocalStorage<DispatchContext | { unconfigured: true }>(),
+);
 export function admitDispatchChild(identity: unknown): (() => void) | undefined {
   const parent = dispatchContext.getStore();
   if (!parent) {
@@ -128,6 +145,7 @@ const scopePattern = /^(?:slack\/[CGD][A-Z0-9]+\/[0-9]+\.[0-9]{6}|session\/[a-f0
 const frozenSchema =
   "CREATE TABLE thread_fences (\n scope_key TEXT PRIMARY KEY NOT NULL,\n epoch INTEGER NOT NULL CHECK(epoch >= 1),\n state TEXT NOT NULL CHECK(state IN ('OPEN','DRAINING','RETIRED')),\n updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)\n) STRICT;\nCREATE TABLE thread_dispatch_claims (\n claim_id TEXT PRIMARY KEY NOT NULL,\n scope_key TEXT NOT NULL REFERENCES thread_fences(scope_key),\n epoch INTEGER NOT NULL CHECK(epoch >= 1),\n fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64),\n kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 64),\n state TEXT NOT NULL CHECK(state IN ('STARTING','RUNNING','UNKNOWN','TERMINAL')),\n created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),\n updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),\n terminal_receipt TEXT,\n CHECK((state='TERMINAL' AND terminal_receipt IS NOT NULL AND length(terminal_receipt)=64)\n       OR (state!='TERMINAL' AND terminal_receipt IS NULL))\n) STRICT;\nCREATE INDEX thread_dispatch_open_claims ON thread_dispatch_claims(scope_key,epoch,state);\nCREATE UNIQUE INDEX thread_dispatch_one_native ON thread_dispatch_claims(scope_key) WHERE kind='native' AND state!='TERMINAL';\nPRAGMA user_version=2;\n";
 const shaPattern = /^[a-f0-9]{64}$/;
+const fenceLog = createSubsystemLogger("state/thread-dispatch");
 export const dispatchHash = (value: unknown): string =>
   createHash("sha256").update(JSON.stringify(value)).digest("hex");
 function refuse(): never {
@@ -331,15 +349,24 @@ function validClaim(claim: DispatchClaim): void {
   )
     refuse();
 }
-export class NativeDispatchBusyError extends Error {
+class NativeDispatchBusy extends Error {
   readonly code = "NATIVE_BUSY";
   constructor() {
     super("NATIVE_BUSY");
     this.name = "NativeDispatchBusyError";
   }
 }
+// One class per process, so `instanceof` holds whichever module copy threw it.
+export const NativeDispatchBusyError = resolveGlobalSingleton(
+  Symbol.for("openclaw.threadDispatch.NativeDispatchBusyError"),
+  () => NativeDispatchBusy,
+);
+export type NativeDispatchBusyError = NativeDispatchBusy;
 type NativeAdmissionBusyReceipt = Readonly<{ claimId: string; scopeKey: string; epoch: number }>;
-const nativeAdmissionBusyReceipts = new WeakMap<object, NativeAdmissionBusyReceipt>();
+const nativeAdmissionBusyReceipts = resolveGlobalSingleton(
+  Symbol.for("openclaw.threadDispatch.nativeAdmissionBusyReceipts"),
+  () => new WeakMap<object, NativeAdmissionBusyReceipt>(),
+);
 /** Private provenance: only a rejected SQL admission can produce this receipt. */
 export function readNativeAdmissionBusy(error: unknown): NativeAdmissionBusyReceipt | undefined {
   return typeof error === "object" && error !== null
@@ -388,7 +415,7 @@ export function admitThreadDispatch(
           "SELECT * FROM thread_dispatch_claims WHERE scope_key=? AND kind='native' AND state!='TERMINAL'",
         )
         .get(claim.scopeKey);
-      if (old)
+      if (old && !releaseFinishedUnknownClaim(db, config.databasePath, old))
         recoverDeadNativeOwner(db, config.databasePath, {
           claimId: String(old.claim_id),
           scopeKey: String(old.scope_key),
@@ -521,6 +548,8 @@ export async function withThreadDispatch<T>(params: {
   run: () => Promise<T>;
   terminalReceipt: (result: T) => string | undefined;
   failedErrorReceipt?: (error: unknown) => string | undefined;
+  /** Whether work the run started may still be running after it ended. */
+  workInFlight?: () => boolean;
   timeoutMs?: number;
   config?: DispatchConfig;
 }): Promise<T> {
@@ -546,13 +575,24 @@ export async function withThreadDispatch<T>(params: {
       return params.run();
     });
     owner.closed = true;
-    settleThreadDispatch(config, claim, params.terminalReceipt(result));
+    settleEndedOwner(config, claim, params.terminalReceipt(result), params.workInFlight);
     return result;
   } catch (error) {
     owner.closed = true;
     // If reconciliation itself fails, STARTING remains durable and blocks retirement.
-    settleThreadDispatch(config, claim, params.failedErrorReceipt?.(error));
+    settleEndedOwner(config, claim, params.failedErrorReceipt?.(error), params.workInFlight);
     throw error;
+  }
+}
+function settleEndedOwner(
+  config: DispatchConfig,
+  claim: DispatchClaim,
+  receipt: string | undefined,
+  workInFlight: (() => boolean) | undefined,
+): void {
+  settleThreadDispatch(config, claim, receipt);
+  if (receipt === undefined && claim.kind === "native") {
+    rememberFinishedUnknownClaim(config.databasePath, claim, workInFlight);
   }
 }
 
@@ -564,7 +604,10 @@ type NativePreAdmissionRefusal = Readonly<{
   claimId: string;
   epoch: number;
 }>;
-const preAdmissionRefusals = new WeakMap<object, NativePreAdmissionRefusal>();
+const preAdmissionRefusals = resolveGlobalSingleton(
+  Symbol.for("openclaw.threadDispatch.preAdmissionRefusals"),
+  () => new WeakMap<object, NativePreAdmissionRefusal>(),
+);
 export function readNativePreAdmissionRefusal(
   error: unknown,
 ): NativePreAdmissionRefusal | undefined {
@@ -584,11 +627,10 @@ type LogicalDispatchContext = {
   replyEntered?: boolean;
   observeCompleted: (receipt: string) => void;
   hooks: Promise<boolean>[];
+  pendingHooks: number;
   acceptingHooks: boolean;
   ledger: LogicalTurnLedger;
 };
-// Process-wide: plugins loaded through jiti get their own copy of this module, and
-// their sends must still see the owner that core opened.
 const logicalDispatchContext = resolveGlobalSingleton(
   Symbol.for("openclaw.threadDispatch.logicalDispatchContext"),
   () => new AsyncLocalStorage<LogicalDispatchContext>(),
@@ -614,16 +656,21 @@ export function trackLogicalDispatchHook(task: () => Promise<unknown>): boolean 
   const logical = logicalDispatchContext.getStore();
   if (!logical || (logical.role !== "dispatch" && logical.role !== "host")) return false;
   if (!logical.acceptingHooks) refuse();
+  let hook: Promise<boolean>;
   try {
-    logical.hooks.push(
-      task().then(
-        () => true,
-        () => false,
-      ),
+    hook = task().then(
+      () => true,
+      () => false,
     );
   } catch {
     throw new Error("THREAD_DISPATCH_HOOK_FAILED");
   }
+  logical.pendingHooks += 1;
+  logical.hooks.push(
+    hook.finally(() => {
+      logical.pendingHooks -= 1;
+    }),
+  );
   return true;
 }
 /**
@@ -764,7 +811,9 @@ async function withLogicalOwner<T>(
   const sessionKey = params.sessionKey;
   const sourceTurnId = params.sourceTurnId;
   let completedReceipt: string | undefined;
+  let failedReceipt: string | undefined;
   let entered = false;
+  let turn: LogicalDispatchContext | undefined;
   const claimId = `logical:${dispatchHash({ scopeKey, sourceTurnId })}`;
   const epoch = config.scopes[scopeKey];
   if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 1) refuse();
@@ -787,6 +836,7 @@ async function withLogicalOwner<T>(
           role,
           hooks: [],
           acceptingHooks: true,
+          pendingHooks: 0,
           ledger: createLogicalTurnLedger(claimId, scopeKey),
           observeCompleted: (receipt) => {
             if (logical.ledger.sealed) {
@@ -798,6 +848,7 @@ async function withLogicalOwner<T>(
             completedReceipt = receipt;
           },
         };
+        turn = logical;
         return logicalDispatchContext.run(logical, async () => {
           try {
             const result = await params.run(logical.observeCompleted);
@@ -816,7 +867,7 @@ async function withLogicalOwner<T>(
             }
             const settlement = await settleLogicalTurnLedger(
               logical.ledger,
-              completedReceipt !== undefined,
+              { kind: "returned", observedCompletion: completedReceipt !== undefined },
               params.abortSignal,
             );
             completedReceipt = settlement
@@ -830,14 +881,26 @@ async function withLogicalOwner<T>(
               : undefined;
             if (params.abortSignal?.aborted) throw new Error("THREAD_DISPATCH_ABORTED");
             return result;
+          } catch (error) {
+            failedReceipt = await settleFailedLogicalTurn(logical, params.abortSignal).catch(
+              (settleError: unknown) => {
+                fenceLog.error(
+                  `failed logical turn could not be settled; leaving UNKNOWN: claim=${claimId} error=${String(settleError)}`,
+                );
+                return undefined;
+              },
+            );
+            throw error;
           } finally {
             logical.acceptingHooks = false;
-            // A throw or abort settles UNKNOWN: nothing more may start in the turn either way.
             sealLogicalTurnLedger(logical.ledger);
           }
         });
       },
       terminalReceipt: () => completedReceipt,
+      failedErrorReceipt: () => failedReceipt,
+      workInFlight: () =>
+        turn !== undefined && (turn.pendingHooks > 0 || ledgerHasWorkInFlight(turn.ledger)),
     });
   } catch (error) {
     if (role === "dispatch" && !entered && error instanceof NativeDispatchBusyError) {
@@ -848,6 +911,72 @@ async function withLogicalOwner<T>(
     }
     throw error;
   }
+}
+
+/** How the turn's hooks ended by `deadline`: all succeeded, one failed, or one still runs. */
+function drainLogicalHooksWithin(
+  hooks: Promise<boolean>[],
+  deadline: number,
+): Promise<"succeeded" | "failed" | "unsettled"> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve("unsettled"), Math.max(0, deadline - Date.now()));
+    void Promise.all(hooks).then((results) => {
+      clearTimeout(timer);
+      resolve(results.every(Boolean) ? "succeeded" : "failed");
+    });
+  });
+}
+
+/**
+ * The receipt of a logical turn whose run threw, or undefined to leave it UNKNOWN.
+ * It settles TERMINAL only on proof that nothing the turn started can still act:
+ * every hook ended without failing, the ledger settles (each native attempt ended with its
+ * cleanup proof, each send has a known outcome), and no child process claim is
+ * still live. An aborted turn, or one whose ledger was already decided, stays UNKNOWN.
+ */
+async function settleFailedLogicalTurn(
+  logical: LogicalDispatchContext,
+  signal: AbortSignal | undefined,
+): Promise<string | undefined> {
+  const { ledger, owner } = logical;
+  if (ledger.sealed) {
+    return undefined;
+  }
+  if (signal?.aborted) {
+    return leaveLogicalTurnUnknown(ledger, "failed-turn-aborted");
+  }
+  logical.acceptingHooks = false;
+  const hooks = await drainLogicalHooksWithin(
+    logical.hooks,
+    Date.now() + LOGICAL_EFFECT_SETTLE_TIMEOUT_MS,
+  );
+  if (hooks !== "succeeded") {
+    return leaveLogicalTurnUnknown(
+      ledger,
+      `hooks-${hooks} waitedMs=${LOGICAL_EFFECT_SETTLE_TIMEOUT_MS}`,
+    );
+  }
+  if (signal?.aborted) {
+    return leaveLogicalTurnUnknown(ledger, "failed-turn-aborted");
+  }
+  const settlement = await settleLogicalTurnLedger(ledger, { kind: "threw" }, signal);
+  if (!settlement) {
+    return undefined;
+  }
+  if (signal?.aborted) {
+    return leaveLogicalTurnUnknown(ledger, "failed-turn-aborted");
+  }
+  owner.closed = true;
+  const liveChildren = database(owner.config, (db) => countLiveChildClaims(db, owner.claim));
+  if (liveChildren) {
+    return leaveLogicalTurnUnknown(ledger, `child-claims-live live=${liveChildren}`);
+  }
+  return dispatchHash({
+    kind: "logical_turn_failed_settled",
+    sourceTurnId: logical.sourceTurnId,
+    sessionKey: logical.sessionKey,
+    ...settlement,
+  });
 }
 
 /**
@@ -947,7 +1076,10 @@ type CronDispatchContext = {
   failedReceipt?: string;
   closed: boolean;
 };
-const cronDispatchContext = new AsyncLocalStorage<CronDispatchContext>();
+const cronDispatchContext = resolveGlobalSingleton(
+  Symbol.for("openclaw.threadDispatch.cronDispatchContext"),
+  () => new AsyncLocalStorage<CronDispatchContext>(),
+);
 export const hasCronDispatchOwner = (): boolean => cronDispatchContext.getStore() !== undefined;
 export function bindCronDispatchSession(sessionKey: string): void {
   const context = cronDispatchContext.getStore();

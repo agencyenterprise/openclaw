@@ -102,6 +102,14 @@ export function createLogicalTurnLedger(claimId: string, scopeKey: string): Logi
   return { claimId, scopeKey, attempts: [], effects: [], acceptingAttempts: true, sealed: false };
 }
 
+/** Whether a native attempt or a send of the turn has not reported how it ended. */
+export function ledgerHasWorkInFlight(ledger: LogicalTurnLedger): boolean {
+  return (
+    ledger.attempts.some((attempt) => !attempt.outcome) ||
+    ledger.effects.some((effect) => !effect.outcome)
+  );
+}
+
 /** Whether a new native or dispatch attempt may still join the turn. */
 export function ledgerAcceptsAttempts(ledger: LogicalTurnLedger): boolean {
   return ledger.acceptingAttempts && !ledger.sealed;
@@ -270,22 +278,21 @@ export type LedgerSettlement = {
 };
 
 /**
- * Decides whether a returned turn may settle TERMINAL. Every native attempt must
- * have ended and carry an ended-run cleanup proof, and the last one must have
- * returned: an attempt that threw counts only when a later one returned (a model
- * fallback). A turn with no attempt needs its observed completion
- * (`observedCompletion`). Either way every send must have a known outcome, and
- * every channel must be able to account for its sends. Attempt admission closes
- * when settlement starts, and the attempt evidence is read again after the last
- * await, right before the seal. The ledger is sealed at the decision, whatever it is.
+ * How the turn itself ended. `returned`: its run returned; `observedCompletion`
+ * tells whether the reply path observed it complete. `threw`: its run threw.
  */
+export type LogicalTurnEnd = { kind: "returned"; observedCompletion: boolean } | { kind: "threw" };
+
 /**
  * The turn's attempt evidence, read synchronously: the ended-run receipts when
- * every attempt ended with one and the last returned, or why not.
+ * every attempt ended with one, or why not. A returned turn also needs its last
+ * attempt to have returned (an attempt that threw counts only when a later one
+ * returned, a model fallback), and, with no attempt at all, its observed
+ * completion. A turn that threw needs neither: whatever it ran has ended.
  */
 function readAttemptEvidence(
   ledger: LogicalTurnLedger,
-  observedCompletion: boolean,
+  end: LogicalTurnEnd,
 ): { receipts: string[] } | { unknownReason: string } {
   const attempts = ledger.attempts.length;
   const running = ledger.attempts.filter((attempt) => !attempt.outcome).length;
@@ -300,33 +307,47 @@ function readAttemptEvidence(
       unknownReason: `attempt-without-ended-run-proof attempts=${attempts} proven=${receipts.length}`,
     };
   }
+  if (end.kind === "threw") {
+    return { receipts };
+  }
   if (ledger.attempts.at(-1)?.outcome === "threw") {
     return { unknownReason: `last-attempt-threw attempts=${attempts}` };
   }
-  if (!observedCompletion && !attempts) {
+  if (!end.observedCompletion && !attempts) {
     return { unknownReason: "no-attempt-and-no-observed-completion" };
   }
   return { receipts };
 }
 
+/**
+ * Decides whether a turn may settle TERMINAL on its ledger. Every native attempt
+ * must have ended and carry an ended-run cleanup proof (see readAttemptEvidence
+ * for what `end` adds), every send must have a known outcome, and every channel
+ * must be able to account for its sends. Attempt admission closes when
+ * settlement starts, and the attempt evidence is read again after the last
+ * await, right before the seal. The ledger is sealed at the decision, whatever it is.
+ */
+/** Seals the ledger and logs why its turn stays UNKNOWN. */
+export function leaveLogicalTurnUnknown(ledger: LogicalTurnLedger, reason: string): undefined {
+  ledger.sealed = true;
+  ledgerLog.warn(`logical turn left UNKNOWN: claim=${ledger.claimId} reason=${reason}`);
+  return undefined;
+}
+
 export async function settleLogicalTurnLedger(
   ledger: LogicalTurnLedger,
-  observedCompletion: boolean,
+  end: LogicalTurnEnd,
   signal?: AbortSignal,
 ): Promise<LedgerSettlement | undefined> {
   // From here on no attempt joins the turn; its sends still drain below.
   ledger.acceptingAttempts = false;
-  const leaveUnknown = (reason: string): undefined => {
-    ledger.sealed = true;
-    ledgerLog.warn(`logical turn left UNKNOWN: claim=${ledger.claimId} reason=${reason}`);
-    return undefined;
-  };
+  const leaveUnknown = (reason: string) => leaveLogicalTurnUnknown(ledger, reason);
   if (accountingUnavailable.reasons.size) {
     return leaveUnknown(
       `accounting-unavailable reasons=${[...accountingUnavailable.reasons].join(",")}`,
     );
   }
-  const early = readAttemptEvidence(ledger, observedCompletion);
+  const early = readAttemptEvidence(ledger, end);
   if ("unknownReason" in early) {
     return leaveUnknown(early.unknownReason);
   }
@@ -343,7 +364,7 @@ export async function settleLogicalTurnLedger(
   } while (ledger.effects.some((effect) => !effect.outcome));
   // No await from here to the seal: nothing can start between check and decision.
   // Attempts are read again: evidence must hold at the decision, not only before the drain.
-  const evidence = readAttemptEvidence(ledger, observedCompletion);
+  const evidence = readAttemptEvidence(ledger, end);
   if ("unknownReason" in evidence) {
     return leaveUnknown(evidence.unknownReason);
   }
@@ -355,8 +376,14 @@ export async function settleLogicalTurnLedger(
     );
   }
   ledger.sealed = true;
+  const basis =
+    end.kind === "threw"
+      ? "failed-turn-evidence"
+      : end.observedCompletion
+        ? "observed-completion"
+        : "ended-run-proof";
   ledgerLog.info(
-    `logical turn settled on ${observedCompletion ? "observed-completion" : "ended-run-proof"}: claim=${ledger.claimId} attempts=${evidence.receipts.length} sendsCompleted=${count("completed")} sendsNotSent=${count("not_sent")}`,
+    `logical turn settled on ${basis}: claim=${ledger.claimId} attempts=${evidence.receipts.length} sendsCompleted=${count("completed")} sendsNotSent=${count("not_sent")}`,
   );
   return {
     attempts: evidence.receipts,

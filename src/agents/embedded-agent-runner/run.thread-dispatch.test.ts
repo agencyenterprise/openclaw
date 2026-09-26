@@ -243,7 +243,8 @@ it("V3 inherited native owner cannot bypass drain when host opt-in environment d
       },
     })).rejects.toThrow("THREAD_DISPATCH_REFUSED");
     expect(runEmbeddedAgentViaCliBackendIfEligible).not.toHaveBeenCalled();
-    expect(db.prepare("SELECT state FROM thread_dispatch_claims").get()?.state).toBe("UNKNOWN");
+    // Refused before any attempt began: the failed turn proves it ran nothing.
+    expect(db.prepare("SELECT state FROM thread_dispatch_claims").get()?.state).toBe("TERMINAL");
   } finally { db.close(); }
 });
 describe("a run whose last tool batch ended the loop (stopReason toolUse)", () => {

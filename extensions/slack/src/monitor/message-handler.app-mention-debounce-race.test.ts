@@ -3,6 +3,7 @@
 import { resolveGlobalDedupeCache } from "openclaw/plugin-sdk/dedupe-runtime";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { setSlackRuntime } from "../runtime.js";
+import { resetSlackInboundThreadWaitsForTest } from "./inbound-thread-wait.js";
 
 type FlushEntry = {
   message: Record<string, unknown>;
@@ -181,6 +182,7 @@ describe("createSlackMessageHandler app_mention copy held in the debouncer", () 
   });
 
   beforeEach(() => {
+    resetSlackInboundThreadWaitsForTest();
     prepareSlackMessageMock.mockReset();
     dispatchPreparedSlackMessageMock.mockReset();
     dispatchPreparedSlackMessageMock.mockResolvedValue(undefined);
@@ -237,9 +239,12 @@ describe("createSlackMessageHandler app_mention copy held in the debouncer", () 
       expect(dispatchPreparedSlackMessageMock).toHaveBeenCalledTimes(1);
       heldAppMentionFlushes.pending.length = 0;
 
-      // The seen gate was released, so Slack's app_mention retry of the same post must run.
+      // The seen gate was released, so Slack's app_mention retry of the same post must run. It
+      // joins the post already waiting on the busy thread, which redelivers it once.
       const handler = lastHandler;
       await sendMentionEvent(handler);
+      await releaseHeldAppMentionFlushes();
+      await vi.advanceTimersByTimeAsync(1_000);
       await releaseHeldAppMentionFlushes();
 
       expect(dispatchPreparedSlackMessageMock).toHaveBeenCalledTimes(2);

@@ -12,6 +12,7 @@ const resolveThreadTsMock = vi.fn(async ({ message }: { message: Record<string, 
   ...message,
 }));
 const { createSlackMessageHandler } = await import("./message-handler.js");
+const { resetSlackInboundThreadWaitsForTest } = await import("./inbound-thread-wait.js");
 
 vi.mock("openclaw/plugin-sdk/channel-inbound", async () => {
   const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/channel-inbound")>(
@@ -114,9 +115,25 @@ async function handleDirectMessage(
 const CLAIM_BUSY_ERROR_MESSAGE =
   "restart recovery claim busy for agent:main:main:thread:C0AHSKBNDB6:1788473062.847669";
 
-function withRetryAttempt(entry: unknown, retryAttempt: number) {
+const OPS_ALERT_CHANNEL = "C0A3C98HS48";
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+
+function withHeldRetry(
+  entry: unknown,
+  heldRetry: { firstFailureAtMs?: number; attempts: number; sessionInitConflicts?: number },
+) {
   const typed = entry as { message: unknown; opts: Record<string, unknown> };
-  return { ...typed, opts: { ...typed.opts, retryAttempt } };
+  return {
+    ...typed,
+    opts: {
+      ...typed.opts,
+      heldRetry: {
+        firstFailureAtMs: heldRetry.firstFailureAtMs ?? Date.now(),
+        attempts: heldRetry.attempts,
+        sessionInitConflicts: heldRetry.sessionInitConflicts ?? 0,
+      },
+    },
+  };
 }
 
 /** The dropped 2026-09-07 directive: an @mention in a thread whose session was busy. */
@@ -131,6 +148,7 @@ const BUSY_CLAIM_MENTION = {
 
 describe("createSlackMessageHandler", () => {
   beforeEach(() => {
+    resetSlackInboundThreadWaitsForTest();
     enqueueMock.mockClear();
     flushKeyMock.mockClear();
     onFlushCallbacks.length = 0;
@@ -399,10 +417,9 @@ describe("createSlackMessageHandler", () => {
       expect(enqueueMock).toHaveBeenCalledTimes(2);
       expect(enqueueMock.mock.calls[1]?.[0]).toMatchObject({
         opts: {
-          retryAttempt: 1,
+          heldRetry: { attempts: 1, sessionInitConflicts: 1 },
         },
       });
-      expect(enqueueMock.mock.calls[1]?.[0]).not.toHaveProperty("opts.dispatchCompletion");
     } finally {
       vi.useRealTimers();
     }
@@ -487,7 +504,9 @@ describe("createSlackMessageHandler", () => {
       expect(recordSlackInboundMessageDeliveriesMock).not.toHaveBeenCalled();
       expect(releaseSeenMessage).toHaveBeenCalledWith("C0AHSKBNDB6", "1788774766.101659");
       expect(enqueueMock).toHaveBeenCalledTimes(2);
-      expect(enqueueMock.mock.calls[1]?.[0]).toMatchObject({ opts: { retryAttempt: 1 } });
+      expect(enqueueMock.mock.calls[1]?.[0]).toMatchObject({
+        opts: { heldRetry: { attempts: 1, sessionInitConflicts: 0 } },
+      });
     } finally {
       vi.useRealTimers();
     }
@@ -506,7 +525,7 @@ describe("createSlackMessageHandler", () => {
     };
     // A fifth attempt must wait far longer than the first: a busy claim is held for as
     // long as the turn that owns it runs.
-    const retriedEntry = withRetryAttempt(entry, 4);
+    const retriedEntry = withHeldRetry(entry, { attempts: 4 });
     vi.useFakeTimers();
     try {
       await expect(onFlushCallbacks[0]?.([retriedEntry])).rejects.toThrow("Slack dispatch failed");
@@ -515,13 +534,15 @@ describe("createSlackMessageHandler", () => {
 
       await vi.advanceTimersByTimeAsync(14_000);
       expect(enqueueMock).toHaveBeenCalledTimes(2);
-      expect(enqueueMock.mock.calls[1]?.[0]).toMatchObject({ opts: { retryAttempt: 5 } });
+      expect(enqueueMock.mock.calls[1]?.[0]).toMatchObject({
+        opts: { heldRetry: { attempts: 5 } },
+      });
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("replies in the thread when the busy-claim retry budget is spent", async () => {
+  it("alerts operators, never the thread, once the busy-thread wait has run six hours", async () => {
     const postMessage = vi.fn(async (_payload: Record<string, unknown>) => ({ ok: true }));
     const runtimeError = vi.fn();
     dispatchPreparedSlackMessageMock.mockRejectedValueOnce(
@@ -530,34 +551,56 @@ describe("createSlackMessageHandler", () => {
     const { handler } = createHandlerWithTracker({ postMessage, runtimeError });
     await handler(BUSY_CLAIM_MENTION as never, { source: "app_mention", wasMentioned: true });
 
-    const entry = enqueueMock.mock.calls[0]?.[0] as {
-      message: unknown;
-      opts: Record<string, unknown>;
-    };
-    const spentEntry = withRetryAttempt(entry, 99);
+    const spentEntry = withHeldRetry(enqueueMock.mock.calls[0]?.[0], {
+      firstFailureAtMs: Date.now() - SIX_HOURS_MS,
+      attempts: 360,
+    });
 
     await expect(onFlushCallbacks[0]?.([spentEntry])).rejects.toThrow("Slack dispatch failed");
 
     expect(enqueueMock).toHaveBeenCalledTimes(1);
     expect(recordSlackInboundMessageDeliveriesMock).not.toHaveBeenCalled();
-    // A swapped ack reaction on its own is silence that reads as acknowledgement.
     expect(postMessage).toHaveBeenCalledTimes(1);
-    const notice = postMessage.mock.calls[0]?.[0] as {
+    const alert = postMessage.mock.calls[0]?.[0] as {
       channel: string;
-      thread_ts: string;
+      thread_ts?: string;
       text: string;
     };
-    expect(notice).toMatchObject({
-      channel: "C0AHSKBNDB6",
-      thread_ts: "1788473062.847669",
-    });
-    expect(notice.text).toContain("could not process this message");
+    expect(alert.channel).toBe(OPS_ALERT_CHANNEL);
+    expect(alert.thread_ts).toBeUndefined();
+    expect(alert.text).toContain("channel: C0AHSKBNDB6 | ts: 1788774766.101659");
+    expect(alert.text).toContain("attempts: 361");
+    expect(alert.text).not.toContain("resend");
     expect(runtimeError.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
-      "was not processed after",
+      "Slack inbound message undeliverable after 6h",
     );
   });
 
-  it("still answers a spent entry batched with one that has retry budget left", async () => {
+  it("keeps the redelivery's retry clock when Slack's other copy collapses into its batch", async () => {
+    const postMessage = vi.fn(async (_payload: Record<string, unknown>) => ({ ok: true }));
+    dispatchPreparedSlackMessageMock.mockRejectedValueOnce(
+      new Error("Slack dispatch failed", { cause: new Error(CLAIM_BUSY_ERROR_MESSAGE) }),
+    );
+    const { handler } = createHandlerWithTracker({ postMessage });
+    await handler(BUSY_CLAIM_MENTION as never, { source: "app_mention", wasMentioned: true });
+    await handler({ ...BUSY_CLAIM_MENTION, type: "message" } as never, { source: "message" });
+
+    const redelivery = withHeldRetry(enqueueMock.mock.calls[0]?.[0], {
+      firstFailureAtMs: Date.now() - SIX_HOURS_MS,
+      attempts: 360,
+    });
+    const messageCopy = enqueueMock.mock.calls[1]?.[0] as Record<string, unknown>;
+
+    await expect(onFlushCallbacks[0]?.([redelivery, messageCopy])).rejects.toThrow(
+      "Slack dispatch failed",
+    );
+
+    // The collapse keeps the richer message copy; a fresh clock there would restart six hours.
+    expect(postMessage).toHaveBeenCalledTimes(1);
+    expect(postMessage.mock.calls[0]?.[0]).toMatchObject({ channel: OPS_ALERT_CHANNEL });
+  });
+
+  it("alerts for a spent entry batched with one that is still inside its wait", async () => {
     const postMessage = vi.fn(async (_payload: Record<string, unknown>) => ({ ok: true }));
     dispatchPreparedSlackMessageMock.mockRejectedValueOnce(
       new Error("Slack dispatch failed", { cause: new Error(CLAIM_BUSY_ERROR_MESSAGE) }),
@@ -569,25 +612,25 @@ describe("createSlackMessageHandler", () => {
       wasMentioned: true,
     });
 
-    const spent = withRetryAttempt(enqueueMock.mock.calls[0]?.[0], 99);
+    const spent = withHeldRetry(enqueueMock.mock.calls[0]?.[0], {
+      firstFailureAtMs: Date.now() - SIX_HOURS_MS,
+      attempts: 360,
+    });
     const fresh = enqueueMock.mock.calls[1]?.[0] as Record<string, unknown>;
     vi.useFakeTimers();
     try {
       await expect(onFlushCallbacks[0]?.([spent, fresh])).rejects.toThrow("Slack dispatch failed");
 
-      // Dropping the spent entry silently because a sibling was retried is the same
-      // class of bug as the original incident.
+      // Dropping the spent entry silently because a sibling kept waiting is the same class of
+      // bug as the original incident.
       expect(postMessage).toHaveBeenCalledTimes(1);
-      expect(postMessage.mock.calls[0]?.[0]).toMatchObject({
-        channel: "C0AHSKBNDB6",
-        thread_ts: "1788473062.847669",
-      });
+      expect(postMessage.mock.calls[0]?.[0]).toMatchObject({ channel: OPS_ALERT_CHANNEL });
 
       await vi.advanceTimersByTimeAsync(1_000);
       expect(enqueueMock).toHaveBeenCalledTimes(3);
       expect(enqueueMock.mock.calls[2]?.[0]).toMatchObject({
         message: { ts: "1788774790.000200" },
-        opts: { retryAttempt: 1 },
+        opts: { heldRetry: { attempts: 1 } },
       });
     } finally {
       vi.useRealTimers();
@@ -606,9 +649,12 @@ describe("createSlackMessageHandler", () => {
     const { handler } = createHandlerWithTracker({ postMessage });
     await handler(BUSY_CLAIM_MENTION as never, { source: "app_mention", wasMentioned: true });
 
-    // A busy claim would still have budget at this attempt; a session-init conflict,
+    // A busy claim would still be inside its wait at this attempt; a session-init conflict,
     // which settles in milliseconds, must not keep retrying for minutes.
-    const spent = withRetryAttempt(enqueueMock.mock.calls[0]?.[0], 3);
+    const spent = withHeldRetry(enqueueMock.mock.calls[0]?.[0], {
+      attempts: 3,
+      sessionInitConflicts: 3,
+    });
     vi.useFakeTimers();
     try {
       await expect(onFlushCallbacks[0]?.([spent])).rejects.toThrow("Slack dispatch failed");
@@ -616,6 +662,8 @@ describe("createSlackMessageHandler", () => {
 
       expect(enqueueMock).toHaveBeenCalledTimes(1);
       expect(postMessage).toHaveBeenCalledTimes(1);
+      expect(postMessage.mock.calls[0]?.[0]).toMatchObject({ channel: OPS_ALERT_CHANNEL });
+      expect(postMessage.mock.calls[0]?.[0]).not.toHaveProperty("thread_ts");
     } finally {
       vi.useRealTimers();
     }
@@ -631,13 +679,16 @@ describe("createSlackMessageHandler", () => {
     const { handler } = createHandlerWithTracker({ postMessage, runtimeError });
     await handler(BUSY_CLAIM_MENTION as never, { source: "app_mention", wasMentioned: true });
 
-    const spent = withRetryAttempt(enqueueMock.mock.calls[0]?.[0], 99);
+    const spent = withHeldRetry(enqueueMock.mock.calls[0]?.[0], {
+      firstFailureAtMs: Date.now() - SIX_HOURS_MS,
+      attempts: 360,
+    });
     await expect(onFlushCallbacks[0]?.([spent])).rejects.toThrow("Slack dispatch failed");
 
     expect(postMessage).not.toHaveBeenCalled();
-    // The failure is still on record for operators even when the thread stays quiet.
-    expect(runtimeError.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
-      "was not processed after",
+    // A post another path delivered is not a failure, so nothing reports it as one.
+    expect(runtimeError.mock.calls.map((call) => String(call[0])).join("\n")).not.toContain(
+      "undeliverable",
     );
   });
 
