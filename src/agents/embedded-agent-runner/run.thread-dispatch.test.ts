@@ -246,3 +246,102 @@ it("V3 inherited native owner cannot bypass drain when host opt-in environment d
     expect(db.prepare("SELECT state FROM thread_dispatch_claims").get()?.state).toBe("UNKNOWN");
   } finally { db.close(); }
 });
+describe("a run whose last tool batch ended the loop (stopReason toolUse)", () => {
+  const nativeState = (db: ReturnType<typeof prepareFence>["db"], runId: string) =>
+    db.prepare("SELECT state FROM thread_dispatch_claims WHERE claim_id=?").get(`native:${runId}`)
+      ?.state;
+  const toolUseResult = (meta: Record<string, unknown> = {}) =>
+    ({
+      ...dispatchResult,
+      payloads: [],
+      meta: {
+        durationMs: 1,
+        stopReason: "toolUse",
+        agentMeta: { agentHarnessId: "openclaw" },
+        ...meta,
+      },
+    }) as unknown as EmbeddedAgentRunResult;
+  async function runToolUseTurn(
+    runId: string,
+    cleanup: "verified" | "unverified" | "none",
+    meta = {},
+  ) {
+    const { beginNativeCleanupAttempt } = await import("./native-cleanup-proof.js");
+    runEmbeddedAgentViaCliBackendIfEligible.mockImplementation(async () => {
+      if (cleanup !== "none") {
+        beginNativeCleanupAttempt()(cleanup === "verified");
+      }
+      return toolUseResult(meta);
+    });
+    await runEmbeddedAgent({ ...laneRunParams(), runId });
+  }
+
+  it("settles TERMINAL with verified cleanup; the next turn in the thread is admitted", async () => {
+    const { db } = prepareFence();
+    try {
+      await runToolUseTurn("tool-use-verified", "verified");
+      expect(nativeState(db, "tool-use-verified")).toBe("TERMINAL");
+      runEmbeddedAgentViaCliBackendIfEligible.mockResolvedValue(dispatchResult);
+      await runEmbeddedAgent({ ...laneRunParams(), runId: "after-tool-use" });
+      expect(nativeState(db, "after-tool-use")).toBe("TERMINAL");
+    } finally {
+      db.close();
+    }
+  });
+
+  it.each([
+    ["unverified cleanup", "unverified", {}],
+    ["no cleanup attempt", "none", {}],
+    [
+      "pending client tool calls",
+      "verified",
+      { pendingToolCalls: [{ id: "c1", name: "x", arguments: "{}" }] },
+    ],
+    ["a yield", "verified", { yielded: true }],
+    ["a timeout phase", "verified", { timeoutPhase: "llm-idle" }],
+    ["a plugin harness (codex)", "verified", { agentMeta: { agentHarnessId: "codex" } }],
+  ] as const)("stays UNKNOWN with %s and blocks the next turn", async (_label, cleanup, meta) => {
+    const { db } = prepareFence();
+    try {
+      await runToolUseTurn("tool-use-doubt", cleanup, meta);
+      expect(nativeState(db, "tool-use-doubt")).toBe("UNKNOWN");
+      await expect(
+        runEmbeddedAgent({ ...laneRunParams(), runId: "blocked-after-doubt" }),
+      ).rejects.toMatchObject({ code: "NATIVE_BUSY" });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("settles a cron-owned attempt TERMINAL with verified cleanup", async () => {
+    const { db } = prepareFence();
+    const { withCronDispatchOwner, bindCronDispatchSession } =
+      await import("../../state/thread-dispatch.js");
+    const { beginNativeCleanupAttempt } = await import("./native-cleanup-proof.js");
+    runEmbeddedAgentViaCliBackendIfEligible.mockImplementation(async () => {
+      beginNativeCleanupAttempt()(true);
+      return toolUseResult();
+    });
+    try {
+      await withCronDispatchOwner({
+        sessionKey: laneRunParams().sessionKey,
+        operationId: "isolated-cron:tool-use",
+        identity: { job: "tool-use" },
+        run: async () => {
+          bindCronDispatchSession(laneRunParams().sessionKey);
+          return runEmbeddedAgent({ ...laneRunParams(), runId: "cron-tool-use" });
+        },
+        completed: () => true,
+      });
+      expect(
+        db
+          .prepare(
+            "SELECT state FROM thread_dispatch_claims WHERE claim_id='isolated-cron:tool-use'",
+          )
+          .get()?.state,
+      ).toBe("TERMINAL");
+    } finally {
+      db.close();
+    }
+  });
+});

@@ -117,3 +117,41 @@ it("an attempt whose agent cannot show it is idle carries no proof: UNKNOWN", as
     db.close();
   }
 });
+it("an attempt whose transcript ends on a terminating tool batch (stopReason toolUse) still carries the ended-run proof", async () => {
+  const { readEndedCleanupProof } = await import("../../../state/native-cleanup-evidence.js");
+  const cleanupIdentity = dispatchHash("tool-use-terminal-attempt");
+  const endsOnTerminatingTool = () => {
+    const session = createDefaultEmbeddedSession({
+      prompt: async (current) => {
+        current.messages.push(
+          {
+            role: "assistant",
+            stopReason: "toolUse",
+            content: [
+              { type: "toolCall", id: "call_1", name: "edit", arguments: { path: "a.txt" } },
+            ],
+          },
+          {
+            role: "toolResult",
+            toolCallId: "call_1",
+            toolName: "edit",
+            isError: false,
+            content: [{ type: "text", text: "No changes made to a.txt." }],
+          },
+        );
+      },
+    });
+    Object.assign(session.agent, { waitForIdle: async () => {} });
+    return session;
+  };
+  const result = await withNativeCleanupTracking(cleanupIdentity, async () => {
+    await createContextEngineAttemptRunner({
+      contextEngine: createContextEngineBootstrapAndAssemble(),
+      sessionKey: "agent:main:tool-use-terminal-attempt",
+      createSession: endsOnTerminatingTool,
+      tempPaths,
+    });
+    return { meta: { stopReason: "toolUse" } };
+  });
+  expect(readEndedCleanupProof(result, cleanupIdentity)).toMatch(/^[a-f0-9]{64}$/);
+});

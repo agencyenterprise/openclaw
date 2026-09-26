@@ -19,6 +19,7 @@ import {
   buildAgentHookContextIdentityFields,
 } from "../../plugins/hook-agent-context.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import { readEndedCleanupProof } from "../../state/native-cleanup-evidence.js";
 import { bindCurrentNativeOwnerDeadline } from "../../state/thread-dispatch.js";
 import { hasProtectedDispatchOwner } from "../../state/thread-dispatch.js";
 import { hasCronDispatchOwner, runCronDispatchAttempt } from "../../state/thread-dispatch.js";
@@ -75,6 +76,31 @@ function refusedAfterTurnSettled(): EmbeddedAgentRunResult {
   return { payloads: [], meta: { durationMs: 0, aborted: true, livenessState: "abandoned" } };
 }
 
+const COMPLETED_STOP_REASONS: ReadonlySet<string> = new Set(["stop", "end_turn", "completed"]);
+/** Only the embedded harness verifies its own cleanup; a plugin harness attempt counts as cleaned up once it returns. */
+const EMBEDDED_HARNESS_ID = "openclaw";
+
+/**
+ * Whether a returned run may settle TERMINAL: one of the completed stop reasons, or
+ * "toolUse", which ends the loop when every tool in the final batch returned
+ * `terminate: true` (for example an edit or write that changed nothing). "toolUse"
+ * counts only for the embedded harness and with the cleanup tracker's ended-run proof.
+ */
+function isCompletedRun(result: EmbeddedAgentRunResult, cleanupIdentity: string): boolean {
+  const meta = result.meta;
+  if (!meta || meta.aborted || meta.yielded || meta.error || meta.pendingToolCalls?.length) {
+    return false;
+  }
+  if (COMPLETED_STOP_REASONS.has(meta.stopReason ?? "")) {
+    return true;
+  }
+  return (
+    meta.stopReason === "toolUse" &&
+    meta.agentMeta?.agentHarnessId === EMBEDDED_HARNESS_ID &&
+    readEndedCleanupProof(result, cleanupIdentity) !== undefined
+  );
+}
+
 export function runEmbeddedAgent(
   paramsInput: RunEmbeddedAgentParams,
 ): Promise<EmbeddedAgentRunResult> {
@@ -120,22 +146,15 @@ export function runEmbeddedAgent(
       failedErrorReceipt: (error) => readNativeThrownCleanupReceipt(error, cleanupIdentity),
       failedTerminalReceipt: (result) => readNativeFailedCleanupReceipt(result, cleanupIdentity),
       terminalReceipt: (result) => {
-        const meta = result.meta;
-        if (
-          !meta ||
-          meta.aborted ||
-          meta.yielded ||
-          meta.error ||
-          meta.pendingToolCalls?.length ||
-          !["stop", "end_turn", "completed"].includes(meta.stopReason ?? "")
-        )
+        if (!isCompletedRun(result, cleanupIdentity)) {
           return undefined;
+        }
         return dispatchHash({
           kind: "cron_attempt_terminal",
           runId: internalParamsInput.runId,
           sessionKey: internalParamsInput.sessionKey,
           lifecycleGeneration,
-          stopReason: meta.stopReason,
+          stopReason: result.meta.stopReason,
         });
       },
     });
@@ -181,18 +200,11 @@ export function runEmbeddedAgent(
     terminalReceipt: (result) => {
       const failedReceipt = readNativeFailedCleanupReceipt(result, cleanupIdentity);
       if (failedReceipt) return failedReceipt;
-      const meta = result.meta;
-      if (
-        !meta ||
-        meta.aborted ||
-        meta.yielded ||
-        // replayInvalid forbids repeating side effects; it does not mean this
-        // awaited successful turn is still active. Child claims stay separate.
-        meta.error ||
-        meta.pendingToolCalls?.length ||
-        !["stop", "end_turn", "completed"].includes(meta.stopReason ?? "")
-      )
+      // replayInvalid forbids repeating side effects; it does not mean this
+      // awaited successful turn is still active. Child claims stay separate.
+      if (!isCompletedRun(result, cleanupIdentity)) {
         return undefined;
+      }
       // This releases only the observed native turn. Child/external UNKNOWN
       // claims remain independent blockers for retirement.
       return dispatchHash({
@@ -201,8 +213,8 @@ export function runEmbeddedAgent(
         sessionKey: dispatchSessionKey,
         sessionId: internalParamsInput.sessionId,
         lifecycleGeneration,
-        stopReason: meta.stopReason,
-        durationMs: meta.durationMs,
+        stopReason: result.meta.stopReason,
+        durationMs: result.meta.durationMs,
       });
     },
   });
