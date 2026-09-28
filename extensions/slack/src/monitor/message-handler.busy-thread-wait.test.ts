@@ -1,13 +1,27 @@
 // Slack tests cover inbound posts that wait for a busy thread instead of being dropped.
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
+  createPluginStateKeyedStoreForTests,
+  resetPluginStateStoreForTests,
+} from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  buildSlackHeldInboundRecord,
   resetSlackInboundThreadWaitsForTest,
+  SLACK_HELD_INBOUND_NAMESPACE,
+  type SlackHeldInboundPost,
+  type SlackHeldInboundRecord,
   type SlackHeldInboundStore,
 } from "./inbound-thread-wait.js";
 
 type PreparedFixture = { ctxPayload: { ts?: string; text?: string } };
 
-const threadState = vi.hoisted(() => ({ busy: false }));
+const threadState = vi.hoisted(() => ({
+  busy: false,
+  busyError: () => new Error("NATIVE_BUSY") as Error,
+}));
 const ingressState = vi.hoisted(() => ({ resolveFails: false }));
 const delivered = vi.hoisted(() => new Set<string>());
 const dispatchedTs: string[] = [];
@@ -20,7 +34,7 @@ vi.mock("./message-handler/pipeline.runtime.js", () => ({
   dispatchPreparedSlackMessage: async (prepared: PreparedFixture) => {
     dispatchAttempts.push(prepared.ctxPayload.ts ?? "");
     if (threadState.busy) {
-      throw new Error("NATIVE_BUSY");
+      throw threadState.busyError();
     }
     dispatchedTs.push(prepared.ctxPayload.ts ?? "");
   },
@@ -132,6 +146,7 @@ describe("createSlackMessageHandler busy-thread wait", () => {
     resetSlackInboundThreadWaitsForTest();
     vi.useFakeTimers();
     threadState.busy = false;
+    threadState.busyError = () => new Error("NATIVE_BUSY");
     ingressState.resolveFails = false;
     delivered.clear();
     dispatchedTs.length = 0;
@@ -349,5 +364,169 @@ describe("createSlackMessageHandler busy-thread wait", () => {
     expect(dispatchedTs).toEqual([JUDD_MENTION.ts, "1790381400.000200"]);
     expect(restarted.postMessage).not.toHaveBeenCalled();
     expect(rows.size).toBe(0);
+  });
+});
+
+/** The gateway's own store: SQLite plugin state, which accepts plain JSON values only. */
+describe("createSlackMessageHandler busy-thread wait with the plugin state store", () => {
+  let stateDir: string;
+  let store: ReturnType<typeof createPluginStateKeyedStoreForTests<SlackHeldInboundRecord>>;
+
+  const LATER_TS = "1790444736.310639";
+
+  beforeEach(async () => {
+    resetSlackInboundThreadWaitsForTest();
+    resetPluginStateStoreForTests();
+    vi.useFakeTimers();
+    threadState.busy = false;
+    threadState.busyError = () => new Error("NATIVE_BUSY");
+    ingressState.resolveFails = false;
+    delivered.clear();
+    dispatchedTs.length = 0;
+    dispatchAttempts.length = 0;
+    stateDir = await mkdtemp(path.join(tmpdir(), "openclaw-slack-held-inbound-"));
+    store = createPluginStateKeyedStoreForTests<SlackHeldInboundRecord>("slack", {
+      namespace: SLACK_HELD_INBOUND_NAMESPACE,
+      maxEntries: 1_000,
+      overflowPolicy: "reject-new",
+      defaultTtlMs: 24 * HOUR_MS,
+      env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+    });
+  });
+
+  afterEach(async () => {
+    resetSlackInboundThreadWaitsForTest();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    resetPluginStateStoreForTests();
+    await rm(stateDir, { recursive: true, force: true });
+  });
+
+  async function storedPosts() {
+    const rows = await store.entries();
+    return new Map(rows.map((row) => [row.value.post.message.ts, row.value.post]));
+  }
+
+  it("stores both Slack copies of a post held behind an earlier post (2026-09-26 regression)", async () => {
+    const first = createHarness(store);
+    threadState.busy = true;
+    await sendMention(first.handler);
+
+    // Both copies of the later post wait behind the first; neither carries a retry cause.
+    const later = {
+      ...JUDD_MENTION,
+      user: "U02PCSCSNSH",
+      ts: LATER_TS,
+      text: "<@U0AG6682EQZ> later",
+    };
+    await first.handler({ ...later, type: "message" } as never, { source: "message" });
+    await first.handler(later as never, { source: "app_mention", wasMentioned: true });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(first.errors.filter((line) => line.includes("held inbound store"))).toEqual([]);
+    const held = await storedPosts();
+    expect([...held.keys()].toSorted()).toEqual([JUDD_MENTION.ts, LATER_TS]);
+    expect(held.get(LATER_TS)).not.toHaveProperty("cause");
+    expect(held.get(LATER_TS)?.opts).toEqual({ source: "message", wasMentioned: true });
+
+    resetSlackInboundThreadWaitsForTest();
+    threadState.busy = false;
+    createHarness(store);
+    await vi.advanceTimersByTimeAsync(2 * MINUTE_MS);
+
+    expect(dispatchedTs).toEqual([JUDD_MENTION.ts, LATER_TS]);
+    expect(await store.entries()).toEqual([]);
+  });
+
+  it("stores a JSON record when the busy error carries an Error cause and the event has undefined fields", async () => {
+    threadState.busyError = () =>
+      new Error("THREAD_DISPATCH_REFUSED: NATIVE_BUSY", { cause: new Error("fence held") });
+    const first = createHarness(store);
+    threadState.busy = true;
+
+    await sendMention(first.handler, { files: undefined } as Partial<typeof JUDD_MENTION>);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(first.errors.filter((line) => line.includes("held inbound store"))).toEqual([]);
+    const post = (await storedPosts()).get(JUDD_MENTION.ts);
+    expect(post?.cause).toBe("claim-busy");
+    expect(post?.lastError).toContain("NATIVE_BUSY");
+    expect(post?.message).not.toHaveProperty("files");
+
+    resetSlackInboundThreadWaitsForTest();
+    threadState.busy = false;
+    createHarness(store);
+    await vi.advanceTimersByTimeAsync(2 * MINUTE_MS);
+
+    expect(dispatchedTs).toEqual([JUDD_MENTION.ts]);
+  });
+
+  it("refuses to build a record whose cause is an Error instead of storing it", () => {
+    const post = {
+      message: JUDD_MENTION,
+      opts: { source: "app_mention", wasMentioned: true },
+      retry: { firstFailureAtMs: 0, attempts: 1, sessionInitConflicts: 0 },
+      cause: new Error("NATIVE_BUSY"),
+    } as unknown as SlackHeldInboundPost;
+
+    expect(() => buildSlackHeldInboundRecord(post)).toThrow(
+      `held inbound record for ${THREAD_CHANNEL}:${JUDD_MENTION.ts} would not restore (cause=Error: NATIVE_BUSY)`,
+    );
+  });
+
+  it("stores exactly the record it builds for a held post", async () => {
+    const post: SlackHeldInboundPost = {
+      message: JUDD_MENTION as SlackHeldInboundPost["message"],
+      opts: { source: "app_mention", wasMentioned: true },
+      retry: { firstFailureAtMs: 1, attempts: 2, sessionInitConflicts: 0 },
+      cause: "claim-busy",
+      lastError: "NATIVE_BUSY",
+    };
+    const record = buildSlackHeldInboundRecord(post);
+
+    await store.register("default:record", record);
+
+    expect(await store.lookup("default:record")).toEqual(record);
+  });
+
+  it("says loudly that a post may be lost when the store rejects its record", async () => {
+    const rejecting: SlackHeldInboundStore = {
+      ...store,
+      register: async () => {
+        throw new Error("PLUGIN_STATE_LIMIT_EXCEEDED");
+      },
+      delete: (key) => store.delete(key),
+      entries: () => store.entries(),
+    };
+    const { handler, errors } = createHarness(rejecting);
+    threadState.busy = true;
+
+    await sendMention(handler);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errors.join("\n")).toContain(
+      `held inbound store write for ${THREAD_CHANNEL}:${JUDD_MENTION.ts} failed; its durable copy is missing or older than the held post, so a restart may lose it`,
+    );
+  });
+
+  it("says a delivered post may be redelivered when the store cannot delete its record", async () => {
+    const undeletable: SlackHeldInboundStore = {
+      register: (key, value) => store.register(key, value),
+      delete: async () => {
+        throw new Error("SQLITE_BUSY");
+      },
+      entries: () => store.entries(),
+    };
+    const { handler, errors } = createHarness(undeletable);
+    threadState.busy = true;
+    await sendMention(handler);
+
+    threadState.busy = false;
+    await vi.advanceTimersByTimeAsync(2 * MINUTE_MS);
+
+    expect(dispatchedTs).toEqual([JUDD_MENTION.ts]);
+    expect(errors.join("\n")).toContain(
+      `held inbound store delete for ${THREAD_CHANNEL}:${JUDD_MENTION.ts} failed; its durable copy remains until the store TTL, so a restart may redeliver it`,
+    );
   });
 });

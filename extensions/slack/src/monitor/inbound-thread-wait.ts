@@ -159,6 +159,37 @@ function parseHeldInboundRecord(value: unknown): SlackHeldInboundPost | undefine
   };
 }
 
+/**
+ * The plugin state store accepts plain JSON only, so an absent optional field must be left out
+ * rather than stored as `undefined`. Build the record field by field; the Slack event is JSON
+ * by origin and is cloned through JSON so no in-process field can reach the store. A record
+ * that would not restore is refused here, loudly, rather than stored.
+ */
+export function buildSlackHeldInboundRecord(post: SlackHeldInboundPost): SlackHeldInboundRecord {
+  const record: SlackHeldInboundRecord = {
+    version: 1,
+    post: {
+      // structuredClone would keep the undefined fields the store rejects.
+      // oxlint-disable-next-line unicorn/prefer-structured-clone
+      message: JSON.parse(JSON.stringify(post.message)) as SlackMessageEvent,
+      opts: { source: post.opts.source, wasMentioned: post.opts.wasMentioned },
+      retry: {
+        firstFailureAtMs: post.retry.firstFailureAtMs,
+        attempts: post.retry.attempts,
+        sessionInitConflicts: post.retry.sessionInitConflicts,
+      },
+      ...(post.cause !== undefined ? { cause: post.cause } : {}),
+      ...(post.lastError !== undefined ? { lastError: post.lastError } : {}),
+    },
+  };
+  if (!parseHeldInboundRecord(record)) {
+    throw new Error(
+      `held inbound record for ${buildPostKey(post.message)} would not restore (cause=${String(post.cause)})`,
+    );
+  }
+  return record;
+}
+
 function formatElapsed(ms: number): string {
   const totalMinutes = Math.max(Math.floor(ms / 60_000), 0);
   return `${Math.floor(totalMinutes / 60)}h ${totalMinutes % 60}m`;
@@ -295,6 +326,7 @@ function createSlackInboundThreadWaits(params: {
 
   const writeStore = (
     describe: string,
+    consequence: string,
     write: (target: SlackHeldInboundStore) => Promise<unknown>,
   ): Promise<unknown> => {
     if (!store) {
@@ -303,20 +335,27 @@ function createSlackInboundThreadWaits(params: {
     // Serialize writes so a delete can never land before the register it supersedes.
     storeWrites = storeWrites.then(() =>
       write(store).catch((err: unknown) => {
-        logError(`slack held inbound store ${describe} failed: ${formatErrorMessage(err)}`);
+        logError(
+          `slack held inbound store ${describe} failed; ${consequence}: ${formatErrorMessage(err)}`,
+        );
       }),
     );
     return storeWrites;
   };
 
   const persist = (post: SlackHeldInboundPost) =>
-    writeStore(`write for ${buildPostKey(post.message)}`, (target) =>
-      target.register(buildStoreKey(post.message), { version: 1, post }),
+    writeStore(
+      `write for ${buildPostKey(post.message)}`,
+      "its durable copy is missing or older than the held post, so a restart may lose it",
+      async (target) =>
+        await target.register(buildStoreKey(post.message), buildSlackHeldInboundRecord(post)),
     );
 
   const forget = (message: SlackMessageEvent) =>
-    writeStore(`delete for ${buildPostKey(message)}`, (target) =>
-      target.delete(buildStoreKey(message)),
+    writeStore(
+      `delete for ${buildPostKey(message)}`,
+      "its durable copy remains until the store TTL, so a restart may redeliver it",
+      async (target) => await target.delete(buildStoreKey(message)),
     );
 
   const ensureWait = (threadKey: string): ThreadWait => {
@@ -338,6 +377,8 @@ function createSlackInboundThreadWaits(params: {
       wait.posts.sort((left, right) => compareSlackTs(left.message.ts, right.message.ts));
       return post;
     }
+    const cause = post.cause ?? held.cause;
+    const lastError = post.lastError ?? held.lastError;
     const merged: SlackHeldInboundPost = {
       ...mergeSlackPostCopies(held, post),
       retry: {
@@ -348,8 +389,8 @@ function createSlackInboundThreadWaits(params: {
           post.retry.sessionInitConflicts,
         ),
       },
-      cause: post.cause ?? held.cause,
-      lastError: post.lastError ?? held.lastError,
+      ...(cause !== undefined ? { cause } : {}),
+      ...(lastError !== undefined ? { lastError } : {}),
     };
     wait.posts[index] = merged;
     return merged;
