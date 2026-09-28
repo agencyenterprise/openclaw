@@ -1228,9 +1228,12 @@ async function processResponsesStream(
   };
   let currentItem: Record<string, unknown> | null = null;
   let currentBlock: Record<string, unknown> | null = null;
+  type ToolCallIdentity = ReturnType<typeof readResponsesToolCallItemIdentity>;
   type StreamingToolCallState = ResponsesToolCallState & {
     block: Record<string, unknown>;
     contentIndex: number;
+    // Identity as first streamed; the tracker may later adopt identities into the state.
+    registeredIdentity: ToolCallIdentity;
   };
   const streamingToolCalls = createResponsesToolCallTracker<StreamingToolCallState>();
   let lastTextBlock: {
@@ -1269,6 +1272,169 @@ async function processResponsesStream(
       throw new Error("Responses stream completed tool call without a function name");
     }
     return name;
+  };
+  // call_id is stable across a call's events; item ids may rotate, so they only
+  // identify a completed call that has no call_id.
+  const completedToolCallKey = (identity: ToolCallIdentity): string | undefined =>
+    identity.callId !== undefined
+      ? `call:${identity.callId}`
+      : identity.itemId !== undefined
+        ? `item:${identity.itemId}`
+        : undefined;
+  const completedToolCallKeys = new Set<string>();
+  const rememberCompletedToolCall = (identity: ToolCallIdentity) => {
+    const key = completedToolCallKey(identity);
+    if (key) {
+      completedToolCallKeys.add(key);
+    }
+  };
+  const wasToolCallCompleted = (identity: ToolCallIdentity): boolean => {
+    const key = completedToolCallKey(identity);
+    return key !== undefined && completedToolCallKeys.has(key);
+  };
+  const sharesRegisteredIdentity = (
+    toolCall: StreamingToolCallState,
+    identity: ToolCallIdentity,
+  ): boolean =>
+    (identity.callId !== undefined && toolCall.registeredIdentity.callId === identity.callId) ||
+    (identity.itemId !== undefined && toolCall.registeredIdentity.itemId === identity.itemId);
+  // Why an output_item.done left its call active; logged if response.completed reconciles it.
+  const deferredToolCallCompletions: string[] = [];
+  const recordDeferredToolCallCompletion = (
+    reason: "identity-mismatch" | "unreliable-arguments",
+    event: Record<string, unknown>,
+    identity: ToolCallIdentity,
+  ) => {
+    const outputIndex = typeof event.output_index === "number" ? event.output_index : "none";
+    deferredToolCallCompletions.push(
+      `${reason}@${outputIndex}:${identity.callId ?? identity.itemId ?? "anonymous"}`,
+    );
+  };
+  const finishToolCallBlock = (
+    toolCallBlock: Record<string, unknown>,
+    contentIndex: number,
+    item: Record<string, unknown>,
+    completedName: string,
+    finalPartialJson: string,
+  ) => {
+    const args = parseStreamingJson(finalPartialJson);
+    const provisionalId = typeof toolCallBlock.id === "string" ? toolCallBlock.id : undefined;
+    const currentToolCallId = resolveToolCallId(item, provisionalId);
+    toolCallBlock.id = currentToolCallId;
+    toolCallBlock.name = completedName;
+    toolCallBlock.arguments = args;
+    toolCallBlock.partialJson = finalPartialJson;
+    stream.push({
+      type: "toolcall_end",
+      contentIndex,
+      toolCall: {
+        type: "toolCall",
+        id: currentToolCallId,
+        name: completedName,
+        arguments: args,
+      },
+      partial: output,
+    });
+    rememberCompletedToolCall(readResponsesToolCallItemIdentity(item));
+    if (currentBlock === toolCallBlock) {
+      currentBlock = null;
+      currentItem = null;
+    }
+  };
+  const readTerminalToolCallArguments = (item: Record<string, unknown>): string => {
+    const terminalArguments = typeof item.arguments === "string" ? item.arguments : "";
+    if (!terminalArguments) {
+      throw new Error("Responses stream completed tool call without terminal arguments");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(terminalArguments);
+    } catch (error) {
+      throw new Error("Responses stream completed tool call with invalid JSON arguments", {
+        cause: error,
+      });
+    }
+    if (!isRecord(parsed)) {
+      throw new Error("Responses stream completed tool call with non-object arguments");
+    }
+    return terminalArguments;
+  };
+  // output_item.done can leave a call active (it never arrived, its identity no
+  // longer routes to the streamed call, or its argument stream became unreliable
+  // with no argument snapshot). response.output is the authoritative final state:
+  // complete every such call from it. Every unfinished terminal call must match an
+  // active call and every active call must be matched, or the stream is rejected.
+  const reconcileActiveToolCallsWithTerminalOutput = (
+    response: Record<string, unknown> | undefined,
+  ) => {
+    if (!streamingToolCalls.hasActive()) {
+      return;
+    }
+    const terminalItems: unknown[] = Array.isArray(response?.output) ? response.output : [];
+    const terminalCallIds = new Set<string>();
+    const unfinished: Array<{
+      outputIndex: number;
+      item: Record<string, unknown>;
+      identity: ToolCallIdentity;
+    }> = [];
+    for (const [outputIndex, item] of terminalItems.entries()) {
+      if (!isRecord(item) || item.type !== "function_call") {
+        continue;
+      }
+      const identity = readResponsesToolCallItemIdentity(item);
+      if (identity.callId) {
+        if (terminalCallIds.has(identity.callId)) {
+          throw new Error("Responses stream repeated a terminal tool-call identity");
+        }
+        terminalCallIds.add(identity.callId);
+      }
+      if (!wasToolCallCompleted(identity)) {
+        unfinished.push({ outputIndex, item, identity });
+      }
+    }
+    // Parallel calls need a positive identity match; only a sole unfinished call
+    // may match by output position alone (the hasActive check below proves it sole).
+    const allowPositionalMatch = unfinished.length === 1;
+    const reconciled: Array<{
+      toolCall: StreamingToolCallState;
+      item: Record<string, unknown>;
+      name: string;
+      argumentsJson: string;
+    }> = [];
+    for (const { outputIndex, item, identity } of unfinished) {
+      const toolCall = streamingToolCalls.resolve({ output_index: outputIndex }, identity);
+      if (!toolCall || !(allowPositionalMatch || sharesRegisteredIdentity(toolCall, identity))) {
+        throw new Error("Responses stream completed with an unmatched terminal tool call");
+      }
+      if (reconciled.some((entry) => entry.toolCall === toolCall)) {
+        throw new Error("Responses stream matched one tool call to several terminal items");
+      }
+      if (item.status !== undefined && item.status !== "completed") {
+        throw new Error("Responses stream completed with an incomplete terminal tool call");
+      }
+      reconciled.push({
+        toolCall,
+        item,
+        name: resolveCompletedToolCallName(toolCall, item.name),
+        argumentsJson: readTerminalToolCallArguments(item),
+      });
+    }
+    // Every active call must be covered before any toolcall_end is emitted.
+    for (const { toolCall } of reconciled) {
+      streamingToolCalls.forget(toolCall);
+    }
+    if (streamingToolCalls.hasActive()) {
+      throw new Error("Responses stream completed with unresolved tool calls");
+    }
+    for (const { toolCall, item, name, argumentsJson } of reconciled) {
+      finishToolCallBlock(toolCall.block, toolCall.contentIndex, item, name, argumentsJson);
+    }
+    log.warn(
+      `[responses] reconciled ${reconciled.length} active tool call(s) from response.completed output ` +
+        `provider=${model.provider} api=${model.api} model=${model.id} ` +
+        `calls=${reconciled.map(({ item }) => stringifyUnknown(item.call_id) || stringifyUnknown(item.id)).join(",")} ` +
+        `deferredDone=${deferredToolCallCompletions.join(",") || "none"}`,
+    );
   };
   const appendPendingMessageDelta = (delta: string) => {
     pendingMessageText = `${pendingMessageText ?? ""}${delta}`;
@@ -1459,6 +1625,7 @@ async function processResponsesStream(
           contentIndex,
           argumentStreamReliable: true,
           ...readResponsesToolCallItemIdentity(item),
+          registeredIdentity: readResponsesToolCallItemIdentity(item),
         };
         streamingToolCalls.register(event, toolCallState);
         currentItem = item;
@@ -1631,13 +1798,13 @@ async function processResponsesStream(
         }
         currentBlock = null;
       } else if (item.type === "function_call") {
-        const streamingToolCall = streamingToolCalls.resolve(
-          event,
-          readResponsesToolCallItemIdentity(item),
-        );
+        const itemIdentity = readResponsesToolCallItemIdentity(item);
+        const streamingToolCall = streamingToolCalls.resolve(event, itemIdentity);
         // Do not turn an unresolved completion into a second public call while
-        // an indexed call is still open. Its identity or index must match.
+        // an indexed call is still open. Its identity or index must match;
+        // response.completed reconciles it from the terminal output.
         if (!streamingToolCall && streamingToolCalls.hasActive()) {
+          recordDeferredToolCallCompletion("identity-mismatch", event, itemIdentity);
           await cooperativeScheduler.afterEvent();
           continue;
         }
@@ -1647,6 +1814,7 @@ async function processResponsesStream(
           : "";
         const completedArguments = typeof item.arguments === "string" ? item.arguments : undefined;
         if (streamingToolCall && !streamingToolCall.argumentStreamReliable && !completedArguments) {
+          recordDeferredToolCallCompletion("unreliable-arguments", event, itemIdentity);
           await cooperativeScheduler.afterEvent();
           continue;
         }
@@ -1655,54 +1823,29 @@ async function processResponsesStream(
           (completedArguments.length > 0 || !streamedPartialJson)
             ? completedArguments
             : streamedPartialJson || "{}";
-        const args = parseStreamingJson(finalPartialJson);
         let toolCallBlock: Record<string, unknown>;
         let contentIndex: number;
         if (streamingToolCall) {
           toolCallBlock = streamingToolCall.block;
           contentIndex = streamingToolCall.contentIndex;
+          streamingToolCalls.forget(streamingToolCall);
         } else {
           toolCallBlock = {
             type: "toolCall",
             id: resolveToolCallId(item),
             name: completedName,
-            arguments: args,
+            arguments: parseStreamingJson(finalPartialJson),
             partialJson: finalPartialJson,
           };
           output.content.push(toolCallBlock);
           contentIndex = blockIndex();
           stream.push({ type: "toolcall_start", contentIndex, partial: output });
         }
-        const provisionalId = typeof toolCallBlock.id === "string" ? toolCallBlock.id : undefined;
-        const currentToolCallId = resolveToolCallId(item, provisionalId);
-        toolCallBlock.id = currentToolCallId;
-        toolCallBlock.name = completedName;
-        toolCallBlock.arguments = args;
-        toolCallBlock.partialJson = finalPartialJson;
-        stream.push({
-          type: "toolcall_end",
-          contentIndex,
-          toolCall: {
-            type: "toolCall",
-            id: currentToolCallId,
-            name: completedName,
-            arguments: args,
-          },
-          partial: output,
-        });
-        if (streamingToolCall) {
-          streamingToolCalls.forget(streamingToolCall);
-        }
-        if (currentBlock === toolCallBlock) {
-          currentBlock = null;
-          currentItem = null;
-        }
+        finishToolCallBlock(toolCallBlock, contentIndex, item, completedName, finalPartialJson);
       }
     } else if (type === "response.completed") {
-      if (streamingToolCalls.hasActive()) {
-        throw new Error("Responses stream completed with unresolved tool calls");
-      }
       const response = event.response as Record<string, unknown> | undefined;
+      reconcileActiveToolCallsWithTerminalOutput(response);
       if (typeof response?.id === "string") {
         output.responseId = response.id;
       }
