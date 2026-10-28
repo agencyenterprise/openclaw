@@ -81,7 +81,8 @@ export function requiresClaudeMandatoryAdaptiveThinking(ref: ClaudeModelRef): bo
   return (
     resolveClaudeFable5ModelIdentity(ref) !== undefined ||
     resolveClaudeMythos5ModelIdentity(ref) !== undefined ||
-    /(?:^|-)claude-mythos-preview(?=$|[^a-z0-9])/.test(modelId)
+    /(?:^|-)claude-mythos-preview(?=$|[^a-z0-9])/.test(modelId) ||
+    /(?:^|-)claude-opus-5-5(?=$|[^a-z0-9])/.test(modelId)
   );
 }
 
